@@ -1,0 +1,6 @@
+# 取得したデータ（Apple の著作物）
+cache/
+out/
+__pycache__/
+*.pyc
+.pytest_cache/

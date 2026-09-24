@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "flyover-viewer",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["scripts/serve.py", "out"],
+      "autoPort": true,
+      "port": 8000
+    }
+  ]
+}
