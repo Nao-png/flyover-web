@@ -1,5 +1,7 @@
 # flyover-web
 
+日本語 | [English](README.en.md)
+
 Apple Maps の Flyover（3D の航空写真）を Windows のブラウザで見る。Python だけで動き、Mac は要らない。
 
 ## 地球儀で見る（Google Earth のように）
