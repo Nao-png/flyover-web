@@ -6,7 +6,17 @@ retroplasma/flyover-reverse-engineering の pkg/fly/c3m/internal/huffman.go の�
 結果になるよう、その振る舞いを関数で再現する。
 """
 import functools
+import os
 import struct
+
+import numpy as np
+
+try:                     # numba があれば、復号をそちらで（なくても同じ結果で動く）
+    from . import _fast
+except ImportError:
+    _fast = None
+if os.environ.get("FLYOVER_NO_NUMBA"):
+    _fast = None
 
 M64 = (1 << 64) - 1
 
@@ -40,85 +50,117 @@ def be32(b, off):
 
 
 class Table:
-    """展開表。表ごとに、項目の値（int32）と長さ（バイト）の組を持つ。"""
+    """展開表。表ごとに、項目の値（int32）と長さ（int8）の組を持つ。"""
 
     def __init__(self, pages):
-        self.vals = [list(struct.unpack(f"<{len(p) // 8}q", p)) for p in pages]
+        raw = [list(struct.unpack(f"<{len(p) // 8}q", p)) for p in pages]
         # 8 バイトの項目を (int32 の値, 5 バイト目) に分ける
-        self.vals, self.lens = ([[i32(v) for v in page] for page in self.vals],
-                                [[(v >> 32) & 0xFF for v in page] for page in self.vals])
+        self.vals = [[i32(v) for v in page] for page in raw]
+        self.lens = [[(v >> 32) & 0xFF for v in page] for page in raw]
+        self.lens0_i8 = [i8(v) for v in self.lens[0]]
+        # numba 版（_fast.huffman_decode）用に、全部の表を 1 列に並べたもの
+        self.flat_vals = np.array([v for page in self.vals for v in page], np.int64)
+        self.flat_lens = np.array([v for page in self.lens for v in page], np.int64)
+        self.offs = np.cumsum([0] + [len(page) for page in self.vals[:-1]]).astype(np.int64)
 
     def __len__(self):
         return len(self.vals)
 
     def decode(self, data, len1, len2):
-        """data（len2 バイト）を len1 バイト（int16 の並び）に展開する。"""
-        buf = bytes(data[:len2]) + b"\0" * 8
+        """data（len2 バイト）を len1 バイト（int16 の並び）に展開する。
+
+        huffman.go の処理そのままだが、速さのために shl・shr・i8・i16 を書き下し、4 バイトの
+        読み出しを先に済ませてある（読む位置はいつも 4 の倍数）。"""
         out = bytearray(len1 + 3)
         if len1 < 2:
             return out
+        buf = bytes(data[:len2]) + b"\0" * 16
+        if _fast is not None:
+            words = np.frombuffer(buf[:len(buf) // 4 * 4], ">u4").astype(np.uint32)
+            res = _fast.huffman_decode(words, len2, len1 // 2, self.flat_vals, self.flat_lens, self.offs)
+            out[:len1 // 2 * 2] = res.astype("<u2").tobytes()
+            return out
+        words = struct.unpack(f">{len(buf) // 4}I", buf[:len(buf) // 4 * 4])
         len2mul8 = 8 * len2
         n = len1 // 2
-        fv, fl = self.vals[0], self.lens[0]
-        shift1, inp1, roff, woff = 0, 0, 0, 0
-        while True:
+        fv, fl = self.vals[0], self.lens0_i8
+        vals, lens = self.vals, self.lens
+        res = [0] * n
+        shift1 = inp1 = ri = 0          # ri: 次に読む 4 バイトの番号（roff = 4 * ri）
+        for w in range(n):
             if shift1 <= 0:
-                inp1 |= shl(be32(buf, roff), 32 - shift1)
+                k = 32 - shift1
+                if k < 64:
+                    inp1 = (inp1 | (words[ri] << k)) & M64
+                ri += 1
                 shift1 += 32
-                roff += 4
             neg = inp1 >> 63
             shift2 = shift1 - 1
-            inp2 = (2 * inp1) & M64
-            test = len2mul8 - (8 * roff - (shift1 - 1))
+            inp2 = (inp1 << 1) & M64
+            test = len2mul8 - (32 * ri - (shift1 - 1))
             if test > 15:
                 if shift1 <= 16:
-                    inp2 |= shl(be32(buf, roff), 33 - shift1)
-                    roff += 4
+                    k = 33 - shift1
+                    if k < 64:
+                        inp2 = (inp2 | (words[ri] << k)) & M64
+                    ri += 1
                     shift2 = shift1 + 31
                 idx = inp2 >> 48
             else:
                 if shift1 <= test:
-                    inp2 |= shl(be32(buf, roff), 33 - shift1)
-                    roff += 4
+                    k = 33 - shift1
+                    if 0 <= k < 64:
+                        inp2 = (inp2 | (words[ri] << k)) & M64
+                    ri += 1
                     shift2 = shift1 + 31
-                idx = shl(shr(inp2, (64 - (test & 0xFF)) & 0xFF), 16 - test)
-            fval = i8(fl[idx])
+                k = (64 - (test & 0xFF)) & 0xFF
+                idx = inp2 >> k if k < 64 else 0
+                k = 16 - test
+                idx = (idx << k) & M64 if 0 <= k < 64 else 0
+            fval = fl[idx]
             if fval <= 0:
                 fneg = -fval
                 tidx = fv[idx]
                 if shift2 <= 15:
-                    inp2 |= shl(be32(buf, roff), 32 - shift2)
+                    k = 32 - shift2
+                    if k < 64:
+                        inp2 = (inp2 | (words[ri] << k)) & M64
                     shift2 += 32
-                    roff += 4
+                    ri += 1
                 shift3 = shift2 - 16
-                inp3 = shl(inp2, 16)
+                inp3 = (inp2 << 16) & M64
                 if shift2 - 16 < fneg:
-                    inp3 |= shl(be32(buf, roff), 48 - shift2)
-                    roff += 4
+                    k = 48 - shift2
+                    if 0 <= k < 64:
+                        inp3 = (inp3 | (words[ri] << k)) & M64
+                    ri += 1
                     shift3 = shift2 + 16
-                oidx = shr(inp3, 64 - fneg)
-                ov, ol = self.vals[tidx], self.lens[tidx]
-                oneg = ol[oidx] - 16
+                k = 64 - fneg
+                oidx = inp3 >> k if 0 <= k < 64 else 0
+                ov = vals[tidx]
+                oneg = lens[tidx][oidx] - 16
                 if shift3 < oneg:
-                    inp3 |= shl(be32(buf, roff), 32 - shift3)
+                    k = 32 - shift3
+                    if 0 <= k < 64:
+                        inp3 = (inp3 | (words[ri] << k)) & M64
                     shift3 += 32
-                    roff += 4
+                    ri += 1
                 shift1 = shift3 - oneg
-                inp1 = shl(inp3, oneg)
+                inp1 = (inp3 << oneg) & M64 if 0 <= oneg < 64 else 0
                 val = ov[oidx] if neg == 0 else -ov[oidx]
             else:
                 if shift2 < fval:
-                    inp2 |= shl(be32(buf, roff), 32 - shift2)
+                    k = 32 - shift2
+                    if 0 <= k < 64:
+                        inp2 = (inp2 | (words[ri] << k)) & M64
                     shift2 += 32
-                    roff += 4
-                inp1 = shl(inp2, fval)
+                    ri += 1
+                inp1 = (inp2 << fval) & M64 if fval < 64 else 0
                 val = fv[idx] if neg == 0 else -fv[idx]
                 shift1 = shift2 - fval
-            struct.pack_into("<H", out, woff, i16(val) & 0xFFFF)
-            woff += 2
-            n -= 1
-            if n == 0:
-                return out
+            res[w] = val & 0xFFFF
+        struct.pack_into(f"<{n}H", out, 0, *res)
+        return out
 
 
 def read_params(data, off):

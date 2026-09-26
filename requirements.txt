@@ -1,6 +1,8 @@
 numpy>=1.24
 requests>=2.28
+httpx[http2]>=0.27
 pycryptodome>=3.15
 pillow>=10.0
 pillow-heif>=0.13
+numba>=0.59          # なくても動くが、C3M の展開が 5 倍ほど速くなる
 pytest>=7.0
