@@ -151,12 +151,11 @@ class Net:
         self.last_ok = [0.0] * len(self.http)      # 最後に応答が返った時刻（loop.time()）
         self.slots = [asyncio.Semaphore(self.STREAMS) for _ in self.http]
         self.errors = (httpx.TransportError,)
-        self.active = {"bulk": 0, "ground": 0, "probe": 0}   # lane ごとの要求の数（出し直しは数えない）
+        self.active = {"bulk": 0, "ground": 0}     # lane ごとの要求の数（出し直しは数えない）
 
     def get(self, make_url, method="GET", lane="bulk"):
         """make_url() の URL を GET した応答。URL は要求を出すたびに作る（認証を付け直す）。
-        lane は "ground"（最初の接続を使う）、"bulk" か "probe"（3D のある範囲を調べる HEAD。
-        残りの接続を使う）。"""
+        lane は "ground"（最初の接続を使う）か "bulk"（残りの接続を使う）。"""
         return asyncio.run_coroutine_threadsafe(self._get(make_url, method, lane), self.loop).result()
 
     def _lane(self, lane):
@@ -331,23 +330,6 @@ class Client:
         os.makedirs(d, exist_ok=True)
         _write(path + ".empty" if b is None else path, b or b"")
         return b
-
-    def tile_exists(self, region, x, y, z, h=0):
-        """タイルにデータがあるか。中身は取らずに HEAD で大きさだけ見る（保存したものがあれば
-        それを使う）。データのないタイルは 404 か、空か、JPEG が返る。"""
-        path = os.path.join(self.cache_dir, "c3m", f"{region['region']}_{region['version']}",
-                            f"{z}_{x}_{y}_{h}.c3m")
-        if os.path.exists(path):
-            return True
-        if os.path.exists(path + ".empty"):
-            return False
-        url = (f"{self.c3m_url}?style={STYLE_C3M}&v={region['version']}&region={region['region']}"
-               f"&x={x}&y={y}&z={z}&h={h}")
-        r = self._get(url, "HEAD", lane="probe")
-        if r.status_code == 404 or r.headers.get("content-type") == "image/jpeg":
-            return False
-        r.raise_for_status()
-        return int(r.headers.get("content-length") or 0) > 0
 
     def _style_tile(self, style, x, y, z, ext):
         """衛星画像や地形のタイル（cache/<style>/ に保存する）。データのないものは None。"""

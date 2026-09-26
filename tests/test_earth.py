@@ -245,54 +245,6 @@ def test_tile_glb_skips_edge_transition_meshes():
     assert glb.tile_glb([C3M(rot, trans, mats, [band, plane])]) is None     # 帯だけのタイルは空
 
 
-def test_cover_mask_refines_only_the_edges():
-    from flyover.earth import cover_mask
-
-    # 地域 (1, 2) の中で、ズーム 15 で見て左上 20 x 12 の升目にだけ 3D がある
-    def inside(z, x, y):
-        k = 1 << (15 - z)
-        c, r = x * k - 64, y * k - 128          # 地域の左上からの升目（ズーム 15）
-        return c < 20 and r < 12 and c + k > 0 and r + k > 0
-    asked = []
-
-    def exists(z, x, y):
-        asked.append((z, x, y))
-        return inside(z, x, y)
-
-    mask = np.unpackbits(np.frombuffer(cover_mask(1, 2, exists), np.uint8)).reshape(64, 64)
-    want = np.zeros((64, 64), np.uint8)
-    want[:12, :20] = 1
-    assert (mask == want).all()
-    assert len(asked) < 600              # 4,096 升目を全部は調べない
-    assert sum(z == 13 for z, _, _ in asked) == 256
-
-
-def test_client_tile_exists_uses_head(tmp_path):
-    c = _offline_client([])
-    c.cache_dir, c.c3m_url = str(tmp_path), "https://example.invalid/tile"
-    region = {"region": 5, "version": 7}
-    sent = []
-
-    class R:
-        def __init__(self, ctype, size):
-            self.status_code, self.headers = 200, {"content-type": ctype, "content-length": str(size)}
-
-        def raise_for_status(self):
-            pass
-
-    def get(url, method="GET", lane="bulk"):
-        sent.append(method)
-        return R("application/x-c3m", 120) if "x=1&" in url else R("application/x-c3m", 0)
-    c._get = get
-    assert c.tile_exists(region, 1, 2, 13) is True
-    assert c.tile_exists(region, 3, 2, 13) is False
-    assert sent == ["HEAD", "HEAD"]
-    d = tmp_path / "c3m" / "5_7"
-    d.mkdir(parents=True)
-    (d / "13_4_2_0.c3m").write_bytes(b"x")
-    assert c.tile_exists(region, 4, 2, 13) is True and len(sent) == 2     # 保存したものがあれば聞かない
-
-
 def test_net_gives_up_on_stuck_requests_and_reconnects(monkeypatch):
     import asyncio
     import time
@@ -343,11 +295,9 @@ def test_net_holds_ground_requests_while_many_tiles_load(monkeypatch):
     import time
     time.sleep(0.05)
     ground = [pool.submit(net.get, (lambda i=i: f"sat{i}"), "GET", "ground") for i in range(3)]
-    probes = [pool.submit(net.get, (lambda i=i: f"head{i}"), "HEAD", "probe") for i in range(3)]
-    for f in tiles + ground + probes:
+    for f in tiles + ground:
         f.result()
     # タイルを取っている間、地面の画像は 1 本ずつしか出ない（3 本目が届くのはタイルの後になる
-    # こともあるが、3 本とも先に全部届くことはない）。範囲を調べる HEAD は地面を止めない
+    # こともあるが、3 本とも先に全部届くことはない）
     first_tile = order.index("tile0")
     assert sum(u.startswith("sat") for u in order[:first_tile]) < 3
-    assert all(u in order for u in ["head0", "head1", "head2"])

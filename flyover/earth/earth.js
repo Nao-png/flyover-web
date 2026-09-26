@@ -357,7 +357,6 @@ addEventListener('keydown', e => {
     case 'u': resetView({ top: true }); break;
     case 'r': resetView({ north: true, top: true }); break;
     case 'o': set2D(!mode2D); break;
-    case 'c': toggleCover(); break;
     case ' ': e.preventDefault(); stopAll(); held.clear(); break;
   }
 });
@@ -427,176 +426,13 @@ function set2D(on) {
 }
 dimBtn.onclick = () => set2D(!mode2D);
 
-// ---------------------------------------------------------------- 3D のある範囲
+// ---------------------------------------------------------------- Flyover のある地域
 
-// Google Earth のように、Flyover（3D）のあるところを黄色で塗って縁取る。範囲はサーバーが Apple の
-// タイルのあるなしから調べた、1 km ほど（ズーム 15 のタイル）の升目で、地域（ズーム 9 のタイル）
-// ごとに 64 x 64。まだ調べていない地域は四角を薄く塗っておき、見ている所に近い地域から調べてもらう。
-// 描くのは地球儀に貼る画像（地形に沿い、縁の太さが寄っても離れても同じになる）。
 const covered = new Set(cfg.coverage.map(([x, y]) => x + ',' + y));
 function tileRect(z, x, y) {
   const n = 2 ** z, lat = j => Math.atan(Math.sinh(Math.PI * (1 - 2 * j / n)));
   return C.Rectangle.fromRadians(x / n * 2 * Math.PI - Math.PI, lat(y + 1), (x + 1) / n * 2 * Math.PI - Math.PI, lat(y));
 }
-const coverMasks = new Map();     // 'x,y' -> 64 x 64 の canvas（3D のある升目が不透明）
-function addMask(key, b64) {
-  const bin = atob(b64), cv = document.createElement('canvas');
-  cv.width = cv.height = 64;
-  const ctx = cv.getContext('2d'), img = ctx.createImageData(64, 64);
-  for (let i = 0; i < 4096; i++) {
-    if (bin.charCodeAt(i >> 3) >> (7 - (i & 7)) & 1) img.data.set([255, 255, 255, 255], i * 4);
-  }
-  ctx.putImageData(img, 0, 0);
-  coverMasks.set(key, cv);
-}
-
-const COVER_FILL = [255, 196, 38, 80], COVER_LINE = [255, 204, 51, 235], COVER_TODO = [255, 196, 38, 30];
-const TS = 256, PAD = 3, TW = TS + 2 * PAD;
-const work = document.createElement('canvas');
-work.width = work.height = TW;
-const wctx = work.getContext('2d', { willReadFrequently: true });
-wctx.imageSmoothingQuality = 'high';
-const blank = document.createElement('canvas');
-blank.width = blank.height = 1;
-// 画像のタイル 1 枚。升目を画素に引き伸ばし（縮め）て描き、升目が画素の半分ほど以上を占めるところを
-// 範囲とする。範囲のうち、2 画素以内に範囲の外があるところが縁。縁が隣のタイルとつながるよう、
-// 周りを PAD 画素ずつ広く描いて判定する
-function drawCover(x, y, level) {
-  const f = 2 ** (level - 9), sz = TS * f;          // 地域 1 つの幅（画素）
-  const x0 = x / f - PAD / sz, x1 = (x + 1) / f + PAD / sz, y0 = y / f - PAD / sz, y1 = (y + 1) / f + PAD / sz;
-  const done = [], todo = [];
-  for (const [rx, ry] of cfg.coverage) {
-    if (rx + 1 <= x0 || rx >= x1 || ry + 1 <= y0 || ry >= y1) continue;
-    const m = coverMasks.get(rx + ',' + ry), at = [PAD + (rx * f - x) * TS, PAD + (ry * f - y) * TS];
-    (m ? done : todo).push([m, at]);
-  }
-  if (!done.length && !todo.length) return blank;
-  const read = draw => { wctx.clearRect(0, 0, TW, TW); draw(); return wctx.getImageData(0, 0, TW, TW).data; };
-  const a = done.length && read(() => {
-    wctx.imageSmoothingEnabled = true;
-    for (const [m, [dx, dy]] of done) wctx.drawImage(m, dx, dy, sz, sz);
-  });
-  const b = todo.length && read(() => {
-    wctx.fillStyle = '#fff';
-    for (const [, [dx, dy]] of todo) wctx.fillRect(dx, dy, sz, sz);
-  });
-  // 縮めて描くときは、小さな範囲が消えないよう、少しでも占めていれば範囲にする
-  const T = sz >= 64 ? 128 : 72, R = 4 * TW;
-  const out = document.createElement('canvas');
-  out.width = out.height = TS;
-  const octx = out.getContext('2d'), img = octx.createImageData(TS, TS), o = img.data;
-  for (let j = 0; j < TS; j++) {
-    for (let i = 0, k = ((j + PAD) * TW + PAD) * 4 + 3, q = j * TS * 4; i < TS; i++, k += 4, q += 4) {
-      if (a && a[k] >= T) {
-        const edge = a[k - 4] < T || a[k + 4] < T || a[k - R] < T || a[k + R] < T || a[k - 8] < T ||
-          a[k + 8] < T || a[k - 2 * R] < T || a[k + 2 * R] < T || a[k - R - 4] < T || a[k - R + 4] < T ||
-          a[k + R - 4] < T || a[k + R + 4] < T;
-        o.set(edge ? COVER_LINE : COVER_FILL, q);
-      } else if (b && b[k] >= 128) {
-        o.set(COVER_TODO, q);
-      }
-    }
-  }
-  octx.putImageData(img, 0, 0);
-  return out;
-}
-class CoverImagery {
-  constructor() {
-    this.tilingScheme = new C.WebMercatorTilingScheme();
-    this.rectangle = this.tilingScheme.rectangle;
-    this.tileWidth = this.tileHeight = TS;
-    this.minimumLevel = 0;
-    this.maximumLevel = 16;
-    this.errorEvent = new C.Event();
-    this.hasAlphaChannel = true;
-    this.credit = this.proxy = this.tileDiscardPolicy = undefined;
-  }
-  get ready() { return true; }
-  getTileCredits() { return undefined; }
-  requestImage(x, y, level) { return Promise.resolve(drawCover(x, y, level)); }
-  pickFeatures() { return undefined; }
-}
-
-// 描いた画像は Cesium が覚えていて描き直せないので、範囲が増えたら層ごと作り直す。新しい層が
-// 描けるまでの間が空かないよう、古い層と少し重ねてから入れ替える
-let coverOn = true, coverAlpha = 0, coverFade = null, coverDirty = false, coverRefreshed = 0;
-let coverLayer = newCoverLayer(1);
-function newCoverLayer(alpha) {
-  const l = viewer.imageryLayers.addImageryProvider(new CoverImagery());
-  l.alpha = alpha;
-  l.show = coverAlpha > 0;
-  return l;
-}
-function refreshCover() {
-  if (coverFade) viewer.imageryLayers.remove(coverFade.old);
-  coverFade = { old: coverLayer, start: performance.now() };
-  coverLayer = newCoverLayer(0.001);
-  coverDirty = false;
-  coverRefreshed = performance.now();
-  scene.requestRender();
-}
-function fadeCover(now) {
-  if (!coverFade) return false;
-  const t = Math.min(1, Math.max(0, (now - coverFade.start - 300) / 300));
-  coverLayer.alpha = Math.max(0.001, t * coverAlpha);
-  coverFade.old.alpha = (1 - t) * coverAlpha;
-  if (t >= 1) { viewer.imageryLayers.remove(coverFade.old); coverFade = null; }
-  return true;
-}
-const coverBtn = document.getElementById('cover-btn');
-function toggleCover() {
-  coverOn = !coverOn;
-  coverBtn.classList.toggle('on', coverOn);
-  coverBtn.setAttribute('aria-pressed', coverOn);
-  updateCover();
-}
-coverBtn.onclick = toggleCover;
-// 上空から見たときだけ出す。寄ると 3D の街が上に重なるが、地形が 3D より高い山あいなどでは下から
-// のぞくので、高度 50 km から 20 km までの間に消していく
-function updateCover() {
-  const c = ellipsoid.cartesianToCartographic(camera.positionWC);
-  const a = coverOn && c ? C.Math.clamp((c.height - 20e3) / 30e3, 0, 1) : 0;
-  if (a === coverAlpha) return;
-  coverAlpha = a;
-  for (const l of [coverLayer, coverFade && coverFade.old]) if (l) l.show = a > 0;
-  if (!coverFade) coverLayer.alpha = a;
-  scene.requestRender();
-}
-
-// まだ調べていない地域のうち、見ている範囲にあるものを、画面の中心に近い順に 4 つずつ調べてもらう
-const coverRects = new Map(cfg.coverage.map(([x, y]) => [x + ',' + y, tileRect(9, x, y)]));
-const coverBusy = new Set(), coverRetry = new Map();
-const scratchRect = new C.Rectangle(), scratchCarto = new C.Cartographic();
-function pumpCover() {
-  if (coverDirty && (!coverBusy.size || performance.now() - coverRefreshed > 3000) && !coverFade) refreshCover();
-  // 隠れているタブや、3D の街を読んでいる間は調べない（Apple への要求とサーバーの CPU を取り合う）
-  if (!coverAlpha || coverBusy.size >= 4 || document.hidden || active > 0) return;
-  const view = camera.computeViewRectangle(ellipsoid);
-  const c = ellipsoid.cartesianToCartographic(camera.positionWC);
-  if (!view || !c) return;
-  const now = performance.now(), want = [];
-  for (const [key, r] of coverRects) {
-    if (coverMasks.has(key) || coverBusy.has(key) || (coverRetry.get(key) || 0) > now) continue;
-    if (!C.Rectangle.intersection(r, view, scratchRect)) continue;
-    const m = C.Rectangle.center(r, scratchCarto);
-    want.push([Math.hypot(C.Math.negativePiToPi(m.longitude - c.longitude) * Math.cos(c.latitude), m.latitude - c.latitude), key]);
-  }
-  want.sort((p, q) => p[0] - q[0]);
-  for (const [, key] of want.slice(0, 4 - coverBusy.size)) {
-    coverBusy.add(key);
-    const [x, y] = key.split(',');
-    fetch(`/api/cover/${x}/${y}.json`).then(r => r.ok ? r.json() : Promise.reject(r.status)).then(b64 => {
-      if (b64) addMask(key, b64); else coverRects.delete(key);
-      coverDirty = true;
-    }).catch(() => coverRetry.set(key, performance.now() + 30e3)).finally(() => coverBusy.delete(key));
-  }
-}
-// 調べ終えてあるものは最初にまとめてもらう
-fetch('/api/cover').then(r => r.json()).then(all => {
-  for (const [key, b64] of Object.entries(all)) addMask(key, b64);
-  if (coverMasks.size) coverDirty = true;
-}).catch(() => {});
-setInterval(pumpCover, 250);
 
 // ---------------------------------------------------------------- Flyover のタイル
 
@@ -910,7 +746,7 @@ scene.preUpdate.addEventListener(() => {
   updateMs = performance.now() - t0;
   // 読み込み中（モデルや地形は描くときに処理が進む）や、動きがあるときは次のコマも描く。
   // 地球儀は描かないと読み込みが始まらないので、最初は読み終えるまで描き続ける
-  if (fadeCover(now) || anim || held.size || active > 0 || globeQueue > 0 || !globe.tilesLoaded) scene.requestRender();
+  if (anim || held.size || active > 0 || globeQueue > 0 || !globe.tilesLoaded) scene.requestRender();
 });
 
 // ---------------------------------------------------------------- 下の帯
@@ -973,7 +809,6 @@ setInterval(() => {
   } else {
     $('scale').hidden = true;
   }
-  updateCover();
 }, 150);
 
 // ---------------------------------------------------------------- URL に視点を残す

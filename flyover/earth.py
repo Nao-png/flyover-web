@@ -2,8 +2,6 @@
 サーバー。ビューアの一式（earth/）と、次の API を配る:
 
     /api/config                        Flyover のある地域（ズーム 9 のタイル）など
-    /api/cover                         調べ終えた地域の、3D のある範囲（下の cover_mask）
-    /api/cover/<x>/<y>.json            ズーム 9 のタイル x, y の地域の、3D のある範囲
     /api/flyover/<z>/<x>/<y>.glb       Flyover のタイル（高さ区分をまとめた glb）。ないときは 204
     /api/sat/<z>/<x>/<y>.jpg           衛星画像
     /api/terrain/<level>/<x>/<y>.bin   地形（地理座標のタイル、65 x 65 の float32 の楕円体高と、
@@ -12,7 +10,6 @@
 
 取得したものは cache/ に保存し、次からはそれを使う。
 """
-import base64
 import http.server
 import json
 import mimetypes
@@ -73,36 +70,6 @@ def build_glb(raws, name):
     return glb.tile_glb(tiles) if tiles else None
 
 
-COVER_ZOOMS = (13, 15)          # 3D のある範囲は、この範囲のズームのタイルがあるかで調べる
-
-
-def cover_mask(x, y, exists, map=map):
-    """ズーム 9 のタイル x, y の地域で、3D のあるところ。ズーム 15 のタイル（1 km ほど）ごとの
-    64 x 64 の印（北の行から、行ごとに西から）を、1 ビットずつ詰めた 512 バイトにして返す。
-
-    exists(z, x, y) はそのタイルにデータがあるか。全部をズーム 15 で調べると 4,096 回になるので、
-    ズーム 13 の 256 枚を調べ、あるもののうち上下左右のどれかがないもの（範囲の縁）だけ、4 つの
-    子を調べることを繰り返す。縁でないものは中まで全部あるとみなす。map は並べて調べるのに使う。"""
-    z0, z1 = COVER_ZOOMS
-    top = 1 << (z1 - 9)
-    mask = np.zeros((top, top), bool)
-    s = 1 << (z0 - 9)
-    cand = [(x * s + i, y * s + j) for j in range(s) for i in range(s)]
-    for z in range(z0, z1 + 1):
-        found = {t for t, ok in zip(cand, map(lambda t: exists(z, *t), cand)) if ok}
-        edge = set() if z == z1 else {
-            (tx, ty) for tx, ty in found
-            if not {(tx + 1, ty), (tx - 1, ty), (tx, ty + 1), (tx, ty - 1)} <= found}
-        n, k = 1 << (z - 9), 1 << (z1 - z)
-        for tx, ty in found - edge:
-            c, r = (tx - x * n) * k, (ty - y * n) * k
-            mask[r:r + k, c:c + k] = True
-        cand = [(2 * tx + i, 2 * ty + j) for tx, ty in sorted(edge) for j in (0, 1) for i in (0, 1)]
-        if not cand:
-            break
-    return np.packbits(mask).tobytes()
-
-
 def _warm_worker():
     """作業プロセスの準備（最初のタイルを待たせないよう、起動時に済ませる）。ブラウザと CPU を
     取り合わないよう、優先度を少し下げ、HEIC の復号は 1 本のスレッドでする（既定ではコアの数だけ
@@ -144,10 +111,6 @@ class Earth:
         self.terrain = Terrain(self.client, Geoid(cache_dir, self.client.http), self.map)
         self._locks, self._locks_lock = {}, threading.Lock()
         self.tile_hosts = []            # タイルを受けるアドレス（serve が足す）
-        # 3D のある範囲を調べる HEAD 用。1 回に 0.3 秒ほどかかるので並べる（範囲を出すのは上空から
-        # 見ているときだけで、そのときは Flyover のタイルを取っていないので、取り合いにはならない）
-        self.cover_pool = ThreadPoolExecutor(128)
-        self._cover_dir = os.path.join(cache_dir, "cover")
 
     def map(self, fn, items):
         return list(self.pool.map(fn, items))
@@ -191,35 +154,6 @@ class Earth:
             open(tmp, "wb").write(out or b"")
             os.replace(tmp, path)
             return out
-
-    def _cover_path(self, region):
-        return os.path.join(self._cover_dir, f"{region['region']}_{region['version']}.bin")
-
-    def cover(self, x, y):
-        """ズーム 9 のタイル x, y の地域の cover_mask（base64）。地域がなければ None。
-        調べたものは cache/cover/ に保存する。"""
-        region = self.client.region_of_tile(x, y, 9, strict=True)
-        if region is None:
-            return None
-        path = self._cover_path(region)
-        with self._lock(("cover", x, y)):
-            if not os.path.exists(path):
-                mask = cover_mask(x, y, lambda z, tx, ty: self.client.tile_exists(region, tx, ty, z),
-                                  lambda fn, items: list(self.cover_pool.map(fn, items)))
-                os.makedirs(self._cover_dir, exist_ok=True)
-                tmp = f"{path}.{threading.get_ident()}.tmp"
-                open(tmp, "wb").write(mask)
-                os.replace(tmp, path)
-            return base64.b64encode(open(path, "rb").read()).decode()
-
-    def covers(self):
-        """調べ終えた地域の cover_mask（"x,y" -> base64）。"""
-        out = {}
-        for (x, y) in self.client.covered():
-            path = self._cover_path(self.client.region_of_tile(x, y, 9, strict=True))
-            if os.path.exists(path):
-                out[f"{x},{y}"] = base64.b64encode(open(path, "rb").read()).decode()
-        return out
 
     def satellite(self, z, x, y):
         with self._lock(("sat", z, x, y)):
@@ -281,12 +215,6 @@ def handler(earth):
         def route(self, path, query):
             if path == "/api/config":
                 return self.send(200, json.dumps(earth.config()).encode(), "application/json", cache=False)
-            if path == "/api/cover":
-                return self.send(200, json.dumps(earth.covers()).encode(), "application/json", cache=False)
-            m = re.fullmatch(r"/api/cover/(\d+)/(\d+)\.json", path)
-            if m:
-                mask = earth.cover(*map(int, m.groups()))
-                return self.send(200, json.dumps(mask).encode(), "application/json", cache=False)
             if path == "/api/search":
                 res = earth.search(query.get("q", [""])[0])
                 return self.send(200, json.dumps(res, ensure_ascii=False).encode(),
