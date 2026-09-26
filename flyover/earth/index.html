@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flyover Earth</title>
+<script>window.CESIUM_BASE_URL = 'https://cdn.jsdelivr.net/npm/cesium@1.145.0/Build/Cesium/';</script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/cesium@1.145.0/Build/Cesium/Widgets/widgets.css">
+<script src="https://cdn.jsdelivr.net/npm/cesium@1.145.0/Build/Cesium/Cesium.js"></script>
+<link rel="stylesheet" href="earth.css">
+</head>
+<body>
+<div id="globe"></div>
+
+<div id="search">
+  <form id="search-form" autocomplete="off">
+    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+    <input id="q" type="search" placeholder="場所を検索（地名、または 緯度, 経度）" aria-label="場所を検索">
+  </form>
+  <div id="results" hidden></div>
+</div>
+
+<div id="controls">
+  <button id="help-btn" class="round small" title="操作方法（?）" aria-label="操作方法">?</button>
+  <button id="dim-btn" class="round" title="2D と 3D を切り替え（O）">3D</button>
+  <button id="compass" class="round" title="北を上に（N）" aria-label="北を上に">
+    <svg viewBox="0 0 40 40" aria-hidden="true"><g id="needle"><path d="M20 5 L25 20 L15 20 Z" fill="#e8453c"/><path d="M20 35 L25 20 L15 20 Z" fill="#cfd4da"/></g></svg>
+  </button>
+  <div class="zoom">
+    <button id="zoom-in" title="拡大（PageUp / +）" aria-label="拡大">+</button>
+    <button id="zoom-out" title="縮小（PageDown / -）" aria-label="縮小">−</button>
+  </div>
+</div>
+
+<div id="status">
+  <span id="loading" hidden><i></i>読み込み中</span>
+  <span id="scale"><b></b><i></i></span>
+  <span id="cursor"></span>
+  <span id="camera"></span>
+  <span id="credits"></span>
+</div>
+
+<div id="help" hidden>
+  <div class="card" role="dialog" aria-labelledby="help-title">
+    <button class="close" aria-label="閉じる">×</button>
+    <h2 id="help-title">操作方法</h2>
+    <div class="cols">
+      <section>
+        <h3>マウス</h3>
+        <dl>
+          <dt>ドラッグ</dt><dd>移動（地面をつかんで動かす）</dd>
+          <dt>ホイール</dt><dd>拡大・縮小（カーソルの方へ）</dd>
+          <dt>Shift + ドラッグ</dt><dd>左右で回転、上下で傾き</dd>
+          <dt>中ボタンでドラッグ</dt><dd>回転・傾き</dd>
+          <dt>Ctrl + ドラッグ</dt><dd>その場で見回す</dd>
+          <dt>右ボタンでドラッグ</dt><dd>拡大・縮小</dd>
+          <dt>Shift + ホイール</dt><dd>傾き</dd>
+          <dt>ダブルクリック</dt><dd>カーソルの方へ寄る</dd>
+          <dt>右ダブルクリック</dt><dd>カーソルから離れる</dd>
+        </dl>
+      </section>
+      <section>
+        <h3>キーボード</h3>
+        <dl>
+          <dt>矢印</dt><dd>移動</dd>
+          <dt>Shift + ←→</dt><dd>回転</dd>
+          <dt>Shift + ↑↓</dt><dd>傾き</dd>
+          <dt>PageUp / PageDown、+ / -</dt><dd>拡大・縮小</dd>
+          <dt>Shift + PageUp / PageDown</dt><dd>高度を上げる・下げる</dd>
+          <dt>Alt を押しながら</dt><dd>ゆっくり動かす</dd>
+          <dt>N</dt><dd>北を上に</dd>
+          <dt>U</dt><dd>真上から見る</dd>
+          <dt>R</dt><dd>北を上にして真上から（リセット）</dd>
+          <dt>O</dt><dd>2D と 3D を切り替え</dd>
+          <dt>Space</dt><dd>動きを止める</dd>
+          <dt>/</dt><dd>検索</dd>
+          <dt>?</dt><dd>この一覧</dd>
+        </dl>
+      </section>
+    </div>
+    <p class="note">Flyover（3D）のある所では、寄っていくと 3D の街が読み込まれます。</p>
+  </div>
+</div>
+
+<script src="earth.js"></script>
+</body>
+</html>

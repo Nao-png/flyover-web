@@ -4,11 +4,19 @@ retroplasma/flyover-reverse-engineering の pkg/fly/c3m/internal/edgebreaker.go 
 変数名はあちらに合わせてある（逆コンパイル由来で意味の分からない名前が多い）。
 頂点と UV は int16 の差分で詰められていて、予測との和は int16 で折り返す。
 """
+import os
 import struct
 
 import numpy as np
 
 from .huffman import be32, i16
+
+try:                     # numba があれば、重い部分をそちらで（なくても同じ結果で動く）
+    from . import _fast
+except ImportError:
+    _fast = None
+if os.environ.get("FLYOVER_NO_NUMBA"):
+    _fast = None
 
 NEXT = (1, 2, 0)   # 三角形の中で次の角
 PREV = (2, 0, 1)
@@ -334,6 +342,153 @@ def make_res7(res9, buf3, i32_1, a):
         tri += 3
 
 
+def _traverse(a, res4, res6, d8, d1, vtd, uvd, res1, res9, res3_total):
+    """三角形をたどって頂点と UV を復元する（展開の処理のほとんどを占める）。numba があれば
+    _fast.traverse（同じ処理）を使う。(vtx, uv, res5, group, UV の数)。"""
+    uv = [0] * (res3_total * 2)
+    res5 = [0] * (res9 * 3)            # 角ごとの UV 番号
+    seen = [0] * res1                  # bf_res1mul4_a（頂点が復元済みか）
+    uvof = [-1] * res1                 # bf_res1mul4_b（頂点の UV 番号）
+    unset = [-1] * res1
+    done = [0] * res9                  # bf_res9mul4_a（三角形を訪れたか）
+    stack = [0] * (res9 * 3)           # bf_res9mul12_b
+    later = [0] * (res9 * 3)           # bf_res9mul12_c
+    vtx = [0] * (res1 * 3)
+    group = [0] * res9                 # bf_res9mul4_b_res6t
+    n_uv = [0]
+
+    # ここから先は処理のほとんどを占めるので、速さのために書き下してある:
+    # 0 以上の角の番号の次・前は表 NX・PV で引き（負の番号は Go の振る舞いに合わせて nxt・prv）、
+    # int16 の折り返し i16(x) は ((x + 0x8000) & 0xFFFF) - 0x8000、int(v / 3) は v // 3（v >= 0）
+    NX = [c for t in range(0, 3 * res9, 3) for c in (t + 1, t + 2, t)]
+    PV = [c for t in range(0, 3 * res9, 3) for c in (t + 2, t, t + 1)]
+
+    def unpack_vtx(av):
+        idx3 = a[av]
+        if idx3 >= 0:
+            h, i_ = 3 * res4[NX[idx3]], 3 * res4[PV[idx3]]
+        else:
+            h, i_ = 3 * res4[nxt(idx3)], 3 * res4[prv(idx3)]
+        j = 3 * res4[idx3]
+        k = 3 * res4[av]
+        vtx[k] = ((vtx[h] + vtx[i_] - vtx[j] - vtd[k] + 0x8000) & 0xFFFF) - 0x8000
+        vtx[k + 1] = ((vtx[h + 1] + vtx[i_ + 1] - vtx[j + 1] - vtd[k + 1] + 0x8000) & 0xFFFF) - 0x8000
+        vtx[k + 2] = ((vtx[h + 2] + vtx[i_ + 2] - vtx[j + 2] - vtd[k + 2] + 0x8000) & 0xFFFF) - 0x8000
+        seen[k // 3] = 1
+
+    def unpack_uv(c3):
+        r = n_uv[0]
+        for idx in (PV[c3], c3, NX[c3]):
+            uv[2 * r], uv[2 * r + 1] = uvd[2 * r], uvd[2 * r + 1]
+            res5[idx] = r
+            uvof[res4[idx]] = r
+            r += 1
+        n_uv[0] = r
+
+    ctrA = ctrC = ctrB = ctrD = ctd = 0
+    while True:                                    # BIG_LOOP
+        while ctrC < res9 and done[ctrC] != 0:
+            ctrC += 1
+        if ctrC == res9:
+            break
+        c3 = 3 * ctrC
+        stack[ctrA] = c3
+        ctrA += 1
+        for e in (res4[PV[c3]], res4[c3], res4[NX[c3]]):
+            vtx[3 * e:3 * e + 3] = vtd[3 * e:3 * e + 3]
+            seen[e] = 1
+        unpack_uv(c3)
+        done[ctrC] = 1
+        group[ctrC] = res6[ctrB]
+        ctrB += 1
+        if (ctd | ctrA) == 0:
+            continue
+        nb = ctrB
+        restart = False
+        while True:
+            if ctrA != 0:
+                nb01 = nb
+            else:
+                cnt = ctd - 1
+                while True:
+                    v = later[cnt]
+                    x = done[v // 3]
+                    ctd -= 1
+                    if ctd == 0:
+                        break
+                    cnt -= 1
+                    if x == 0:
+                        break
+                if x != 0:
+                    ctrA = 0
+                    ctrB = nb
+                    restart = True
+                    break
+                uvof[:] = unset                    # 全部 -1 に戻す
+                if seen[res4[v]] == 0:
+                    unpack_vtx(v)
+                unpack_uv(v)
+                ctrA = 1
+                done[v // 3] = 1
+                nb01 = nb + 1
+                group[v // 3] = res6[nb]
+                stack[0] = v
+            nb = nb01
+            am1 = ctrA - 1
+            cond = stack[ctrA - 1]
+            g6 = res6[nb01 - 1]
+            ii = cond
+            while True:
+                av = a[ii]
+                if av >= 0 and done[av // 3] == 0:
+                    i1, i2 = PV[ii], NX[ii]
+                    other = True
+                    if d8[res4[i1]] != 0 and d8[res4[i2]] != 0:
+                        ctrD += 1
+                        if d1[ctrD - 1] != 0:
+                            later[ctd] = av
+                            ctd += 1
+                            other = False
+                    if other:
+                        t = res4[av]
+                        if seen[t] == 0:
+                            unpack_vtx(av)
+                        r = uvof[t]
+                        if r == -1:
+                            an = a[av]
+                            if an >= 0:
+                                n1, n2 = res5[NX[an]], res5[PV[an]]
+                            else:
+                                n1, n2 = res5[nxt(an)], res5[prv(an)]
+                            n3 = res5[an]
+                            r = n_uv[0]
+                            nu = ((uv[2 * n1] + uv[2 * n2] - uv[2 * n3] + 0x8000) & 0xFFFF) - 0x8000
+                            nv = ((uv[2 * n1 + 1] + uv[2 * n2 + 1] - uv[2 * n3 + 1] + 0x8000) & 0xFFFF) - 0x8000
+                            uv[2 * r] = ((nu - uvd[2 * r] + 0x8000) & 0xFFFF) - 0x8000
+                            uv[2 * r + 1] = ((nv - uvd[2 * r + 1] + 0x8000) & 0xFFFF) - 0x8000
+                            n_uv[0] = r + 1
+                            uvof[t] = r
+                        res5[av] = r
+                        res5[PV[av]] = res5[i2]
+                        res5[NX[av]] = res5[i1]
+                        done[av // 3] = 1
+                        group[av // 3] = g6
+                        stack[am1] = av
+                        am1 += 1
+                ii = NX[ii]
+                if ii == cond:
+                    break
+            ctrA = am1
+            if (ctd | am1) == 0:
+                ctrB = nb
+                restart = True
+                break
+        if restart:
+            continue
+
+    return vtx, uv, res5, group, n_uv[0]
+
+
 def decompress(data, off, table_a, table_b):
     """展開したメッシュ。vertices (res1, 3) float32、uv (res3, 2) float32、faces（角ごとの頂点
     番号 res4）、res5（角ごとの UV 番号）、groups（三角形ごとの材質 res6）、res8、faces_count。"""
@@ -374,7 +529,13 @@ def decompress(data, off, table_a, table_b):
         raise ValueError("incorrect values in buf 5 #2")
 
     meta_ctr, meta, wbo, clers = decode_clers(bufs[2], res9, b5unkn32, a)
-    process_clers(meta, meta_ctr, clers, wbo, b5unkn32, res1, a, b)
+    if _fast is not None:
+        an, bn = np.array(a, np.int64), np.array(b, np.int64)
+        _fast.process_clers(np.array(meta, np.int64), meta_ctr, np.frombuffer(bytes(clers), np.uint8),
+                            wbo, b5unkn32, res1, an, bn)
+        a, b = an.tolist(), bn.tolist()
+    else:
+        process_clers(meta, meta_ctr, clers, wbo, b5unkn32, res1, a, b)
     res4 = b
 
     make_res7(res9, bufs[3], i32_1, a)   # 使わないが、あちらと同じく読んでおく
@@ -408,131 +569,12 @@ def decompress(data, off, table_a, table_b):
     vtd = struct.unpack(f"<{len(bufs[7]) // 2}h", bufs[7][:len(bufs[7]) // 2 * 2])
 
     res3_total = i32le(b0, 41)
-    uv = [0] * (res3_total * 2)
-    res5 = [0] * (res9 * 3)            # 角ごとの UV 番号
-    seen = [0] * res1                  # bf_res1mul4_a（頂点が復元済みか）
-    uvof = [-1] * res1                 # bf_res1mul4_b（頂点の UV 番号）
-    done = [0] * res9                  # bf_res9mul4_a（三角形を訪れたか）
-    stack = [0] * (res9 * 3)           # bf_res9mul12_b
-    later = [0] * (res9 * 3)           # bf_res9mul12_c
-    vtx = [0] * (res1 * 3)
-    group = [0] * res9                 # bf_res9mul4_b_res6t
-    n_uv = [0]
-
-    def unpack_vtx(av):
-        idx3 = a[av]
-        h, i_, j = 3 * res4[nxt(idx3)], 3 * res4[prv(idx3)], 3 * res4[idx3]
-        k = res4[av]
-        for c in range(3):
-            vtx[3 * k + c] = i16(vtx[h + c] + vtx[i_ + c] - vtx[j + c] - vtd[3 * k + c])
-        seen[k] = 1
-
-    def unpack_uv(c3):
-        for idx in (prv(c3), c3, nxt(c3)):
-            r = n_uv[0]
-            uv[2 * r], uv[2 * r + 1] = uvd[2 * r], uvd[2 * r + 1]
-            res5[idx] = r
-            uvof[res4[idx]] = r
-            n_uv[0] += 1
-
-    ctrA = ctrC = ctrB = ctrD = ctd = 0
-    while True:                                    # BIG_LOOP
-        while ctrC < res9 and done[ctrC] != 0:
-            ctrC += 1
-        if ctrC == res9:
-            break
-        stack[ctrA] = 3 * ctrC
-        ctrA += 1
-        for e in (res4[prv(3 * ctrC)], res4[3 * ctrC], res4[nxt(3 * ctrC)]):
-            vtx[3 * e:3 * e + 3] = vtd[3 * e:3 * e + 3]
-            seen[e] = 1
-        unpack_uv(3 * ctrC)
-        done[ctrC] = 1
-        group[ctrC] = res6[ctrB]
-        ctrB += 1
-        if (ctd | ctrA) == 0:
-            continue
-        nb = ctrB
-        restart = False
-        while True:
-            if ctrA != 0:
-                nb01 = nb
-            else:
-                cnt = ctd - 1
-                while True:
-                    v = later[cnt]
-                    x = done[int(v / 3)]
-                    ctd -= 1
-                    if ctd == 0:
-                        break
-                    cnt -= 1
-                    if x == 0:
-                        break
-                if x != 0:
-                    ctrA = 0
-                    ctrB = nb
-                    restart = True
-                    break
-                for i in range(res1):
-                    uvof[i] = -1
-                if seen[res4[v]] == 0:
-                    unpack_vtx(v)
-                unpack_uv(v)
-                ctrA = 1
-                done[int(v / 3)] = 1
-                nb01 = nb + 1
-                group[int(v / 3)] = res6[nb]
-                stack[0] = v
-            nb = nb01
-            am1 = ctrA - 1
-            cond = stack[ctrA - 1]
-            r6 = nb01 - 1
-            ii = stack[ctrA - 1]
-            while True:
-                av = a[ii]
-                if av >= 0 and done[int(av / 3)] == 0:
-                    i1, i2 = prv(ii), nxt(ii)
-                    other = True
-                    if d8[res4[i1]] != 0 and d8[res4[i2]] != 0:
-                        ctrD += 1
-                        if d1[ctrD - 1] != 0:
-                            later[ctd] = av
-                            ctd += 1
-                            other = False
-                    if other:
-                        t = res4[av]
-                        if seen[t] == 0:
-                            unpack_vtx(av)
-                        r = uvof[t]
-                        if r == -1:
-                            an = a[av]
-                            n1, n2, n3 = res5[nxt(an)], res5[prv(an)], res5[an]
-                            r = n_uv[0]
-                            nu = i16(uv[2 * n1] + uv[2 * n2] - uv[2 * n3])
-                            nv = i16(uv[2 * n1 + 1] + uv[2 * n2 + 1] - uv[2 * n3 + 1])
-                            uv[2 * r] = i16(nu - uvd[2 * r])
-                            uv[2 * r + 1] = i16(nv - uvd[2 * r + 1])
-                            n_uv[0] += 1
-                            uvof[res4[av]] = r
-                        res5[av] = r
-                        res5[prv(av)] = res5[i2]
-                        res5[nxt(av)] = res5[i1]
-                        done[int(av / 3)] = 1
-                        group[int(av / 3)] = res6[r6]
-                        stack[am1] = av
-                        am1 += 1
-                ii = nxt(ii)
-                if ii == cond:
-                    break
-            ctrA = am1
-            if (ctd | am1) == 0:
-                ctrB = nb
-                restart = True
-                break
-        if restart:
-            continue
-
-    res3 = n_uv[0]
+    args = (a, res4, res6, d8, d1, vtd, uvd, res1, res9, res3_total)
+    if _fast is not None:
+        vtx, uv, res5, group, res3 = _fast.traverse(*[np.asarray(x, np.int64) if isinstance(x, (list, tuple)) else x
+                                                      for x in args])
+    else:
+        vtx, uv, res5, group, res3 = _traverse(*args)
     # あちらと同じく float64 で計算してから float32 に丸める
     verts = (np.array(vtx, np.float64).reshape(-1, 3) * f64 + np.array(f32, np.float64)).astype(np.float32)
     scale = 1.0 / ((1 << i8_0) - 1)

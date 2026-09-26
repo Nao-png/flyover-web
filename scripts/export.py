@@ -40,29 +40,12 @@ def main():
     x0, y0 = flyover.tile_xy(a.lat, a.lon, a.zoom)
     print(f"地域 {region['name']}（region {region['region']}、版 {region['version']}）、"
           f"タイル x={x0} y={y0} z={a.zoom}", flush=True)
-    def tile_dir(x, y):
-        r = client.region_of_tile(x, y, a.zoom)
-        d = os.path.join(a.cache, "c3m", f"{r['region']}_{r['version']}")
-        os.makedirs(d, exist_ok=True)
-        return d
-
     jobs = [(x0 + dx, y0 + dy, h) for dx in range(-a.radius, a.radius + 1)
             for dy in range(-a.radius, a.radius + 1) for h in range(a.heights)]
 
     def get(job):
         x, y, h = job
-        path = os.path.join(tile_dir(x, y), f"{a.zoom}_{x}_{y}_{h}.c3m")
-        empty = path + ".empty"
-        if os.path.exists(path):
-            return job, open(path, "rb").read()
-        if os.path.exists(empty):
-            return job, None
-        b = client.tile(client.region_of_tile(x, y, a.zoom), x, y, a.zoom, h)
-        if b is None:
-            open(empty, "wb").close()
-        else:
-            open(path, "wb").write(b)
-        return job, b
+        return job, client.tile_cached(client.region_of_tile(x, y, a.zoom), x, y, a.zoom, h)
 
     t = time.time()
     tiles, failed = [], 0
