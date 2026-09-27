@@ -132,5 +132,5 @@ python -m pytest tests -q
 
 - Fetched data (`cache/`, `out/`) is Apple's copyrighted material. It is kept out of the repository (listed in `.gitignore`)
 - The globe server only listens locally (127.0.0.1–127.0.0.17). To get around the browser's limit on concurrent connections (6 per host), Flyover, satellite and terrain tiles are spread across different loopback addresses
-- Extracting Apple Maps data this way may conflict with Apple's terms of service. This repository is meant to stay private
+- Extracting Apple Maps data this way may conflict with Apple's terms of service. Use it at your own risk, and do not redistribute the fetched data
 - The original, retroplasma/flyover-reverse-engineering, has no license. For that reason, this repository has no license either
