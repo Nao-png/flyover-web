@@ -2,21 +2,45 @@
 
 日本語 | [English](README.en.md)
 
-Apple Maps の Flyover（3D の航空写真）を Windows のブラウザで見る。Python だけで動き、Mac は要らない。
+Apple マップの Flyover（街の 3D 航空写真）を、Windows のブラウザで見るためのツールです。
+Python だけで動き、Mac も Apple のアプリも要りません。
 
-## 地球儀で見る（Google Earth のように）
+- **地球儀ビューア** — Google Earth のように地球全体から寄っていくと、Flyover のある街が 3D で表示されます。操作も Google Earth と同じです
+- **書き出し** — 指定した地点のまわりを、ブラウザで見られる一式や OBJ（Blender などで開ける 3D の形式）に書き出します
+
+> [!WARNING]
+> このツールは、Apple が一般には公開していない仕組みを使って Apple マップのデータを取得します。Apple の利用規約に反する可能性があります。使うのは自己責任で、取得したデータを再配布しないでください。このプロジェクトは Apple とは関係ありません。
+
+## 必要なもの
+
+- Python 3（3.13 で動作確認）
+- WebGL が使えるブラウザ（Chrome か Edge で確認）
+- インターネット接続（データは見るたびに Apple から取得します）
+
+Windows 11 で動作を確認しています。
+
+## はじめかた
 
 ```bash
+git clone https://github.com/Nao-png/flyover-web
+cd flyover-web
 pip install -r requirements.txt
-python scripts/earth.py          # http://localhost:8000/
+python scripts/earth.py
 ```
 
-地球全体から寄っていくと、Flyover のある所では 3D の街が読み込まれる。
-下地は Apple の衛星画像と地形。見ている所のタイルをその場で Apple から取り、`cache/` に保存する
-（初めての場所は 2〜5 秒ほどで読み終わり、2 回目からはすぐ出る）。地名か「緯度, 経度」で検索できる。
-検索して飛ぶときは、飛んでいる間に行き先のタイルを読み始める。
+ブラウザで http://localhost:8000/ を開きます。ポートを変えるときは `python scripts/earth.py 8080` のように指定します。
 
-操作は Google Earth と同じ（右下の `?` ボタンか `?` キーで一覧）:
+## 地球儀ビューア
+
+地球全体から寄っていくと、Flyover のある所では 3D の街が読み込まれます。下地には Apple の衛星画像と地形を使います。
+
+- **検索**: 左上の欄に地名か「緯度, 経度」を入れます。3D のある場所には印が付きます
+- **読み込みの速さ**: 最初の 3D は 2〜3 秒で出ます。初めての場所で全部が細かくなるまでは 10〜20 秒ほどかかります（回線の速さしだい）。一度見た場所は `cache/` に保存されるので、2 回目からは 7 秒ほどです
+- **視点の保存**: 今の視点は URL（`#緯度,経度,高度m,方位h,傾きt`）に入るので、ブックマークすればその視点から開けます
+
+### 操作
+
+右下の `?` ボタンか `?` キーで、いつでも一覧を出せます。
 
 | 操作 | マウス | キーボード |
 |---|---|---|
@@ -26,111 +50,77 @@ python scripts/earth.py          # http://localhost:8000/
 | 傾き | Shift + 上下にドラッグ、Shift + ホイール | Shift + ↑ ↓ |
 | 見回す | Ctrl + ドラッグ | |
 | 寄る・離れる | ダブルクリック・右ダブルクリック | |
-| 高度 | | Shift + PageUp / PageDown |
+| 高度を上げる・下げる | | Shift + PageUp / PageDown |
 | 北を上に・真上から・両方 | 方位磁針をクリック | N・U・R |
-| 2D / 3D | 右下のボタン | O |
-| 止める・検索・一覧 | | Space・/・? |
+| 2D と 3D の切り替え | 右下のボタン | O |
+| 止める・検索・操作一覧 | | Space・/・? |
 
-Alt を押しながらだとゆっくり動く。URL の `#緯度,経度,高度m,方位h,傾きt` に視点が残るので、
-ブックマークすればその視点から開ける。
+Alt キーを押しながら動かすと、ゆっくり動きます。
 
-## 範囲を決めて書き出す
+## 書き出し
 
-指定した地点のまわりのタイルを取り、three.js のビューアか OBJ に書き出す。
+指定した地点のまわりのタイルを取得して、ブラウザで見られる一式（three.js）に書き出します。
 
 ```bash
 python scripts/export.py 36.5722 136.6680 --out out/higashi-chaya   # 金沢・ひがし茶屋街
 python scripts/serve.py out                                          # http://localhost:8000/higashi-chaya/
 ```
 
-`export.py` の主な引数:
+ひがし茶屋街のまわり 9×9 タイル（約 280 m 四方、88 タイル・15 万三角形）で、取得から書き出しまで約 10 秒です。
 
 | 引数 | 既定 | 意味 |
 |---|---|---|
-| `--zoom` | 20 | タイルのズーム（20 で 1 枚約 30 m 四方） |
-| `--radius` | 4 | 中心のタイルから ±何枚まで（4 で 9×9 枚、約 280 m 四方） |
-| `--heights` | 4 | 要求する高さ区分の数（h = 0〜3） |
+| `--out` | （必須） | 書き出すフォルダ |
+| `--zoom` | 20 | タイルの細かさ（20 で 1 タイル約 30 m 四方） |
+| `--radius` | 4 | 中心のタイルから前後左右に何タイル取るか（4 で 9×9 タイル） |
+| `--heights` | 4 | 要求する高さの区分の数（高い建物ほど多く要る） |
 | `--jobs` | 4 | 同時に要求する数 |
-| `--obj` | なし | OBJ にも書き出す（Blender などで開く用） |
-
-取得したタイルは `cache/` に保存し、次からはそれを使う。ひがし茶屋街の 9×9 枚は 88 タイル・15 万三角形で、取得から書き出しまで約 10 秒。
+| `--obj` | なし | OBJ にも書き出す（ファイル名を指定。例: `--obj out/kanazawa.obj`） |
+| `--quality` | 90 | 画像の JPEG の画質 |
+| `--cache` | `cache` | 取得したデータの保存先 |
 
 ## 仕組み
 
-1. **リソースマニフェスト**（protobuf）を取り、Flyover のタイル（style 15）の URL と、認証に使う `tokenP2` を得る
-2. マニフェストに書かれた**高さ区分の一覧**（`altitude-*.xml`）から、地点を含む地域を選ぶ
-3. タイルを `x, y, z, h` で要求する。URL には `sid` と `accessKey`（AES-256-CBC で作る）を付ける
-4. **C3M**（1 タイル分の 3D モデル）を読む。メッシュは Apple 独自の Edgebreaker の変種で圧縮されている（ハフマン符号 → CLERS 文字列 → 角の表 → 平行四辺形予測で頂点と UV を復元）。画像は HEIC
-5. 地心座標（ECEF）を範囲の中心での東・北・上（メートル）に直し、HEIC を JPEG にして、ブラウザ用に書き出す
+1. Apple マップのアプリと同じように、設定ファイル（リソースマニフェスト）からタイルの URL と認証に使う値を得ます
+2. タイルを位置（`x, y, z`）と高さの区分（`h`）で要求します
+3. 届いた 3D モデル（C3M 形式）を展開します。形は Apple 独自の方式で圧縮され、画像は HEIC 形式です
+4. ブラウザで扱える形（glb と JPEG）に変換して表示します
 
-地球儀のビューアでは:
+詳しい仕組みと、読み込みを速くするための工夫は [docs/how-it-works.md](docs/how-it-works.md) にまとめています。
 
-- Flyover のタイルはズーム 13（1 枚約 4 km）〜20（約 30 m）まである。ビューア（CesiumJS）が、ズーム 9 の地域から四分木をたどって、画面で大きく見える（画面の画素で 520 px を超える）タイルほど細かいものを選び、大きく見えるものから読む。途中の階層は 1 段おきにしか読まない（読む量が 4 割ほど減る）。子孫で埋め尽くせる 4 分の 1 から細かくし、まだ埋まらない所や子にデータがない所（水面など）は、親をその 4 分の 1 だけ切り出して描く。同時に読むのは 48 枚まで（それ以上並べても回線が埋まっていて速くならない）。画面に見えているものを先に読み、カメラのまわり（高度の 2.5 倍、粗いタイルはその 4 倍まで）の画面の外のものは、見えているものが全部届いてから先読みして、回したときにすぐ出せるようにする。必要なタイルが届くまでは、手元にある細かいタイル（3 段下まで）か粗いタイルで埋め、動かしている間に 3D が消えないようにする
-- 止まっているときは描かない（Cesium の requestRenderMode）。カメラが動いたときと、読み込みや動きのあるときだけ描く
-- ブラウザの重い所: 読み込み中に時間を取るのは、シェーダーの用意（GPU 向けの翻訳）と、画像を GPU に送ること。Flyover のモデルは光を当てない（写真そのまま）ので、Cesium の映り込み（動的な環境マップと IBL）と Scene#pick 用の準備を切っている。映り込みは準備ができたところでシェーダーを全部作り直させ、読み込みの最初の数秒をそれに取られていた（74 本 → 53 本）。下の帯のカーソルの標高と縮尺は、カメラもマウスも動いていなければ 1 秒ごとにしか調べない（深度を読むと GPU を待たせる）。地球儀が 1 コマで読み込みを進める時間は 5 ms から 20 ms にしている
-- サーバーは高さ区分をまとめて 1 つの glb（頂点は地心座標）にし、`cache/glb3/` に置く。Flyover の範囲の端のタイルには、平らな地図につなぐための灰色の帯（メッシュの種類 4）と高さ 0 の面（種類 3）が入っているが、地形の上では 2 層に見えるので入れない。頂点の位置は int16、UV は uint16 に詰める（KHR_mesh_quantization。4.9 km のタイルでも 8 cm 刻み）。高さ区分はタイルの大きさに比べた高さの区切りで、ズーム 16 以下では h = 0 しかない（東京スカイツリーやデンバーでも）ので、ズーム 15 以下は h = 0 だけ、16 は h = 0〜1 だけを要求する
-- Apple への要求は HTTP/2（httpx）で、4 本の接続の上にそれぞれ同時 90 本まで並べる。Apple は 1 枚に 1 秒ほどかかるが、並べるほど速い（requests の HTTP/1.1 は接続ごとの TLS の確立などで、同時 32 本で応答まで 4 秒ほど待たされた）。1.5 秒たっても返らなければ同じ要求を別の接続でもう 1 本出し、先に返ったほうを使う（まだなら 3 秒後に 3 本目）。1 本は 10 秒であきらめ、接続ごと止まっている（しばらく何も返っていない）ときは張り直す（以前は 60 秒待たされることがあった）
-- 地形と衛星画像は Flyover のタイルと別の接続で取る。ただし Flyover のタイルを 16 本以上取っている間は同時 4 本までに絞る。回線（手元では 50〜65 Mbps）はどちらでも埋まり、地面の画像の多くは 3D の街の下に隠れるので、街を先にしたほうが早くきれいになる
-- C3M の展開は、numba があれば重い部分（`flyover/_fast.py`）をコンパイルして速くする（密な街で 1 枚 0.3 秒 → 0.06 秒。結果は純 Python 版とビット単位で同じ）。起動時に立ち上げておいた別プロセスで並べるが、ブラウザと CPU を取り合わないよう、コアの半分（多くて 8 つ）で優先度を少し下げて動かす
-- 衛星画像は style 7、地形は style 17（ズーム 7 と 11 は全世界、13 は米国と欧州）。版はマニフェストの style の設定にある。地形は 16 bit の PNG で、PNG の終わり（IEND）の後ろに付いた 12 バイトに float32 の基準の高さと倍率（0.25）が入っている（高さ = 基準 + 値 × 倍率）。高さは Flyover と同じ楕円体高で、基準はタイルごとに違う（読み落とすと内陸では何百 m も低くなる）。Cesium の地理座標のタイルに直して渡す。EGM96 のジオイド高（初回に PROJ の配布物から 2.7 MB 取る）は、地形のタイルのない所の海面と、画面に出す標高に使う
-- 地名の検索は OpenStreetMap の Nominatim に中継する
+## ファイル構成
 
 | ファイル | 中身 |
 |---|---|
-| `flyover/client.py` | マニフェスト、地域の選択、認証、タイルの取得 |
-| `flyover/c3m.py` | C3M の読み取り（先頭情報、材質、メッシュの組み立て） |
-| `flyover/edgebreaker.py` | メッシュの展開 |
-| `flyover/huffman.py` | ハフマン符号の表と展開 |
-| `flyover/_fast.py` | 展開の重い部分の numba 版（numba がなければ使わない） |
-| `flyover/web.py` | ブラウザ用と OBJ の書き出し、ビューア |
-| `flyover/glb.py` | タイルを glb に（地球儀用） |
-| `flyover/terrain.py` | 地形とジオイド（地球儀用） |
-| `flyover/earth.py`、`flyover/earth/` | 地球儀のサーバーとビューア |
-| `scripts/earth.py` | 地球儀のビューアを起動 |
+| `scripts/earth.py` | 地球儀ビューアを起動 |
 | `scripts/export.py` | 取得から書き出しまで |
-| `scripts/serve.py` | 手元で配るだけのサーバー |
-| `scripts/compare_go.py` | Go 版との照合（下記） |
-| `tools/retroplasma-2026.patch` | Go 版を今のサーバーで動かすための修正（照合用） |
+| `scripts/serve.py` | 書き出した一式を手元で配るだけのサーバー |
+| `scripts/compare_go.py` | Go 版との照合 |
+| `flyover/client.py` | Apple への要求（設定ファイル、地域の選択、認証、タイルの取得） |
+| `flyover/c3m.py`、`edgebreaker.py`、`huffman.py`、`_fast.py` | C3M の読み取りと展開（`_fast.py` は numba で速くした版） |
+| `flyover/glb.py`、`terrain.py`、`earth.py`、`earth/` | 地球儀ビューアのサーバーと画面 |
+| `flyover/web.py` | 書き出し（ブラウザ用と OBJ） |
+| `tools/retroplasma-2026.patch` | Go 版を今の Apple のサーバーで動かすための修正（照合用） |
 
-## 元になったもの
+## テスト
 
-[retroplasma/flyover-reverse-engineering](https://github.com/retroplasma/flyover-reverse-engineering)（Go、2021 年でアーカイブ）の解析と実装を Python に移した。C3M の展開は、あちらの逆コンパイル由来の処理を、Go の整数の桁あふれやシフトの振る舞いまで含めて書き写している。
-
-2026 年のサーバーでは、当時から次の点が変わっていた。ここではそれに合わせてある:
-
-- マニフェストのファイル置き場（`cache_base_url`）が空になった → `https://gspe21-ssl.ls.apple.com/` を使う
-- 地域ごとの目録 C3MM 第 1 版（style 14）が 404 になった（タイル座標で取る第 2 版 style 52 は返るが、形式が未解読）→ 目録を使わず、範囲のタイルと高さ区分を直接要求して、空の応答を飛ばす
-- C3M の 5 バイト目（版）が 3 から 7 になった → 第 3 版の読み方でそのまま読める
-- 画像が JPEG から HEIC（画像の形式 13）になった
-
-また、元のツールは地域を「中心がいちばん近いもの」で選んでいて、地域の重なる東京などでは外れる（渋谷は 1 枚も取れなかった）。地域の名前 `Reg_z9_X_Y` はその地域が覆うズーム 9 のタイル番号なので、ここではそれで選ぶ。
-
-認証の手順と `tokenP1` は [sk-zk/streetlevel](https://github.com/sk-zk/streetlevel) の Look Around 用の実装と同じ（あちらも retroplasma から来ている）。retroplasma の設定手順は `tokenP1` を取り出すために Xcode のシミュレータ SDK（約 2 GB）をダウンロードするが、ここでは不要。
-
-## Go 版との照合
-
-Python 版の読み取りは、本物のタイルで Go 版と**ビット単位で一致**することを確かめている（金沢 88 タイル・渋谷 121 タイル、計 209 タイルで一致）。確かめ直すには:
-
-```bash
-git clone https://github.com/retroplasma/flyover-reverse-engineering
-cd flyover-reverse-engineering
-git apply ../flyover-web/tools/retroplasma-2026.patch && rm -rf vendor
-go build -o dump-json.exe ./cmd/dump-json
-cd ../flyover-web
-python scripts/compare_go.py ../flyover-reverse-engineering/dump-json.exe cache/c3m/*
-```
-
-パッチは Go 版そのものも今のサーバーで動くようにする（`go run ./cmd/export-obj 36.5722 136.6680 20 4 4`）。
-
-テスト（Apple のデータなしで動く部分）:
+Apple のデータなしで確かめられる部分のテストです。
 
 ```bash
 python -m pytest tests -q
 ```
 
+C3M の読み取りは、元の Go 版と**ビット単位で一致**することを、本物のタイル 209 枚（金沢 88 枚・渋谷 121 枚）で確かめています。確かめ直す手順は [docs/how-it-works.md](docs/how-it-works.md#go-版との照合) にあります。
+
+## 元になったもの
+
+- [retroplasma/flyover-reverse-engineering](https://github.com/retroplasma/flyover-reverse-engineering)（Go、2021 年にアーカイブ）の解析と実装を Python に移しました。C3M の展開は、Go の整数の桁あふれの振る舞いまで含めて書き写しています。2026 年の Apple のサーバーでは当時から変わった所があり、それに合わせて直しています
+- 認証の手順は [sk-zk/streetlevel](https://github.com/sk-zk/streetlevel)（Look Around 用）の実装を参考にしました
+- 地球儀の表示には [CesiumJS](https://cesium.com/platform/cesiumjs/) を、地名の検索には [OpenStreetMap の Nominatim](https://nominatim.openstreetmap.org/) を使っています
+
 ## 注意
 
-- 取得したデータ（`cache/`、`out/`）は Apple の著作物。リポジトリには入れない（`.gitignore` 済み）
-- 地球儀のサーバーは手元（127.0.0.1〜127.0.0.17）でだけ受ける。ブラウザの同時接続の上限（同じホストに 6 本）を避けるため、Flyover・衛星画像・地形のタイルはループバックの別のアドレスに振り分けて取る
-- Apple Maps のデータをこの形で取り出すことは Apple の利用規約に抵触しうる。使うのは自己責任で、取得したデータは再配布しないこと
-- 移植元の retroplasma/flyover-reverse-engineering にはライセンスの表記がない。そのため、このリポジトリにもライセンスを付けていない
+- 取得したデータ（`cache/`、`out/`）は Apple の著作物です。リポジトリには入らないようにしてあります（`.gitignore`）。公開や再配布はしないでください
+- Apple のサーバーの仕様は予告なく変わります。変わると動かなくなることがあります
+- サーバーは自分の PC の中（127.0.0.1〜127.0.0.17）からの接続だけを受け付けます
+- 移植元の retroplasma/flyover-reverse-engineering にライセンスの表記がないため、このリポジトリにもライセンスを付けていません
