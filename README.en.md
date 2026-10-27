@@ -30,6 +30,8 @@ python scripts/earth.py
 
 Open http://localhost:8000/ in your browser. To use another port, pass it like `python scripts/earth.py 8080`.
 
+To view the new Flyover of iOS 27 (style 98), start with `python scripts/earth.py --r3d`. The near view (zoom 17 and above) comes from the new Flyover; the distant view and tiles without the new Flyover are shown with the old one ([how it works](docs/how-it-works.en.md#the-new-flyover-style-98)).
+
 ## Globe viewer
 
 Zoom in from the whole Earth, and wherever Flyover exists the 3D city loads. Apple's satellite imagery and terrain are used underneath.
@@ -98,6 +100,7 @@ For the details, and for what makes loading fast, see [docs/how-it-works.en.md](
 | `scripts/compare_go.py` | Comparison against the Go version |
 | `flyover/client.py` | Requests to Apple (manifest, region selection, authentication, tile fetching) |
 | `flyover/c3m.py`, `edgebreaker.py`, `huffman.py`, `_fast.py` | Reading and decoding C3M (`_fast.py` is a faster version using numba) |
+| `flyover/r3d.py` | Reading the mesh and splats of the new Flyover (style 98, R3D) |
 | `flyover/glb.py`, `terrain.py`, `earth.py`, `earth/` | Server and page for the globe viewer |
 | `flyover/web.py` | Export (for the browser and OBJ) |
 | `tools/retroplasma-2026.patch` | Fixes for running the Go version against today's Apple servers (for the comparison) |

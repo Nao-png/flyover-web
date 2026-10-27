@@ -11,6 +11,16 @@
       "port": 8000
     },
     {
+      "name": "flyover-earth-r3d",
+      "runtimeExecutable": "python",
+      "runtimeArgs": [
+        "scripts/earth.py",
+        "--r3d"
+      ],
+      "autoPort": true,
+      "port": 8000
+    },
+    {
       "name": "flyover-viewer",
       "runtimeExecutable": "python",
       "runtimeArgs": [

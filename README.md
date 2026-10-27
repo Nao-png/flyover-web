@@ -30,6 +30,8 @@ python scripts/earth.py
 
 ブラウザで http://localhost:8000/ を開きます。ポートを変えるときは `python scripts/earth.py 8080` のように指定します。
 
+iOS 27 の新しい Flyover（style 98）で見るときは `python scripts/earth.py --r3d` で起動します。近くの景色（ズーム 17 以上）を新しい Flyover で出し、遠景と、新しい Flyover のないタイルは今までのもので表示します（[仕組み](docs/how-it-works.md#新しい-flyoverstyle-98)）。
+
 ## 地球儀ビューア
 
 地球全体から寄っていくと、Flyover のある所では 3D の街が読み込まれます。下地には Apple の衛星画像と地形を使います。
@@ -98,6 +100,7 @@ python scripts/serve.py out                                          # http://lo
 | `scripts/compare_go.py` | Go 版との照合 |
 | `flyover/client.py` | Apple への要求（設定ファイル、地域の選択、認証、タイルの取得） |
 | `flyover/c3m.py`、`edgebreaker.py`、`huffman.py`、`_fast.py` | C3M の読み取りと展開（`_fast.py` は numba で速くした版） |
+| `flyover/r3d.py` | 新しい Flyover（style 98、R3D）のメッシュとスプラットの読み取り |
 | `flyover/glb.py`、`terrain.py`、`earth.py`、`earth/` | 地球儀ビューアのサーバーと画面 |
 | `flyover/web.py` | 書き出し（ブラウザ用と OBJ） |
 | `tools/retroplasma-2026.patch` | Go 版を今の Apple のサーバーで動かすための修正（照合用） |

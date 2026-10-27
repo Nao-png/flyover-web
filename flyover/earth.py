@@ -8,7 +8,8 @@
                                        これより細かいタイルがないとき 1 になる float32 が 1 つ）
     /api/search?q=...                  地名の検索（OpenStreetMap の Nominatim に中継）
 
-取得したものは cache/ に保存し、次からはそれを使う。
+取得したものは cache/ に保存し、次からはそれを使う。r3d=True なら、Flyover のタイルに iOS 27 の
+新しい Flyover（style 98、flyover/r3d.py）を使い、そのタイルがないか読めないときは C3M にする。
 """
 import http.server
 import json
@@ -26,12 +27,17 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
-from . import c3m, glb, huffman
+from . import c3m, glb, huffman, r3d
 from .client import Client
 from .terrain import DROP, Geoid, Terrain
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "earth")
 MIN_ZOOM, MAX_ZOOM = 13, 20     # Flyover のタイルのあるズーム
+# 新しい Flyover（R3D）を使うズーム。それより粗いタイルは C3M にする。z16 以下の R3D は 1 枚 1 MB 前後と
+# 大きく、Apple の配信サーバーにまだ溜まっていないので最初の応答に 1〜2 秒かかり、読めないものも
+# 多い（東京の 516 枚で z13〜16 は 1〜2 割が読めない。z17 以上はほぼ全部読める）。遠くから寄って
+# いくときの最初の 3D を早く出すため、遠景は配信サーバーに溜まっている C3M（数十 ms で返る）で出す
+R3D_MIN_ZOOM = 17
 NOMINATIM = "https://nominatim.openstreetmap.org/search"
 # 今のサーバーの C3M がどれも使っているハフマン符号の引数（表を作るのに 0.2 秒ほどかかる）
 COMMON_HUFFMAN = [(62, 40000, 50000, 1024), (250, 6000, 25000, 1024)]
@@ -58,15 +64,18 @@ def fetch_heights(z, get_many):
         n = 4
 
 
-def build_glb(raws, name):
-    """高さ区分ごとの C3M のバイト列から glb を作る（別のプロセスで動かす）。"""
+def build_glb(raws, name, parse=c3m.parse, strict=False):
+    """高さ区分ごとの C3M（parse が r3d.parse なら R3D）のバイト列から glb を作る（別のプロセスで動かす）。
+    読めない区分は飛ばす。strict なら、1 つでも読めなければ None（ほかの形式で作り直せるように）。"""
     tiles = []
     for k, b in enumerate(raws):
         if b:
             try:
-                tiles.append(c3m.parse(b))
-            except Exception as e:   # 読めない区分は飛ばす
+                tiles.append(parse(b))
+            except Exception as e:
                 print(f"  {name} h={k}: {e}", flush=True)
+                if strict:
+                    return None
     return glb.tile_glb(tiles) if tiles else None
 
 
@@ -90,6 +99,7 @@ def _warm_worker():
         huffman.make_table(*p)
     if huffman._fast is not None:
         huffman._fast.warm()
+    r3d.warm()
 
 
 def _warm_wait():
@@ -97,8 +107,9 @@ def _warm_wait():
 
 
 class Earth:
-    def __init__(self, cache_dir="cache", jobs=192):
+    def __init__(self, cache_dir="cache", jobs=192, r3d=False):
         self.client = Client(cache_dir=cache_dir)
+        self.r3d = r3d and self.client.r3d_source() is not None
         self.cache_dir = cache_dir
         self.pool = ThreadPoolExecutor(jobs)
         # C3M の展開は重い（密な街で 1 枚 0.1 秒ほど、numba がなければ 0.3 秒ほど）ので、プロセスを
@@ -125,7 +136,7 @@ class Earth:
         g = self.terrain.geoid.grid[::8, ::8]
         return {"coverage": self.client.covered(), "minZoom": MIN_ZOOM, "maxZoom": MAX_ZOOM,
                 "geoid": {"step": 2, "rows": np.round(g).astype(int).tolist()},
-                "terrainDrop": DROP, "tileHosts": self.tile_hosts}
+                "terrainDrop": DROP, "tileHosts": self.tile_hosts, "r3d": self.r3d}
 
     def flyover(self, z, x, y, timing=None):
         """タイルの glb。データがなければ None。timing（dict）があれば、Apple から取るのと
@@ -136,7 +147,8 @@ class Earth:
         region = self.client.region_of_tile(x, y, z, strict=True)
         if region is None:
             return None
-        d = os.path.join(self.cache_dir, "glb3", f"{region['region']}_{region['version']}", str(z))
+        kind = "glb98_8" if self.r3d else "glb3"     # 作り方を変えたら番号を上げる
+        d = os.path.join(self.cache_dir, kind, f"{region['region']}_{region['version']}", str(z))
         path = os.path.join(d, f"{x}_{y}.glb")
         t0 = time.perf_counter()
         with self._lock(("glb", z, x, y)):
@@ -144,10 +156,19 @@ class Earth:
             if os.path.exists(path):
                 return open(path, "rb").read() or None
             t0 = time.perf_counter()
-            raws = fetch_heights(z, lambda hs: self.map(
-                lambda k: self.client.tile_cached(region, x, y, z, k), hs))
-            t1 = time.perf_counter()
-            out = self.cpu.submit(build_glb, raws, f"{z}/{x}/{y}").result()
+            out = None
+            if self.r3d and z >= R3D_MIN_ZOOM:
+                raws = fetch_heights(z, lambda hs: self.map(
+                    lambda k: self.client.r3d_tile_cached(region, x, y, z, k), hs))
+                t1 = time.perf_counter()
+                if any(raws):
+                    # 1 区分でも読めなければ、タイルごと C3M にする（区分が欠けて建物の上が消えないよう）
+                    out = self.cpu.submit(build_glb, raws, f"{z}/{x}/{y} r3d", r3d.parse, True).result()
+            if out is None:
+                raws = fetch_heights(z, lambda hs: self.map(
+                    lambda k: self.client.tile_cached(region, x, y, z, k), hs))
+                t1 = time.perf_counter()
+                out = self.cpu.submit(build_glb, raws, f"{z}/{x}/{y}").result()
             timing["fetch"], timing["build"] = (t1 - t0) * 1000, (time.perf_counter() - t1) * 1000
             os.makedirs(d, exist_ok=True)
             tmp = f"{path}.{threading.get_ident()}.tmp"
@@ -265,8 +286,8 @@ class Server(http.server.ThreadingHTTPServer):
 TILE_HOSTS = [f"127.0.0.{i}" for i in range(2, 18)]
 
 
-def serve(port=8000, cache_dir="cache", host="127.0.0.1"):
-    earth = Earth(cache_dir)
+def serve(port=8000, cache_dir="cache", host="127.0.0.1", r3d=False):
+    earth = Earth(cache_dir, r3d=r3d)
     make = handler(earth)
     for extra in TILE_HOSTS:
         try:

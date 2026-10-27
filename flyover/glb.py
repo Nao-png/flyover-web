@@ -6,7 +6,12 @@
 変換をしないこと（Cesium なら upAxis: Z、forwardAxis: X）。材質は光の影響を受けない
 KHR_materials_unlit で、画像は JPEG。地形の上に置くので、Flyover の範囲の端にある、平らな地図に
 つなぐための帯と面（c3m.Mesh.kind が 0 でないもの）は入れない。
+
+新しい Flyover の三角形のスプラット（木など。r3d.Splats）は、頂点の色（RGBA）を付けた半透明の
+三角形にする。Apple は三角形の内側ほど濃く縁で消えるように描くので、共通の小さな画像（重心座標の
+積から作った、縁ほど透明になるもの）を貼って近い見た目にする。
 """
+import io
 import json
 import struct
 
@@ -14,7 +19,8 @@ import numpy as np
 
 from .web import to_jpeg
 
-FLOAT, INT16, UINT16, UINT32 = 5126, 5122, 5123, 5125
+UINT8, FLOAT, INT16, UINT16, UINT32 = 5121, 5126, 5122, 5123, 5125
+SPLAT_SOFTNESS = 0.5     # スプラットの縁のぼかし: 不透明度 = (27 × 重心座標の積) ^ これ
 MAIN = 0        # C3M のメッシュの種類のうち、本体（c3m.Mesh.kind を見よ）
 ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER = 34962, 34963
 
@@ -22,6 +28,7 @@ ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER = 34962, 34963
 def tile_glb(c3ms, quality=85):
     """c3ms: 同じタイルの C3M（高さ区分ごと）の並び。三角形がなければ None。"""
     parts = []   # (ECEF の頂点, UV, 三角形, (C3M の番号, 材質の番号))
+    splats = []  # (ECEF の頂点 (3N, 3), RGBA (N, 4))
     for ci, c in enumerate(c3ms):
         for m in c.meshes:
             if m.kind != MAIN:          # 範囲の端の、平らな地図につなぐための帯や面は入れない
@@ -30,10 +37,15 @@ def tile_glb(c3ms, quality=85):
             for mat, F in m.groups.items():
                 if len(F):
                     parts.append((X, m.uv, F, (ci, mat)))
-    if not parts:
+        sp = getattr(c, "splats", None)
+        if sp is not None:
+            keep = sp.rgba[:, 3] > 0    # 見えないもの（不透明度 0）は入れない
+            if keep.any():
+                splats.append((c.to_ecef(sp.vertices[keep].reshape(-1, 3)), sp.rgba[keep]))
+    if not parts and not splats:
         return None
-    lo = np.min([X.min(0) for X, *_ in parts], axis=0)
-    hi = np.max([X.max(0) for X, *_ in parts], axis=0)
+    lo = np.min([X.min(0) for X, *_ in parts] + [X.min(0) for X, _ in splats], axis=0)
+    hi = np.max([X.max(0) for X, *_ in parts] + [X.max(0) for X, _ in splats], axis=0)
     center = (lo + hi) / 2
     step = max((hi - lo).max() / 2, 1e-3) / 32767     # int16 の 1 刻みの長さ [m]
 
@@ -87,6 +99,29 @@ def tile_glb(c3ms, quality=85):
         prims.append({"attributes": {"POSITION": pos, "TEXCOORD_0": tex},
                       "indices": accessor(idx.astype(idt), itype, "SCALAR", ELEMENT_ARRAY_BUFFER),
                       "material": mat_index[key]})
+    if splats:
+        images.append({"bufferView": view(_soft_triangle()), "mimeType": "image/png"})
+        materials.append({"pbrMetallicRoughness": {"baseColorTexture": {"index": len(images) - 1},
+                                                   "metallicFactor": 0, "roughnessFactor": 1},
+                          "alphaMode": "BLEND", "doubleSided": True,
+                          "extensions": {"KHR_materials_unlit": {}}})
+        for X, rgba in splats:
+            q = np.round((X - center) / step).astype(np.int32)
+            P = np.zeros((len(q), 4), "<i2")
+            P[:, :3] = q
+            pos = accessor(P, INT16, "VEC3", ARRAY_BUFFER, minmax=(q.min(0).tolist(), q.max(0).tolist()), stride=8)
+            # glTF の頂点の色は線形の値なので、sRGB の色を線形に直す（暗い色が潰れないよう 16 ビットで）
+            c = rgba.astype(np.float64) / 255
+            c[:, :3] = np.where(c[:, :3] <= 0.04045, c[:, :3] / 12.92, ((c[:, :3] + 0.055) / 1.055) ** 2.4)
+            col = accessor(np.repeat(np.round(c * 65535).astype("<u2"), 3, axis=0), UINT16, "VEC4",
+                           ARRAY_BUFFER, normalized=True)
+            # 三角形ごとに、画像の (0,0)・(1,0)・(0,1) の角を当てる（4 バイトの倍数にそろえて 2 バイト空ける）
+            T = np.zeros((len(q), 4), np.uint8)
+            T[1::3, 0] = 255
+            T[2::3, 1] = 255
+            tex = accessor(T, UINT8, "VEC2", ARRAY_BUFFER, normalized=True, stride=4)
+            prims.append({"attributes": {"POSITION": pos, "COLOR_0": col, "TEXCOORD_0": tex},
+                          "material": len(materials) - 1})
     while len(bin_) % 4:
         bin_.append(0)
 
@@ -106,3 +141,18 @@ def tile_glb(c3ms, quality=85):
     return b"".join([struct.pack("<4sII", b"glTF", 2, 12 + 8 + len(js) + 8 + len(bin_)),
                      struct.pack("<I4s", len(js), b"JSON"), js,
                      struct.pack("<I4s", len(bin_), b"BIN\0"), bytes(bin_)])
+
+
+def _soft_triangle(size=64):
+    """スプラット用の画像（PNG）。u, v を重心座標の 2 つとみなし、三角形 u + v <= 1 の内側だけ、
+    (27 × 3 つの重心座標の積) ^ SPLAT_SOFTNESS の不透明度（中心で 1、縁で 0）。色は白。"""
+    from PIL import Image
+
+    u, v = np.meshgrid((np.arange(size) + 0.5) / size, (np.arange(size) + 0.5) / size)
+    w = 1 - u - v
+    a = np.clip(27 * u * v * w, 0, 1) ** SPLAT_SOFTNESS
+    img = np.full((size, size, 4), 255, np.uint8)
+    img[..., 3] = np.round(a * 255)
+    out = io.BytesIO()
+    Image.fromarray(img).save(out, "PNG")          # (size, size, 4) の uint8 は RGBA になる
+    return out.getvalue()

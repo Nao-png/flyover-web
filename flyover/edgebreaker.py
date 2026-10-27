@@ -169,7 +169,7 @@ def close_star(a, b, c, t2):
     t3 = t2i
     t4 = a[t2i]
     t5 = c
-    while True:
+    for _ in range(len(a) + 1):        # 壊れたデータで回り続けないように（角の数より多くは回らない）
         t6 = t5 + 1
         if t4 < 0:
             break
@@ -182,6 +182,8 @@ def close_star(a, b, c, t2):
         t2i = prv(t5)
         t3 = t2i
         t4 = a[t2i]
+    else:
+        raise ValueError("closeStar が終わらない")
     if t6 is not None:
         b[t1 + t6 - _align3(t6)] = t2
     if t2i >= 0:
@@ -193,24 +195,32 @@ def close_star(a, b, c, t2):
 def read_boundary(a, b, some, out):
     """readBoundary。out は [残りの頂点番号] の 1 要素リスト。"""
     t1 = nxt(some)
-    while True:
+    for _ in range(len(a) + 1):        # 壊れたデータで回り続けないように
         result = nxt(t1)
         t1 = a[result]
         if t1 < 0:
             break
-    while True:
+    else:
+        raise ValueError("readBoundary が終わらない")
+    for _ in range(len(a) + 1):
         b[nxt(result)] = out[0]
         result = prv(result)
         t4 = a[result]
         i = out[0]
+        n = 0
         while t4 >= 0:
             b[nxt(t4)] = i
             result = prv(t4)
             t4 = a[result]
             i = out[0]
+            n += 1
+            if n > len(a):
+                raise ValueError("readBoundary が終わらない")
         out[0] = i - 1
         if b[nxt(result)] != -1:
             break
+    else:
+        raise ValueError("readBoundary が終わらない")
 
 
 def process_clers(meta, meta_ctr, clers, wbo, b5unkn32, res1, a, b):
@@ -272,11 +282,13 @@ def process_clers(meta, meta_ctr, clers, wbo, b5unkn32, res1, a, b):
                     if t4 >= 0:
                         a[w3 + 2] = t7
                     a[t7] = t4
-                    while True:
+                    for _ in range(len(a) + 1):     # 壊れたデータで回り続けないように
                         t8 = nxt(t4)
                         t4 = a[t8]
                         if not t4 >= 0:
                             break
+                    else:
+                        raise ValueError("S の境界が終わらない")
                     read_boundary(a, b, t8, vert)
             elif s == "P":
                 if t1 >= 0:

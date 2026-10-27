@@ -262,7 +262,9 @@ def _align3(x):
     return 3 * int(x / 3)
 
 
-@njit(cache=True)
+# 角の表をたどる 3 つは、壊れたデータ（R3D の読み違えなど）でもプロセスごと落ちたり回り続けたり
+# しないよう、添字を確かめ（boundscheck、範囲の外は IndexError）、回る数に上限を付ける
+@njit(cache=True, boundscheck=True)
 def _close_star(a, b, c, t2):
     t1 = _align3(c)
     t2i = _pv(c)
@@ -271,7 +273,11 @@ def _close_star(a, b, c, t2):
     t5 = c
     t6 = 0
     closed = False
+    n = 0
     while True:
+        n += 1
+        if n > a.shape[0] + 1:
+            raise ValueError("closeStar が終わらない")
         t6 = t5 + 1
         if t4 < 0:
             break
@@ -292,21 +298,30 @@ def _close_star(a, b, c, t2):
         a[c] = t2i
 
 
-@njit(cache=True)
+@njit(cache=True, boundscheck=True)
 def _read_boundary(a, b, some, vert):
     t1 = _nx(some)
     result = 0
+    cap = a.shape[0] + 1
+    n = 0
     while True:
+        n += 1
+        if n > cap:
+            raise ValueError("readBoundary が終わらない")
         result = _nx(t1)
         t1 = a[result]
         if t1 < 0:
             break
+    n = 0
     while True:
         b[_nx(result)] = vert
         result = _pv(result)
         t4 = a[result]
         i = vert
         while t4 >= 0:
+            n += 1
+            if n > cap:
+                raise ValueError("readBoundary が終わらない")
             b[_nx(t4)] = i
             result = _pv(t4)
             t4 = a[result]
@@ -317,7 +332,7 @@ def _read_boundary(a, b, some, vert):
     return vert
 
 
-@njit(cache=True)
+@njit(cache=True, boundscheck=True)
 def process_clers(meta, meta_ctr, clers, wbo, b5unkn32, res1, a, b):
     """edgebreaker.process_clers と同じ（a と b を書き換える）。"""
     if meta_ctr <= 0:
@@ -380,7 +395,11 @@ def process_clers(meta, meta_ctr, clers, wbo, b5unkn32, res1, a, b):
                         a[w3 + 2] = t7
                     a[t7] = t4
                     t8 = 0
+                    n = 0
                     while True:
+                        n += 1
+                        if n > a.shape[0] + 1:
+                            raise ValueError("S の境界が終わらない")
                         t8 = _nx(t4)
                         t4 = a[t8]
                         if not t4 >= 0:
