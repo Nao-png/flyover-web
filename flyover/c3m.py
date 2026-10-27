@@ -34,6 +34,7 @@ class C3M:
     translation: np.ndarray                  # (3,) ECEF [m]
     materials: list
     meshes: list
+    splats: object = None                    # 新しい Flyover（r3d.py）の三角形のスプラット（r3d.Splats）
 
     def to_ecef(self, v):
         return np.asarray(v, np.float64) @ self.rotation.T + self.translation

@@ -75,6 +75,34 @@ Also, the original tool picked the region "whose center is closest", which picks
 
 The authentication steps and `tokenP1` are the same as the Look Around implementation in [sk-zk/streetlevel](https://github.com/sk-zk/streetlevel) (which also comes from retroplasma). retroplasma's setup downloads the Xcode simulator SDK (about 2 GB) to extract `tokenP1`; that isn't needed here.
 
+## The new Flyover (style 98)
+
+The manifest requested as iOS 27 lists the new Flyover tiles (style 98). Start with `python scripts/earth.py --r3d` to use them at z17 and above; tiles that are missing or can't be read are filled in with the old C3M. The reader is `flyover/r3d.py`.
+
+- **Fetching**: Tile numbering and height slabs are the same as C3M. Request `?style=98&v=<style 98 version>&region=<region>&x&y&z&h` (`v` is the style 98 version, not the region's version)
+- **File**: A container starting with `3D 96 59 2E` holds triangle splats (part 1) and a textured mesh (part 2). The mesh coordinates become Earth-centered coordinates (ECEF) with the 3×3 rotation and translation in the first entry of part 2. The texture is the first HEIC in the image entry
+- **Splats**: Trees and the like are triangle splats, not mesh (a park tile has a small mesh and close to 20,000 splats). Each has 3 vertices, a color and opacity, and 4 more values (octahedral normals and others). Apple draws them denser toward the inside of the triangle, fading out at the edges. In the glb they are semi-transparent triangles with vertex colors (RGBA), with a shared small image that gets more transparent toward the edges, for a similar look (it doesn't match Apple's drawing pixel for pixel)
+- **Compression**: The content is the same Edgebreaker variant as C3M, split into streams and packed. Each number sequence is packed per "lane" with a bitmap (1 for the next value, 0 to repeat the previous value or look up a table) and Huffman codes (Apple's own table format)
+  - **Shape**: The C / other bit per triangle and the 2-bit kind of the others are rebuilt into the old C3M single bit stream, and `edgebreaker.py` turns it into triangles
+  - **Positions**: An integer per vertex × a step. It holds the difference from a parallelogram prediction while walking the triangles breadth first
+  - **UV**: 4 bits per triangle mark UV seams. UV numbers are assigned depth first, bounded by seams, and the values are restored with a breadth-first parallelogram prediction bounded by seams. The unit is a quarter texel
+  - **Lane directory (J)**: Bits for the lanes in use, a 2-bit kind per lane (a 2m + 6 bit field for m lanes), and a length and fill mark per lane. The kind says what changes for the next lane: if its high bit is 1, the next lane's length is written (otherwise it is the same); if its low bit is 1, 1 byte with the next lane's fill mark is written (otherwise the fill is the same). The first lane's mark sits at the byte boundary after the kind bits (when m leaves a remainder of 1 when divided by 4, it doesn't fit in the field and there is no mark). Marks: 0 = raw bytes, 1 and 4 = repeat, 2 and 5 = table lookup, 3 and 6 = signed differences (the difference between 1–3 and 4–6 is unknown)
+  - **Splats**: BYET blocks for the position (XYZ) and 8 attributes. The origin is 4 bytes per component, or a packed form of that. One packed form is itself a small BYET (the bytes of the int as lanes, the components as values)
+  - **Normals**: Spherical coordinates in 2° steps (not read now, since the view has no lighting)
+- **Speed**:
+  - The heavy loops (Huffman codes, lane filling, the 3 walks, prediction replay) run in numba. One tile takes 20–150 ms, 5–13 times faster than plain Python.
+  - So that broken data doesn't crash or hang the process, index ranges are checked before handing data to numba, the corner-table walks run with index checks (`boundscheck`), and loops have an upper limit.
+  - In building one tile, decoding the image (HEIC, 100–150 ms) is the heaviest part.
+  - The new Flyover is often not yet cached on Apple's delivery servers, so the first fetch of a tile takes 1–2 seconds to respond (tens of ms from the second time; it is also kept locally in `cache/r3d/`).
+  - So the new Flyover is used only at z17 and above, and the distant view (z16 and below) comes from C3M, which is cached on the delivery servers. New Flyover tiles at z16 and below are large, around 1 MB each, and 10–20% of them can't be read.
+- **Checking**: On the 29 Tokyo tiles whose decoding by Apple itself (exported from the iOS 27 simulator) is published, the mesh triangles, positions, UV numbers and UV values, and the splat vertices, colors and attributes all match bit for bit
+- **Where the format comes from**: Apple doesn't document it. It was worked out from the data, using the prose of [nmt3325/apple-maps-r3d-research](https://github.com/nmt3325/apple-maps-r3d-research) as clues (its code was not read, since it has no license). The reference data used for checking is from the same repository
+- **Lane filling**: Decided by the mark in J (on about 150,000 splat lanes in the local tiles, the mark and the filling worked out from the data agree every time). For lanes without a mark: where the prediction is right the bit is 0, so with the right filling a literal never equals the prediction, and that is how it is chosen
+- **Mesh field section**: int32 values for the face count, the corner pairs (va, vb) glued in advance, the vertex count and so on. The fields are laid out as 4 bytes each, and the byte string is packed with a table lookup, using each field's 4-bit mark (which bytes are written) as the bitmap (the same as mode 4 of the origin packing: an unwritten byte is table[previous byte], and each written byte sets table[previous] = it). When the section starts with 0C, that is packed again with a repeat bitmap. Every field in the local tiles reads correctly this way
+- **Header numbers and small tiles**: The two numbers in the header (meaning unknown) and the two numbers after XYZ take 1 byte when small. In small tiles the seam block, and in large low-zoom tiles the per-triangle C bits, are stored unpacked or as a 1-lane BYET
+- **How much can be read**: Of about 15,400 tiles fetched locally, all splats and meshes can be read except 6: 4 version 1 containers (a different layout, rare in upper height slabs) and 2 z13 tiles (a different layout after XYZ). Those fall back to C3M entirely (the new Flyover is used only at z17 and above, so z13 doesn't affect the view)
+- **What is unknown**: What the 4 splat values mean for drawing (the view doesn't use them now). The meaning of some numbers between blocks (not used for reading). The layout of the version 1 container
+
 ## Comparison with the Go version
 
 The Python reader has been checked to **match the Go version bit for bit** on real tiles (88 tiles in Kanazawa and 121 in Shibuya, 209 in total). To check again:

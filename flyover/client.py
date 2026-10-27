@@ -13,6 +13,9 @@
 
 地域は、名前 Reg_z9_X_Y が示すズーム 9 のタイルで選ぶ（元のツールは中心がいちばん近い
 地域を選んでいて、地域の重なる東京などでは外れる）。
+
+iOS 27 の新しい Flyover（style 98、R3D）は、iOS 27 として要求したマニフェストにだけ載っている。
+タイルの番号の付け方と高さ区分は C3M と同じで、v には地域の版ではなく style 98 の版を付ける。
 """
 import asyncio
 import base64
@@ -37,6 +40,10 @@ CACHE_BASE = "https://gspe21-ssl.ls.apple.com/"
 TOKEN_P1 = "4cjLaD4jGRwlQ9U"      # GeoServices の GEOURLAuthenticationGenerateURL にある値
 STYLE_SATELLITE = 7               # 衛星画像（JPEG、256 px のタイル）
 STYLE_C3M = 15
+STYLE_R3D = 98                    # iOS 27 の新しい Flyover（flyover/r3d.py）
+MANIFEST_URL_IOS27 = MANIFEST_URL.replace(
+    "hardware=MacBookPro11,2&os=osx&os_build=20B29&os_version=11.0.1",
+    "hardware=iPhone18,1&os=ios&os_build=24A335&os_version=27.0")
 STYLE_DTM = 17                    # 地形（16 bit の PNG、値は海抜 [m] の 4 倍）
 HEDGE = 1.5                       # 応答がこれ [秒] より遅ければ、同じ要求をもう 1 本出す
 
@@ -252,6 +259,7 @@ class Client:
         base = self.manifest.cache_base or CACHE_BASE
         self.regions = parse_altitude(self._cached(name, base + "xml/" + name))
         self.c3m_url = self.manifest.styles[STYLE_C3M]
+        self._r3d = None                        # (URL, 版)。r3d_source が初めて呼ばれたときに決める
         self._by_tile = {}
         for r in self.regions:
             m = re.fullmatch(r"Reg_z9_(\d+)_(\d+)", r["name"] or "")
@@ -327,6 +335,36 @@ class Client:
         if os.path.exists(path + ".empty"):
             return None
         b = self.tile(region, x, y, z, h)
+        os.makedirs(d, exist_ok=True)
+        _write(path + ".empty" if b is None else path, b or b"")
+        return b
+
+    def r3d_source(self):
+        """style 98 のタイルの (URL, 版)。iOS 27 のマニフェストになければ None。"""
+        if self._r3d is None:
+            m = Manifest(self._cached("ResourceManifest-ios27.pbd", MANIFEST_URL_IOS27, max_age=3600))
+            self._r3d = (m.styles[STYLE_R3D], m.versions[STYLE_R3D]) if STYLE_R3D in m.styles else ()
+        return self._r3d or None
+
+    def r3d_tile(self, region, x, y, z, h):
+        """R3D（style 98）のバイト列。データのないタイルは None。"""
+        url, v = self.r3d_source()
+        r = self._get(f"{url}?style={STYLE_R3D}&v={v}&region={region['region']}&x={x}&y={y}&z={z}&h={h}")
+        if r.status_code in (204, 404):
+            return None
+        r.raise_for_status()
+        return r.content or None
+
+    def r3d_tile_cached(self, region, x, y, z, h):
+        """r3d_tile と同じだが、cache/r3d/<region>_<style 98 の版>/ に保存し、次からはそれを使う。"""
+        url, v = self.r3d_source()
+        d = os.path.join(self.cache_dir, "r3d", f"{region['region']}_{v}")
+        path = os.path.join(d, f"{z}_{x}_{y}_{h}.r3d")
+        if os.path.exists(path):
+            return open(path, "rb").read()
+        if os.path.exists(path + ".empty"):
+            return None
+        b = self.r3d_tile(region, x, y, z, h)
         os.makedirs(d, exist_ok=True)
         _write(path + ".empty" if b is None else path, b or b"")
         return b
