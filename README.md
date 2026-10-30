@@ -30,7 +30,7 @@ python scripts/earth.py
 
 ブラウザで http://localhost:8000/ を開きます。ポートを変えるときは `python scripts/earth.py 8080` のように指定します。
 
-iOS 27 の新しい Flyover（style 98）で見るときは `python scripts/earth.py --r3d` で起動します。近くの景色（ズーム 17 以上）を新しい Flyover で出し、遠景と、新しい Flyover のないタイルは今までのもので表示します（[仕組み](docs/how-it-works.md#新しい-flyoverstyle-98)）。
+iOS 27 の新しい Flyover（style 98）で見るときは `python scripts/earth.py --r3d` で起動します。新しい Flyover のあるところはすべてのズームでそれを使い、ないタイルだけ今までのもので表示します（[仕組み](docs/how-it-works.md#新しい-flyoverstyle-98)）。
 
 ## 地球儀ビューア
 

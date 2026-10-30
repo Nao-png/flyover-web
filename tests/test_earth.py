@@ -94,6 +94,62 @@ def test_tile_glb_layout():
     assert glb.tile_glb([C3M(rot, trans, [], [])]) is None
 
 
+def test_tile_glb_shrinks_images_to_power_of_two():
+    # Cesium は 2 のべき乗でない画像を広げるので、縦横それぞれ 1 つ下の 2 のべき乗に縮めておく
+    out = io.BytesIO()
+    Image.new("RGB", (100, 60), (200, 100, 50)).save(out, "JPEG")
+    mesh = Mesh(np.array([[0, 0, 0], [10, 0, 0], [0, 10, 0]], np.float32),
+                np.array([[0, 0], [1, 0], [0, 1]], np.float32), {0: np.array([[0, 1, 2]], np.int32)})
+    c = C3M(np.eye(3), np.array([-3730288.4, 3519283.2, 3779547.7]),
+            [Material(out.getvalue(), "jpeg"), Material(_jpeg(), "jpeg")], [mesh])
+    g, bin_ = _read_glb(glb.tile_glb([c]))
+    v = g["bufferViews"][g["images"][0]["bufferView"]]
+    img = Image.open(io.BytesIO(bin_[v["byteOffset"]:v["byteOffset"] + v["byteLength"]]))
+    assert img.size == (64, 32)
+    assert glb._jpeg_pot(c.materials[1], 85) == c.materials[1].image     # 4 x 4 はそのまま
+
+
+def _heic(config, data, w, h):
+    """HEVC の 1 コマだけの HEIC（新しい Flyover の画像と同じ並び）。"""
+    def box(t, body):
+        return struct.pack(">I4s", 8 + len(body), t) + body
+
+    def full(t, body, v=0):
+        return box(t, bytes([v, 0, 0, 0]) + body)
+
+    def build(off):
+        infe = full(b"infe", struct.pack(">HH4s", 1, 0, b"hvc1"), 2)
+        ipco = box(b"ipco", box(b"hvcC", config) + full(b"ispe", struct.pack(">II", w, h)))
+        iprp = box(b"iprp", ipco + full(b"ipma", struct.pack(">IHB", 1, 1, 2) + b"\x81\x02"))
+        iloc = full(b"iloc", b"\x44\x00" + struct.pack(">HHHHII", 1, 1, 0, 1, off, len(data)))
+        meta = full(b"meta", full(b"hdlr", b"\0" * 4 + b"pict" + b"\0" * 13) + full(b"pitm", b"\0\1")
+                    + full(b"iinf", struct.pack(">H", 1) + infe) + iprp + iloc)
+        return box(b"ftyp", b"heic\0\0\0\0mif1heic") + meta
+    head = build(0)
+    return build(len(head) + 8) + box(b"mdat", data)
+
+
+def test_tile_glb_hevc():
+    # hevc なら、HEIC の画像は JPEG にせず、HEVC の設定とコマを extras.hevc に入れる
+    config, data = bytes(range(1, 24)), b"\0\0\0\5" + b"frame"
+    heic = _heic(config, data, 96, 64)
+    assert glb.heif_hevc(heic) == (config, data, 96, 64)
+    assert glb.heif_hevc(heic[:40]) is None
+    mesh = Mesh(np.array([[0, 0, 0], [10, 0, 0], [0, 10, 0]], np.float32),
+                np.array([[0, 0], [1, 0], [0, 1]], np.float32), {0: np.array([[0, 1, 2]], np.int32)})
+    c = C3M(np.eye(3), np.array([-3730288.4, 3519283.2, 3779547.7]), [Material(heic, "heic")], [mesh])
+    g, bin_ = _read_glb(glb.tile_glb([c], hevc=True))
+    assert "images" not in g and "textures" not in g
+    h = g["materials"][0]["extras"]["hevc"]
+    part = lambda i: bin_[g["bufferViews"][i]["byteOffset"]:][:g["bufferViews"][i]["byteLength"]]
+    assert (part(h["config"]), part(h["data"]), h["width"], h["height"], h["slab"]) == (config, data, 96, 64, 0)
+    p = g["meshes"][0]["primitives"][0]
+    slab = g["accessors"][p["attributes"]["_SLAB"]]
+    pos = g["accessors"][p["attributes"]["POSITION"]]
+    assert slab["bufferView"] == pos["bufferView"] and slab["byteOffset"] == 6
+    assert (_accessor(g, bin_, p["attributes"]["POSITION"], "<i2", 4)[:, 3] == 0).all()
+
+
 def test_mercator_px_and_grid():
     # ズーム 0 の 256 px の中心は (0, 0) 度。画素の中心が整数
     fx, fy = terrain.mercator_px(0.0, 0.0, 0)

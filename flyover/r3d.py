@@ -8,13 +8,17 @@ docs/how-it-works.md の「新しい Flyover（style 98）」を見よ）。テ�
     3D 96 59 2E、u32 版（2）、3 バイト、続いて [tag u8][LEB128 長さ][中身] の部分が 3 つ。
     部分は 4 バイトのあと同じ形の項目が並ぶ。part 2 の項目 1 は 3x3 の回転（行優先）と ECEF の
     平行移動の double が 12 個、項目 2 がメッシュ、項目 3 が画像（最初の項目の中の HEIC が
-    テクスチャ）。
+    テクスチャ。項目 13 があるタイルには、海などの塗りつぶし用の画像しか入っていない）。
+    版 1（高い区分にまれにある）は部分と項目の枠がなく、16 バイト目から回転と平行移動、続いて
+    スプラット（D1 22 C9 07 で始まる）、メッシュ（E1 21 66 24 で始まる）、画像の HEIC が並ぶ。
 
 メッシュは旧 C3M と同じ Edgebreaker の変種を、いくつもの流れに分けて詰めたもの:
     先頭 20 バイト（8 バイト目に位置の刻みの f32）、v1、H2（数。v2 形式）、
     欄の数、三角形ごとの C / C 以外のビット、C 以外の 2 ビットの種類、旧 C3M の buf5 にあたる
-    区画（三角形の数・頂点の数など）、位置の BYET ブロック、00 と数 2 つ、UV の継ぎ目のブロック、
-    チャートの数、空のブロック、UV の BYET ブロック、法線（ここでは読まない）。
+    区画（三角形の数・頂点の数など）、位置の BYET ブロック、余分なブロックの数とそのブロック
+    （海沿いの低いズームで 1 つ。頂点ごとの 1 ビットの印で、意味は分からない）、数 2 つ、
+    UV の継ぎ目のブロック、チャートの数、チャートごとの番号のブロック（ふつうは空。意味は分からない）、
+    UV の BYET ブロック、法線（ここでは読まない）。
 BYET ブロックは 80 4A 00 のあとに J（使うレーンのビット、レーンごとの 2 ビットの種類、レーンの長さ）と
 レーンの中身。レーンの中身は値の数とハフマン符号の封筒 2 つ（ビットマップとリテラル）で、ビットマップの
 1 で次のリテラル、0 で「直前の値をくり返す」か「直前の値で表を引く」。どちらかを示す印は見つかって
@@ -98,7 +102,7 @@ def _tlv(b, a, e):
 # ---- ハフマン符号の封筒 -----------------------------------------------------------
 
 class _Bits:
-    """LE の u32 の語を、上のビットから順に読む。"""
+    """LE の u32 の語を、上のビットから順に読む（bits は 1 ビット 1 バイト、p は次に読む位置）。"""
 
     def __init__(self, b):
         n = len(b) // 4
@@ -106,46 +110,83 @@ class _Bits:
         self.bits = np.unpackbits(w.view(np.uint8))
         self.p = 0
 
-    def read(self, k):
-        if self.p + k > len(self.bits):
-            raise EOFError
-        v = 0
-        for x in self.bits[self.p:self.p + k].tolist():
-            v = (v << 1) | x
-        self.p += k
-        return v
+
+@_jit
+def _k_read(bits, p, k):
+    """p ビット目から k ビットの数と次の位置。足りなければ位置 -1。"""
+    if p < 0 or p + k > bits.shape[0]:
+        return 0, -1
+    v = 0
+    for i in range(k):
+        v = (v << 1) | int(bits[p + i])      # uint8 のままだと numba なしで桁あふれ
+    return v, p + k
+
+
+@_jit
+def _k_table(bits, p, width, empty):
+    """_table の中身。(記号, 符号長, 符号語, 次の位置)。ビットが足りなければ位置 -1、符号が 62 ビット
+    より長ければ -2（int64 に入らない。正しい表の符号は 22 ビットまで）。"""
+    z = np.zeros(0, np.int64)
+    n, p = _k_read(bits, p, width)
+    w, p = _k_read(bits, p, 3)
+    if p < 0:
+        return z, z, z, -1
+    n += 1
+    sym, lns, codes = np.empty(n, np.int64), np.empty(n, np.int64), np.empty(n, np.int64)
+    prev = -1
+    for i in range(n):
+        if n == 1 and empty:
+            ln, code = 0, 0
+        else:
+            ln = 1
+            if w:
+                ln, p = _k_read(bits, p, w)
+                ln += 1
+            if ln > 62:
+                return z, z, z, -2
+            code, p = _k_read(bits, p, ln)
+        f, p = _k_read(bits, p, 1)
+        if f == 0:
+            s = prev + 1
+        else:
+            f, p = _k_read(bits, p, 1)
+            if f:
+                s, p = _k_read(bits, p, width)
+            else:
+                s, p = _k_read(bits, p, width // 2)
+                s += prev + 1
+        if p < 0:
+            return z, z, z, -1
+        sym[i], lns[i], codes[i] = s, ln, code
+        prev = s
+    return sym, lns, codes, p
 
 
 def _table(r, width, empty=False):
     """記号の数 - 1、符号長の幅（3 ビット）、記号ごとに（符号長 - 1、符号語、値: 0 = 前 + 1、
     11 = 絶対値、10 = 前 + 増分 + 1）。語の境目にそろえて終わる。本体が空（empty）で記号が 1 つなら、
-    符号長と符号語はなく、符号の長さは 0。"""
-    n = r.read(width) + 1
-    w = r.read(3)
-    prev, out = -1, []
-    for _ in range(n):
-        if n == 1 and empty:
-            ln, code = 0, 0
-        else:
-            ln = r.read(w) + 1 if w else 1
-            code = r.read(ln)
-        if r.read(1) == 0:
-            sym = prev + 1
-        elif r.read(1):
-            sym = r.read(width)
-        else:
-            sym = prev + r.read(width // 2) + 1
-        out.append((sym, ln, code))
-        prev = sym
-    r.p += -r.p % 32
-    return out
+    符号長と符号語はなく、符号の長さは 0。(記号, 符号長, 符号語) の配列を返す。"""
+    sym, ln, code, p = _k_table(r.bits, r.p, width, empty)
+    if p == -1:
+        raise EOFError
+    if p == -2:
+        raise ValueError("符号が長すぎる")
+    r.p = p + (-p % 32)
+    return sym, ln, code
 
 
 def _prefix_free(tab):
-    codes = sorted(format(c, f"0{ln}b") for _, ln, c in tab)
-    if len(set(codes)) != len(codes) or any(b.startswith(a) for a, b in zip(codes, codes[1:])):
+    """どの符号語もほかの符号語の頭になっておらず、符号の長さで隙間なく埋まる（記号が 1 つなら可）。"""
+    sym, ln, code = tab
+    if len(ln) == 1:
+        return True
+    mx = int(ln.max())
+    lo = code << (mx - ln)               # 符号語を mx ビットに伸ばした区間 [lo, lo + size)
+    size = np.int64(1) << (mx - ln)
+    o = np.argsort(lo, kind="stable")
+    if not (lo[o][:-1] + size[o][:-1] <= lo[o][1:]).all():
         return False
-    return len(tab) == 1 or sum(2.0 ** -ln for _, ln, _ in tab) == 1.0
+    return int(size.sum()) == 1 << mx      # 区間が重ならないので、和は 2^mx を超えない（桁あふれしない）
 
 
 @_jit
@@ -166,21 +207,30 @@ def _k_huff(bits, p, sym, lens, mx, count):
     return out, p
 
 
+@_jit
+def _k_lookup(syms, lns, codes, mx):
+    """先の mx ビットで引く表 (記号, 符号長)。後の記号が前の記号の区間を上書きする。"""
+    sym = np.zeros(1 << mx, np.int64)
+    lens = np.zeros(1 << mx, np.int64)
+    for i in range(syms.shape[0]):
+        lo = codes[i] << (mx - lns[i])
+        hi = lo + (1 << (mx - lns[i]))
+        sym[lo:hi] = syms[i]
+        lens[lo:hi] = lns[i]
+    return sym, lens
+
+
 def _decode(r, tab, count, strict):
     """count 個の記号（int64 の配列）。strict なら、読み終えた後の残りが 0 だけで最後の語の中に収まること。"""
     if count == 0:
         return np.zeros(0, np.int64)
-    if len(tab) == 1 and tab[0][1] == 0:
-        return np.full(count, tab[0][0], np.int64)
-    mx = max(ln for _, ln, _ in tab)
+    syms, lns, codes = tab
+    if len(lns) == 1 and lns[0] == 0:
+        return np.full(count, syms[0], np.int64)
+    mx = int(lns.max())
     if mx > 22:
         raise ValueError("符号が長すぎる")
-    sym = np.zeros(1 << mx, np.int64)
-    lens = np.zeros(1 << mx, np.int64)
-    for s, ln, c in tab:
-        lo = c << (mx - ln)
-        sym[lo:lo + (1 << (mx - ln))] = s
-        lens[lo:lo + (1 << (mx - ln))] = ln
+    sym, lens = _k_lookup(syms, lns, codes, mx)
     out, p = _k_huff(r.bits, r.p, sym, lens, mx, count)
     if p < 0:
         raise ValueError("ハフマン符号を読めない")
@@ -221,7 +271,7 @@ def _envelope(e, count, width=None, strict=True):
             r = _Bits(T[4:])
             try:
                 t = _table(r, w, lvl == 0 and pl == 0)
-            except EOFError:
+            except (EOFError, ValueError):   # ビットが足りないか、符号が長すぎる（この幅ではない）
                 continue
             if r.p // 8 == len(T) - 4 and _prefix_free(t):
                 tab = t
@@ -764,11 +814,16 @@ def decode_mesh(s, heic):
     prog = _k_position_prog(cor, a, F, V)
     P = np.stack([_pick(prog, o, V) for o in _components(_lanes(s, k, n0, 12, V), 3, V)], 1)
     pos = P.astype(np.float32) * step
-    # XYZ の後ろ: 00、数 2 つ、継ぎ目のブロック（三角形ごとに 4 ビット）
+    # XYZ の後ろ: 余分なブロックの数とそのブロック（頂点ごとの 1 ビットの印。使わない）、数 2 つ、
+    # 継ぎ目のブロック（三角形ごとに 4 ビット）
     i = k + n0
-    if s[i] != 0:
-        raise ValueError("XYZ の後ろが 00 でない")
-    _, i = _v2s(s, i + 1)
+    nx, i = s[i], i + 1
+    if nx > 4:
+        raise ValueError("XYZ の後ろのブロックの数が多すぎる")
+    for _ in range(nx):
+        L, k = _compact(s, i)
+        i = k + L
+    _, i = _v2s(s, i)
     _, i = _v2s(s, i)
     L, k = _compact(s, i)
     nib = np.zeros(F, np.uint8)          # レーンがなければ継ぎ目なし
@@ -782,8 +837,9 @@ def decode_mesh(s, heic):
     if len(nib) != F:
         raise ValueError("継ぎ目の印が足りない")
     res, U = _k_uv_indices(cor, a, nib, F, V)
-    # チャートの数、空のブロック、UV のブロック
-    _, i = _small(s, k + L)
+    # チャートの数、チャートごとの番号（ふつうは空のブロック。0 と 1 が半々ほどのこともあり、意味は
+    # 分からない。使わない）、UV のブロック
+    charts, i = _small(s, k + L)
     L, k = _compact(s, i)
     L, k = _compact(s, k + L)
     uprog = _k_uv_prog(res, a, nib, F, U)
@@ -900,12 +956,19 @@ def decode_splats(s):
 
 
 
+SPLAT_MAGIC = b"\xd1\x22\xc9\x07"
+MESH_MAGIC = b"\xe1\x21\x66\x24"
+
+
 def sections(data):
-    """{(部分, 項目): (始め, 終わり)}。"""
+    """{(部分, 項目): (始め, 終わり)}。版 1 では、項目 (2, 3) は画像の HEIC そのもの。"""
     if data[:4] != MAGIC:
         raise ValueError("R3D ではない")
-    if struct.unpack_from("<I", data, 4)[0] != 2:    # 版 1（高い区分にまれにある）は並びが違い、読まない
-        raise ValueError("R3D の版 2 ではない")
+    ver = struct.unpack_from("<I", data, 4)[0]
+    if ver == 1:
+        return _sections_v1(data)
+    if ver != 2:
+        raise ValueError(f"R3D の版 {ver} は知らない")
     out = {}
     for tag, s, e in _tlv(data, 11, len(data)):
         for t, a, z in _tlv(data, s + 4, e):
@@ -913,15 +976,49 @@ def sections(data):
     return out
 
 
+def _sections_v1(data):
+    """版 1: 区画を見出しで探す（スプラット、メッシュ、画像の順。画像は最初の HEIC がテクスチャで、
+    版 2 と同じく灰色の画像がいくつか続くことがある）。"""
+    sp, me, im = data.find(SPLAT_MAGIC), data.find(MESH_MAGIC), data.find(b"ftyp") - 4
+    if (data.count(SPLAT_MAGIC) > 1 or data.count(MESH_MAGIC) != 1
+            or me < 112 or (sp >= 0 and not 112 <= sp < me) or (im >= 0 and im < me)):
+        raise ValueError("版 1 の並びが思っているのと違う")
+    out = {(2, 1): (16, 112), (2, 2): (me, im if im >= 0 else len(data))}
+    if sp >= 0:
+        out[(1, 3)] = (sp, me)
+    if im >= 0:
+        e = im                           # HEIC の終わり: ftyp、meta、mdat の箱の長さの和
+        for name in (b"ftyp", b"meta", b"mdat"):
+            n, t = struct.unpack_from(">I4s", data, e)
+            if t != name or n < 8 or e + n > len(data):
+                raise ValueError("版 1 の画像の箱が思っているのと違う")
+            e += n
+        out[(2, 3)] = (im, e)
+    return out
+
+
+def _image_items(data, sec):
+    """画像の項目 [(番号, 始め, 終わり)]（版 1 では HEIC が 1 つ）。"""
+    a, z = sec[(2, 3)]
+    if data[a + 4:a + 8] == b"ftyp":
+        return [(1, a, z)]
+    return _tlv(data, a, z)
+
+
 def texture(data, sec=None):
     """テクスチャの HEIC（画像の項目の最初）。"""
     sec = sec or sections(data)
-    a, z = sec[(2, 3)]
-    t, s, e = _tlv(data, a, z)[0]
+    t, s, e = _image_items(data, sec)[0]
     i = data.find(b"ftyp", s, e) - 4
     if i < s:
         raise ValueError("テクスチャがない")
     return bytes(data[i:e])
+
+
+def partial_texture(data, sec):
+    """画像の項目 13 があるか。海沿いの低いズームのタイル（z13〜14）にあり、入っている画像は海などの
+    塗りつぶし用だけで、陸の写真は入っていない（陸の三角形の UV は画像の外を指す）。"""
+    return any(t == 13 for t, s, e in _image_items(data, sec))
 
 
 def parse(data):
@@ -946,6 +1043,8 @@ def parse(data):
     heic = texture(data, sec)
     a, z = sec[(2, 2)]
     pos, fc, uv, fuv = decode_mesh(data[a:z], heic)
+    if partial_texture(data, sec) and (uv.min() < -0.01 or uv.max() > 1.01):
+        raise ValueError("陸の写真がタイルに入っていない（海沿いの低いズームのタイル）")
     # UV の番号ごとに頂点を分ける（UV の番号は 1 つの頂点にしか付かない）
     vert = np.zeros(len(uv), np.int64)
     vert[fuv.ravel()] = fc.ravel()
@@ -960,6 +1059,8 @@ def warm():
     z, u = np.zeros(0, np.int64), np.zeros(0, np.uint8)
     one = np.zeros(1, np.int64)
     _k_huff(u, 0, one, one, 0, 0)
+    _k_table(u, 0, 8, False)
+    _k_lookup(one, one, one, 1)
     _k_fill(u, one, 1, True)
     _k_replay(np.zeros((0, 5), np.int64), z, 0)
     _k_position_prog(z, z, 0, 0)

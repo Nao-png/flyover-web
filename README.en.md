@@ -30,7 +30,7 @@ python scripts/earth.py
 
 Open http://localhost:8000/ in your browser. To use another port, pass it like `python scripts/earth.py 8080`.
 
-To view the new Flyover of iOS 27 (style 98), start with `python scripts/earth.py --r3d`. The near view (zoom 17 and above) comes from the new Flyover; the distant view and tiles without the new Flyover are shown with the old one ([how it works](docs/how-it-works.en.md#the-new-flyover-style-98)).
+To view the new Flyover of iOS 27 (style 98), start with `python scripts/earth.py --r3d`. Wherever the new Flyover exists it is used at every zoom; only tiles without it are shown with the old one ([how it works](docs/how-it-works.en.md#the-new-flyover-style-98)).
 
 ## Globe viewer
 

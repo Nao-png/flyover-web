@@ -431,9 +431,105 @@ def process_clers(meta, meta_ctr, clers, wbo, b5unkn32, res1, a, b):
         raise ValueError("res1v_min1ag not -1")
 
 
+@njit(cache=True, boundscheck=True)
+def _be32(b, o):
+    return np.uint64((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3])
+
+
+@njit(cache=True)
+def _shl(x, k):
+    """x（uint64）を k ビット左へ。64 以上なら 0（Python の (x << k) & mask と同じ）。"""
+    return np.uint64(0) if k >= 64 else x << np.uint64(k)
+
+
+@njit(cache=True, boundscheck=True)
+def decode_clers(b2, res9, b5unkn32, opp):
+    """edgebreaker.decode_clers と同じ。b2 は末尾に 8 バイトの 0 を足した uint8 の配列、opp は int64 の
+    配列。(meta_ctr, meta（int64）, wbo, clers（uint8）)。"""
+    C, L, E, R, S, P = 67, 76, 69, 82, 83, 80
+    meta = np.zeros(res9, np.int64)
+    clers = np.zeros(res9 * 3, np.uint8)
+    wbo = 0
+    if b5unkn32 == 0 and res9 > 0:
+        wbo = 1
+        clers[0] = P
+    if wbo >= res9:
+        raise NotImplementedError("no decoding of data2")
+    inp = np.uint64(0)
+    rs, bmc_tmp, updown, roff, meta_ctr = 0, 0, 0, 0, 0
+    while True:                                   # BIG_LOOP
+        tri = 3 * wbo
+        wbo_tmp = wbo
+        oth = 0
+        shift = rs
+        restart = False
+        while True:
+            if shift <= 0:
+                inp |= _shl(_be32(b2, roff), 32 - shift)
+                shift += 32
+                roff += 4
+            rs = shift - 1
+            out = C
+            flag = inp >> np.uint64(63)
+            inp = inp << np.uint64(1)
+            if flag:
+                if shift <= 2:
+                    inp |= _shl(_be32(b2, roff), 33 - shift)
+                    roff += 4
+                    rs = shift + 31
+                code = int(inp >> np.uint64(62))
+                rs -= 2
+                inp = inp << np.uint64(2)
+                if code == 0:
+                    break
+                if code == 3:
+                    wbo += oth + 1
+                    clers[wbo_tmp + oth] = E
+                    if updown > 0:
+                        updown -= 1
+                        if wbo < res9:
+                            restart = True
+                            break
+                        return meta_ctr, meta, wbo, clers
+                    bmc_tmp = meta_ctr + 1
+                    if wbo < res9:
+                        if bmc_tmp >= b5unkn32:
+                            clers[wbo_tmp + 1 + oth] = P
+                            wbo = wbo_tmp + oth + 2
+                        else:
+                            meta[meta_ctr + 1] = wbo
+                    if wbo >= res9:
+                        meta_ctr += 1
+                        return meta_ctr, meta, wbo, clers
+                    meta_ctr = bmc_tmp
+                    restart = True
+                    break
+                out = R if code == 1 else L
+            clers[wbo + oth] = out
+            oth += 1
+            tri += 3
+            shift = rs
+            if oth + wbo >= res9:
+                wbo += oth
+                return meta_ctr, meta, wbo, clers
+        if restart:
+            continue
+        clers[wbo + oth] = S
+        if opp[_pv(tri)] == -1:
+            updown += 1
+        wbo += oth + 1
+        if wbo < res9:
+            continue
+        return meta_ctr, meta, wbo, clers
+
+
 def warm():
     """コンパイル（か、残してある結果の読み込み）を先に済ませる。"""
     z = np.zeros(0, np.int64)
+    try:
+        decode_clers(np.zeros(8, np.uint8), 0, 0, z)
+    except NotImplementedError:
+        pass
     traverse(z, z, z, z, z, z, z, 0, 0, 0)
     huffman_decode(np.zeros(4, np.uint32), 0, 0, z, z, z)
     try:

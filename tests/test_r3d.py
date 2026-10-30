@@ -137,6 +137,30 @@ def test_uv_indices_on_two_triangles():
 def test_parse_rejects_other_data():
     with pytest.raises(ValueError):
         r3d.parse(b"C3M\x03\x07" + bytes(200))
+    with pytest.raises(ValueError):
+        r3d.sections(r3d.MAGIC + struct.pack("<I", 3) + bytes(200))
+
+
+def test_version1_container_sections():
+    # 版 1: 枠がなく、16 バイト目から回転と平行移動、スプラット、メッシュ、画像の HEIC の順
+    head = r3d.MAGIC + struct.pack("<IfI", 1, 0.0016, 2) + struct.pack("<12d", *range(12))
+    splat = r3d.SPLAT_MAGIC + bytes(20)
+    mesh = r3d.MESH_MAGIC + bytes(30)
+    heic = (struct.pack(">I4s", 24, b"ftyp") + bytes(16) + struct.pack(">I4s", 12, b"meta") + bytes(4)
+            + struct.pack(">I4s", 10, b"mdat") + bytes(2))
+    data = head + b"pbr" + bytes(29) + splat + mesh + heic + heic   # 2 つ目は灰色の画像など
+    sec = r3d.sections(data)
+    a = len(head) + 32
+    assert sec[(2, 1)] == (16, 112)
+    assert sec[(1, 3)] == (a, a + len(splat))
+    assert sec[(2, 2)] == (a + len(splat), a + len(splat) + len(mesh))
+    assert r3d.texture(data, sec) == heic
+    assert not r3d.partial_texture(data, sec)
+    # 画像のないもの（メッシュが空で、スプラットだけ）
+    sec = r3d.sections(head + bytes(32) + splat + mesh)
+    assert (2, 3) not in sec and sec[(2, 2)][1] == len(head) + 32 + len(splat) + len(mesh)
+    with pytest.raises(ValueError):                    # メッシュがスプラットより前
+        r3d.sections(head + bytes(32) + mesh + splat)
 
 
 def test_attribute_origin_forms():

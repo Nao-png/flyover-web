@@ -33,11 +33,10 @@ from .terrain import DROP, Geoid, Terrain
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "earth")
 MIN_ZOOM, MAX_ZOOM = 13, 20     # Flyover のタイルのあるズーム
-# 新しい Flyover（R3D）を使うズーム。それより粗いタイルは C3M にする。z16 以下の R3D は 1 枚 1 MB 前後と
-# 大きく、Apple の配信サーバーにまだ溜まっていないので最初の応答に 1〜2 秒かかり、読めないものも
-# 多い（東京の 516 枚で z13〜16 は 1〜2 割が読めない。z17 以上はほぼ全部読める）。遠くから寄って
-# いくときの最初の 3D を早く出すため、遠景は配信サーバーに溜まっている C3M（数十 ms で返る）で出す
-R3D_MIN_ZOOM = 17
+# 新しい Flyover（R3D）を使うズーム。ズームで新旧のデータが切り替わって景色が変わらないよう、全部の
+# ズームで使う。z16 以下の R3D は 1 枚 1 MB 前後と大きく、Apple の配信サーバーにまだ溜まっていない
+# ことが多いので、初めての場所では遠景の最初の応答に 1〜2 秒かかる
+R3D_MIN_ZOOM = MIN_ZOOM
 NOMINATIM = "https://nominatim.openstreetmap.org/search"
 # 今のサーバーの C3M がどれも使っているハフマン符号の引数（表を作るのに 0.2 秒ほどかかる）
 COMMON_HUFFMAN = [(62, 40000, 50000, 1024), (250, 6000, 25000, 1024)]
@@ -64,9 +63,10 @@ def fetch_heights(z, get_many):
         n = 4
 
 
-def build_glb(raws, name, parse=c3m.parse, strict=False):
+def build_glb(raws, name, parse=c3m.parse, strict=False, hevc=False):
     """高さ区分ごとの C3M（parse が r3d.parse なら R3D）のバイト列から glb を作る（別のプロセスで動かす）。
-    読めない区分は飛ばす。strict なら、1 つでも読めなければ None（ほかの形式で作り直せるように）。"""
+    読めない区分は飛ばす。strict なら、1 つでも読めなければ None（ほかの形式で作り直せるように）。
+    hevc なら、R3D の画像を HEVC のまま入れる（glb.tile_glb を見よ）。"""
     tiles = []
     for k, b in enumerate(raws):
         if b:
@@ -76,7 +76,7 @@ def build_glb(raws, name, parse=c3m.parse, strict=False):
                 print(f"  {name} h={k}: {e}", flush=True)
                 if strict:
                     return None
-    return glb.tile_glb(tiles) if tiles else None
+    return glb.tile_glb(tiles, hevc=hevc) if tiles else None
 
 
 def _warm_worker():
@@ -113,9 +113,10 @@ class Earth:
         self.cache_dir = cache_dir
         self.pool = ThreadPoolExecutor(jobs)
         # C3M の展開は重い（密な街で 1 枚 0.1 秒ほど、numba がなければ 0.3 秒ほど）ので、プロセスを
-        # 分けて並べる。コアを全部使うとブラウザの描画と取り合うので、半分（多くて 8 つ）にする。
-        # 全部の立ち上げに数秒かかるので、起動時に裏で立ち上げておく
-        n = max(2, min(8, (os.cpu_count() or 4) // 2))
+        # 分けて並べる。コアを多く使うとブラウザの描画と取り合い、1 つ 140 MB ほどメモリも使うので、
+        # 4 分の 1（多くて 4 つ）にする（新しい Flyover を HEVC のまま渡せば、高さ区分 1 つ 50 ms ほど。
+        # 待ちのほとんどは Apple からの取得）。全部の立ち上げに数秒かかるので、起動時に裏で立ち上げておく
+        n = max(2, min(4, (os.cpu_count() or 4) // 4))
         self.cpu = ProcessPoolExecutor(n, initializer=_warm_worker)
         threading.Thread(target=lambda: [self.cpu.submit(_warm_wait) for _ in range(n)],
                          daemon=True).start()
@@ -138,20 +139,22 @@ class Earth:
                 "geoid": {"step": 2, "rows": np.round(g).astype(int).tolist()},
                 "terrainDrop": DROP, "tileHosts": self.tile_hosts, "r3d": self.r3d}
 
-    def flyover(self, z, x, y, timing=None):
+    def flyover(self, z, x, y, timing=None, hevc=False):
         """タイルの glb。データがなければ None。timing（dict）があれば、Apple から取るのと
-        glb を作るのにかかった時間 [ms] を入れる。"""
+        glb を作るのにかかった時間 [ms] を入れる。hevc なら、新しい Flyover の画像を HEVC のまま
+        入れる（ビューアが GPU で展開できるとき）。"""
         timing = {} if timing is None else timing
         if not MIN_ZOOM <= z <= MAX_ZOOM:
             return None
         region = self.client.region_of_tile(x, y, z, strict=True)
         if region is None:
             return None
-        kind = "glb98_8" if self.r3d else "glb3"     # 作り方を変えたら番号を上げる
+        hevc = hevc and self.r3d
+        kind = ("glb98_11h" if hevc else "glb98_11") if self.r3d else "glb4"    # 作り方を変えたら番号を上げる
         d = os.path.join(self.cache_dir, kind, f"{region['region']}_{region['version']}", str(z))
         path = os.path.join(d, f"{x}_{y}.glb")
         t0 = time.perf_counter()
-        with self._lock(("glb", z, x, y)):
+        with self._lock(("glb", z, x, y, hevc)):
             timing["wait"] = (time.perf_counter() - t0) * 1000
             if os.path.exists(path):
                 return open(path, "rb").read() or None
@@ -161,9 +164,11 @@ class Earth:
                 raws = fetch_heights(z, lambda hs: self.map(
                     lambda k: self.client.r3d_tile_cached(region, x, y, z, k), hs))
                 t1 = time.perf_counter()
+                # R3D があれば C3M は取らない。R3D の取得が時間切れなら、ここで例外になって
+                # 保存せずに 502 を返し、ビューアがあとで取り直す
                 if any(raws):
                     # 1 区分でも読めなければ、タイルごと C3M にする（区分が欠けて建物の上が消えないよう）
-                    out = self.cpu.submit(build_glb, raws, f"{z}/{x}/{y} r3d", r3d.parse, True).result()
+                    out = self.cpu.submit(build_glb, raws, f"{z}/{x}/{y} r3d", r3d.parse, True, hevc).result()
             if out is None:
                 raws = fetch_heights(z, lambda hs: self.map(
                     lambda k: self.client.tile_cached(region, x, y, z, k), hs))
@@ -247,7 +252,7 @@ def handler(earth):
                 a, b, c = map(int, m.groups())
                 if kind == "flyover":
                     timing = {}
-                    out = earth.flyover(a, b, c, timing)
+                    out = earth.flyover(a, b, c, timing, query.get("hevc") == ["1"])
                     # ブラウザには覚えさせない（作り方を変えたときに古いものが残らないよう）。cache/ にはある
                     return self.send(200 if out else 204, out or b"", "model/gltf-binary", cache=False, timing=timing)
                 if kind == "sat":
