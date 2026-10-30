@@ -37,11 +37,16 @@ Satellite imagery is style 7, and terrain is style 17 (zoom 7 and 11 worldwide, 
 
 ### Conversion on the server
 
-- The height slabs of a tile are packed into one glb (vertices in Earth-centered coordinates) and kept in `cache/glb3/`
+- The height slabs of a tile are packed into one glb (vertices in Earth-centered coordinates) and kept in `cache/glb4/`
 - Vertex positions are packed as int16 and UVs as uint16 (KHR_mesh_quantization; 8 cm steps even on a 4.9 km tile)
+- When the browser can decode HEVC with the GPU's dedicated hardware (WebCodecs; Chrome doesn't decode HEVC in software), images of the new Flyover are passed as HEVC instead of JPEG (`?hevc=1`, `cache/glb98_11h/`). A HEIC holds just one HEVC frame, so its configuration (hvcC) and the frame go into the material's `extras.hevc`. The viewer decodes them in a worker (`earth/hevc.js`), uses the luma (Y) and chroma (UV) planes directly as textures of a Cesium CustomShader, and converts to RGB in the shader. HEIC carries no color description, so it is treated as BT.601 full range as the HEIF rules say (the same as pillow_heif; Chrome otherwise assumes BT.709 limited range)
+  - Building a glb on the server drops from about 125 ms to 19 ms per height slab (no HEIC decoding, shrinking or JPEG). Decoding in the browser takes about 10 ms per image
+  - Images stay at their original size (in WebGL2, textures made from arrays are not enlarged to powers of two) at 1.5 bytes per pixel. With 208 tiles loaded over Osaka, images take 438 MB of GPU memory (754 MB as power-of-two JPEG, 2,885 MB before shrinking)
+  - Which material's image to use is told by the vertex attribute `_SLAB` (the 4th int16 of the position, which used to be padding). If decoding fails, JPEG is used from then on. Add `?hevc=0` to use JPEG only
+- Images are shrunk so that width and height are each the next lower power of two. Cesium enlarges images that are not powers of two to the next power of two before building the downscaled levels (mipmaps), so the 1152–1376 px images common in the new Flyover became 2048 px, about 2.5 times the GPU memory (for 314 tiles loaded over Osaka, images are estimated to drop from 3.6 GB to about 1.0 GB)
 - Tiles at the edge of Flyover coverage contain a gray band that joins the flat map (mesh kind 4) and a plane at height 0 (kind 3). On top of the terrain these look like a second layer, so they are left out
 - Height slabs split heights relative to the tile size. At zoom 16 and below there is only h = 0 (even for Tokyo Skytree or Denver), so zoom 15 and below request only h = 0, and zoom 16 only h = 0–1
-- If numba is available, the heavy parts of C3M decoding (`flyover/_fast.py`) are compiled for speed (0.3 s → 0.06 s per tile in a dense city; the output is bit-for-bit identical to the pure Python version). Decoding runs in parallel in worker processes started at launch. So as not to compete with the browser for CPU, it uses half the cores (at most 8) at slightly lowered priority
+- If numba is available, the heavy parts of C3M decoding (`flyover/_fast.py`) are compiled for speed (0.3 s → 0.06 s per tile in a dense city; the output is bit-for-bit identical to the pure Python version). Decoding runs in parallel in worker processes started at launch. So as not to compete with the browser for CPU, it uses a quarter of the cores (at most 4; each takes 140–190 MB of memory) at slightly lowered priority
 
 ### Requests to Apple
 
@@ -77,7 +82,7 @@ The authentication steps and `tokenP1` are the same as the Look Around implement
 
 ## The new Flyover (style 98)
 
-The manifest requested as iOS 27 lists the new Flyover tiles (style 98). Start with `python scripts/earth.py --r3d` to use them at z17 and above; tiles that are missing or can't be read are filled in with the old C3M. The reader is `flyover/r3d.py`.
+The manifest requested as iOS 27 lists the new Flyover tiles (style 98). Start with `python scripts/earth.py --r3d` to use them at every zoom; only tiles without the new Flyover or that can't be read are filled in with the old C3M (so the scene doesn't switch between old and new data as you zoom). The reader is `flyover/r3d.py`.
 
 - **Fetching**: Tile numbering and height slabs are the same as C3M. Request `?style=98&v=<style 98 version>&region=<region>&x&y&z&h` (`v` is the style 98 version, not the region's version)
 - **File**: A container starting with `3D 96 59 2E` holds triangle splats (part 1) and a textured mesh (part 2). The mesh coordinates become Earth-centered coordinates (ECEF) with the 3×3 rotation and translation in the first entry of part 2. The texture is the first HEIC in the image entry
@@ -91,17 +96,20 @@ The manifest requested as iOS 27 lists the new Flyover tiles (style 98). Start w
   - **Normals**: Spherical coordinates in 2° steps (not read now, since the view has no lighting)
 - **Speed**:
   - The heavy loops (Huffman codes, lane filling, the 3 walks, prediction replay) run in numba. One tile takes 20–150 ms, 5–13 times faster than plain Python.
+  - Reading the Huffman code tables and expanding the triangle connectivity (CLERS) also run in numba. Reading one height slab of the new Flyover went from about 36 ms to 23 ms (on 4,838 local tiles the output is exactly the same as before).
   - So that broken data doesn't crash or hang the process, index ranges are checked before handing data to numba, the corner-table walks run with index checks (`boundscheck`), and loops have an upper limit.
   - In building one tile, decoding the image (HEIC, 100–150 ms) is the heaviest part.
   - The new Flyover is often not yet cached on Apple's delivery servers, so the first fetch of a tile takes 1–2 seconds to respond (tens of ms from the second time; it is also kept locally in `cache/r3d/`).
-  - So the new Flyover is used only at z17 and above, and the distant view (z16 and below) comes from C3M, which is cached on the delivery servers. New Flyover tiles at z16 and below are large, around 1 MB each, and 10–20% of them can't be read.
+  - New Flyover tiles at z16 and below are large, around 1 MB each, so in a new place the distant view takes 1–2 seconds to appear. Tiles whose fetch times out are not filled with C3M; the viewer fetches them again later.
 - **Checking**: On the 29 Tokyo tiles whose decoding by Apple itself (exported from the iOS 27 simulator) is published, the mesh triangles, positions, UV numbers and UV values, and the splat vertices, colors and attributes all match bit for bit
 - **Where the format comes from**: Apple doesn't document it. It was worked out from the data, using the prose of [nmt3325/apple-maps-r3d-research](https://github.com/nmt3325/apple-maps-r3d-research) as clues (its code was not read, since it has no license). The reference data used for checking is from the same repository
 - **Lane filling**: Decided by the mark in J (on about 150,000 splat lanes in the local tiles, the mark and the filling worked out from the data agree every time). For lanes without a mark: where the prediction is right the bit is 0, so with the right filling a literal never equals the prediction, and that is how it is chosen
 - **Mesh field section**: int32 values for the face count, the corner pairs (va, vb) glued in advance, the vertex count and so on. The fields are laid out as 4 bytes each, and the byte string is packed with a table lookup, using each field's 4-bit mark (which bytes are written) as the bitmap (the same as mode 4 of the origin packing: an unwritten byte is table[previous byte], and each written byte sets table[previous] = it). When the section starts with 0C, that is packed again with a repeat bitmap. Every field in the local tiles reads correctly this way
 - **Header numbers and small tiles**: The two numbers in the header (meaning unknown) and the two numbers after XYZ take 1 byte when small. In small tiles the seam block, and in large low-zoom tiles the per-triangle C bits, are stored unpacked or as a 1-lane BYET
-- **How much can be read**: Of about 15,400 tiles fetched locally, all splats and meshes can be read except 6: 4 version 1 containers (a different layout, rare in upper height slabs) and 2 z13 tiles (a different layout after XYZ). Those fall back to C3M entirely (the new Flyover is used only at z17 and above, so z13 doesn't affect the view)
-- **What is unknown**: What the 4 splat values mean for drawing (the view doesn't use them now). The meaning of some numbers between blocks (not used for reading). The layout of the version 1 container
+- **Version 1 container**: Rare in upper height slabs. It has no part and item framing: from byte 16 come 12 doubles for the rotation and translation, then the splats (starting with `D1 22 C9 07`), the mesh (starting with `E1 21 66 24`) and the image HEIC. The contents have the same form as version 2 and read the same way
+- **Coastal low-zoom tiles (z13–14)**: After the XYZ block there is one extra block (a 1-bit mark per vertex; meaning unknown), and the per-chart number block (normally empty) holds values. The image section has item 13, and the image included is only a fill for the sea and the like (sometimes 16 px square); the UVs of land triangles point outside the image. The land photos are not in the tile's other height slabs either. The shapes can be read, but with no photos, tiles that contain land fall back to C3M entirely (sea-only ones are shown from the new Flyover)
+- **How much can be read**: Of about 20,000 tiles fetched locally, all splats and meshes can be read except the coastal tiles "without land photos" above (36) and the following 4 (40 of 20,114). The 4 large z13 tiles on the mountain side of Kobe have a height component of the positions that drifts (the shape looks like a tile, but it is shifted by hundreds of meters to kilometers). The cause is unknown, and they fall back to C3M entirely
+- **What is unknown**: What the 4 splat values mean for drawing (the view doesn't use them now). The meaning of some numbers between blocks (not used for reading). The meaning of the vertex marks and chart numbers in coastal tiles, and where their land photos are. The shift of the 4 Kobe tiles
 
 ## Comparison with the Go version
 

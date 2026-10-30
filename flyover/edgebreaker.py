@@ -85,6 +85,9 @@ def read_bufs(data, off, table_a, table_b):
 
 
 def decode_clers(b2, res9, b5unkn32, opp):
+    if _fast is not None:              # numba 版は meta と clers を配列で返す
+        return _fast.decode_clers(np.frombuffer(bytes(b2) + b"\0" * 8, np.uint8), res9, b5unkn32,
+                                  np.asarray(opp, np.int64))
     meta = [0] * res9
     clers = bytearray(res9 * 3)
     wbo = 0

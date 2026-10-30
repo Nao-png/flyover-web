@@ -448,7 +448,13 @@ const REFINE_PX = 520 / devicePixelRatio;   // タイルがこの幅より大き
 const MAX_ACTIVE = 48;
 const MAX_OFFSCREEN = 24;  // そのうち画面の外の先読みに使う数（見えているものの枠を空けておく）
 const MAX_MODELS = 240;    // これを超えたら、しばらく使っていないものから捨てる（GPU のメモリを食うので）
-const flyUrl = t => `${hostBase(t.x + t.y + 1)}/api/flyover/${t.z}/${t.x}/${t.y}.glb`;
+// 新しい Flyover の画像は、HEVC のまま受け取って GPU の専用回路で展開し（hevc.js）、Y と UV の面の
+// ままテクスチャにする。サーバーで JPEG にする手間がなく、GPU のメモリも RGBA の 4 割ほどで済む。
+// 専用回路で展開できない（Chrome は HEVC をソフトウェアでは展開しない）ときと ?hevc=0 のときは JPEG
+let hevc = cfg.r3d && typeof VideoDecoder !== 'undefined' && new URLSearchParams(location.search).get('hevc') !== '0'
+  && (await VideoDecoder.isConfigSupported({ codec: 'hvc1.3.E.L120.B0', hardwareAcceleration: 'prefer-hardware' })
+    .catch(() => ({}))).supported === true;
+const flyUrl = (t, h = hevc) => `${hostBase(t.x + t.y + 1)}/api/flyover/${t.z}/${t.x}/${t.y}.glb${h ? '?hevc=1' : ''}`;
 const BOX_BUDGET = 4;      // 1 コマに地面の高さを調べてよいタイルの数
 let boxBudget = BOX_BUDGET;
 const flyover = scene.primitives.add(new C.PrimitiveCollection());
@@ -531,17 +537,19 @@ async function load(t, offscreen) {
   t.abort = new AbortController();
   const t0 = performance.now();
   try {
-    const r = await fetch(flyUrl(t), { signal: t.abort.signal });
+    const useHevc = hevc;
+    const r = await fetch(flyUrl(t, useHevc), { signal: t.abort.signal });
     if (r.status === 204) { t.state = 'empty'; return; }
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const buf = new Uint8Array(await r.arrayBuffer());
     const t1 = performance.now();
-    await makeModel(t, buf);
+    await makeModel(t, buf, useHevc);
     loadLog.push({ z: t.z, x: t.x, y: t.y, off: offscreen, at: t0, bytes: buf.length, fetch: t1 - t0, model: performance.now() - t1,
       server: r.headers.get('Server-Timing') });
     if (loadLog.length > 500) loadLog.shift();
   } catch (e) {
     if (e.name === 'AbortError') { t.state = 'none'; }
+    else if (e.retry) { t.state = 'none'; console.warn('HEVC を展開できないので、JPEG にする', e); }
     else { t.state = 'failed'; t.failedAt = performance.now(); console.warn('Flyover', t.z, t.x, t.y, e); }
   } finally {
     active--; t.abort = null;
@@ -549,23 +557,108 @@ async function load(t, offscreen) {
     dirty = true;              // 選び直す
   }
 }
+const hevcWorker = hevc ? new Worker('hevc.js') : null;
+const hevcWait = new Map();
+let hevcId = 0;
+if (hevcWorker) hevcWorker.onmessage = ({ data }) => {
+  const w = hevcWait.get(data.id);
+  hevcWait.delete(data.id);
+  data.error ? w.reject(new Error(data.error)) : w.resolve(data.out);
+};
+const hevcDecode = images => new Promise((resolve, reject) => {
+  hevcWait.set(++hevcId, { resolve, reject });
+  hevcWorker.postMessage({ id: hevcId, images });
+});
+
+// glb の材質の extras.hevc（flyover/glb.py の tile_glb を見よ）から、HEVC の設定とコマを番号順に取り出す
+function glbHevc(buf) {
+  const jl = new DataView(buf.buffer, buf.byteOffset).getUint32(12, true);
+  const g = JSON.parse(new TextDecoder().decode(buf.subarray(20, 20 + jl)));
+  const part = i => {
+    const v = g.bufferViews[i], o = 28 + jl + (v.byteOffset || 0);
+    return buf.slice(o, o + v.byteLength);
+  };
+  return g.materials.map(m => m.extras && m.extras.hevc).filter(Boolean).sort((a, b) => a.slab - b.slab)
+    .map(h => ({ config: part(h.config), data: part(h.data) }));
+}
+
+// HEVC を展開した Y と UV の面を貼るシェーダー。どの面かは頂点の属性 _SLAB（slab）で選ぶ（HEVC でない
+// 材質（スプラットなど）は 255 で、そのまま）。テクスチャは元の大きさのまま（WebGL2 では、配列から作る
+// テクスチャは 2 のべき乗に広げられない）
+function hevcShader(planes) {
+  const tex = (typedArray, width, height, pixelFormat) => ({
+    type: C.UniformType.SAMPLER_2D,
+    value: new C.TextureUniform({ typedArray, width, height, pixelFormat, repeat: false,
+      minificationFilter: C.TextureMinificationFilter.LINEAR_MIPMAP_LINEAR,
+      magnificationFilter: C.TextureMagnificationFilter.LINEAR }),
+  });
+  const uniforms = {};
+  let pick = '';
+  planes.forEach((p, i) => {
+    uniforms['u_y' + i] = tex(p.y, p.w, p.h, C.PixelFormat.LUMINANCE);
+    uniforms['u_uv' + i] = tex(p.uv, (p.w + 1) >> 1, (p.h + 1) >> 1, C.PixelFormat.LUMINANCE_ALPHA);
+    pick += `${i ? 'else ' : ''}if (s == ${i}) { y = textureGrad(u_y${i}, st, dx, dy).r; c = textureGrad(u_uv${i}, st, dx, dy).ra; }\n`;
+  });
+  return new C.CustomShader({ uniforms, fragmentShaderText: `
+void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
+  int s = int(fsInput.attributes.slab + 0.5);
+  if (s >= ${planes.length}) return;
+  vec2 st = fsInput.attributes.texCoord_0, dx = dFdx(st), dy = dFdy(st);
+  float y = 0.0;
+  vec2 c = vec2(0.5);
+  ${pick}
+  c -= 0.5;
+  // BT.601 のフルレンジ（hevc.js を見よ）。Cesium の材質の色は線形の値
+  vec3 rgb = clamp(vec3(y + 1.402 * c.y, y - 0.344136 * c.x - 0.714136 * c.y, y + 1.772 * c.x), 0.0, 1.0);
+  material.diffuse = czm_srgbToLinear(rgb);
+}` });
+}
+
+// テクスチャを作り終えたら、元の Y と UV の配列を手放す（JS のメモリに残さない）
+function releasePlanes(t) {
+  const tm = t.shader._textureManager, u = t.shader.uniforms;
+  if (!tm || !Object.keys(u).every(k => tm._textures[k])) return;
+  for (const k in u) u[k].value.typedArray = undefined;
+  t.planesFreed = true;
+}
+
 const NO_IBL = new C.ImageBasedLighting({ imageBasedLightingFactor: new C.Cartesian2(0, 0) });
-async function makeModel(t, buf) {
-  const model = await C.Model.fromGltfAsync({
-    // basePath はタイルごとに変える。Cesium は glb の中身（バッファや画像）を basePath を鍵に
-    // 使い回すので、同じだと別のタイルの中身が混ざる
-    gltf: buf, basePath: flyUrl(t), upAxis: C.Axis.Z, forwardAxis: C.Axis.X, show: false,
-    incrementallyLoadTextures: false, backFaceCulling: false, releaseGltfJson: true,
-    // 光を当てない（写真そのまま）ので、映り込みの計算は要らない。これがあると、映り込みの準備が
-    // できたところでシェーダーを全部作り直し、読み込み中の数秒をそれに取られる。Scene#pick も使わない
-    environmentMapOptions: { enabled: false }, imageBasedLighting: NO_IBL, allowPicking: false,
-  });
-  flyover.add(model);
-  await new Promise((res, rej) => {
-    model.readyEvent.addEventListener(res);
-    model.errorEvent.addEventListener(rej);
-  });
-  t.model = model; t.clip = 0; t.state = 'ready';
+async function makeModel(t, buf, useHevc) {
+  let shader;
+  if (useHevc) {
+    const images = glbHevc(buf);
+    if (images.length) {
+      try {
+        shader = hevcShader(await hevcDecode(images));
+      } catch (e) {
+        hevc = false;           // 以後は JPEG で受け取る
+        e.retry = true;
+        throw e;
+      }
+    }
+  }
+  let model;
+  try {
+    model = await C.Model.fromGltfAsync({
+      // basePath はタイルごとに変える。Cesium は glb の中身（バッファや画像）を basePath を鍵に
+      // 使い回すので、同じだと別のタイルの中身が混ざる
+      gltf: buf, basePath: flyUrl(t, useHevc), upAxis: C.Axis.Z, forwardAxis: C.Axis.X, show: false,
+      incrementallyLoadTextures: false, backFaceCulling: false, releaseGltfJson: true,
+      // 光を当てない（写真そのまま）ので、映り込みの計算は要らない。これがあると、映り込みの準備が
+      // できたところでシェーダーを全部作り直し、読み込み中の数秒をそれに取られる。Scene#pick も使わない
+      environmentMapOptions: { enabled: false }, imageBasedLighting: NO_IBL, allowPicking: false,
+      customShader: shader,
+    });
+    flyover.add(model);
+    await new Promise((res, rej) => {
+      model.readyEvent.addEventListener(res);
+      model.errorEvent.addEventListener(rej);
+    });
+  } catch (e) {
+    if (shader) shader.destroy();      // モデルはシェーダーを捨てない
+    throw e;
+  }
+  t.model = model; t.shader = shader; t.planesFreed = !shader; t.clip = 0; t.state = 'ready';
 }
 
 // 親のタイルを、子の 4 分の 1（北西・北東・南西・南東 = ビット 0〜3）のうち mask のものだけ
@@ -700,6 +793,7 @@ function updateFlyover() {
       if (t.model.show !== show || show && t.clip !== t.mask) scene.requestRender();
       t.model.show = show;
       if (show && t.clip !== t.mask) setClip(t, t.mask);
+      if (!t.planesFreed) releasePlanes(t);
       n++;
     }
     // 読みかけは、しばらく（4 秒）要らなかったときだけ取りやめる（回している間に取りやめると、
@@ -721,8 +815,9 @@ function updateFlyover() {
   if (n > MAX_MODELS) {             // 毎コマにならないよう、20 個ぶん余裕を作る
     const old = [...tiles.values()].filter(t => t.model && t.touched !== frame).sort((a, b) => (a.touched || 0) - (b.touched || 0));
     for (const t of old.slice(0, n - MAX_MODELS + 20)) {
-      flyover.remove(t.model);      // remove は destroy もする
-      t.model = null; t.state = 'none';
+      flyover.remove(t.model);      // remove は destroy もする（シェーダーは捨てないので別に捨てる）
+      if (t.shader) t.shader.destroy();
+      t.model = null; t.shader = null; t.state = 'none';
     }
   }
   return active + queue.length;
@@ -914,5 +1009,6 @@ $('search-form').addEventListener('submit', async e => {
 });
 
 window.earth = {   // コンソールから触る用
-  viewer, tiles, pick, resetView, setClip, loadLog, stats: () => ({ flyover: pendingFly, globe: globeQueue, updateMs }) };
+  viewer, tiles, pick, resetView, setClip, loadLog, hevc: () => hevc,
+  stats: () => ({ flyover: pendingFly, globe: globeQueue, updateMs }) };
 })();

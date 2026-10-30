@@ -4,7 +4,7 @@
 からの差を int16 に（間隔はノードの scale、中心は translation（float64）に置く。4.9 km の
 タイルでも 8 cm 刻み）、UV は uint16 に。軸は ECEF のまま（z が北極）なので、読む側は軸の
 変換をしないこと（Cesium なら upAxis: Z、forwardAxis: X）。材質は光の影響を受けない
-KHR_materials_unlit で、画像は JPEG。地形の上に置くので、Flyover の範囲の端にある、平らな地図に
+KHR_materials_unlit で、画像は縦横を 2 のべき乗に縮めた JPEG。地形の上に置くので、Flyover の範囲の端にある、平らな地図に
 つなぐための帯と面（c3m.Mesh.kind が 0 でないもの）は入れない。
 
 新しい Flyover の三角形のスプラット（木など。r3d.Splats）は、頂点の色（RGBA）を付けた半透明の
@@ -25,8 +25,68 @@ MAIN = 0        # C3M のメッシュの種類のうち、本体（c3m.Mesh.kind
 ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER = 34962, 34963
 
 
-def tile_glb(c3ms, quality=85):
-    """c3ms: 同じタイルの C3M（高さ区分ごと）の並び。三角形がなければ None。"""
+def _jpeg_pot(material, quality):
+    """材質の画像を、縦横をそれぞれ 1 つ下の 2 のべき乗に縮めた JPEG に。Cesium は 2 のべき乗でない
+    画像を、縮小用の段（ミップマップ）を作る前に次の 2 のべき乗まで広げる（新しい Flyover に多い
+    1152〜1376 px は 2048 px になり、GPU のメモリが 2.5 倍ほどになる）ので、先にこちらで縮めておく。"""
+    from PIL import Image
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+    img = Image.open(io.BytesIO(material.image))
+    size = tuple(1 << (n.bit_length() - 1) for n in img.size)
+    if size == img.size:
+        return to_jpeg(material, quality)
+    out = io.BytesIO()
+    img.convert("RGB").resize(size, Image.LANCZOS).save(out, "JPEG", quality=quality)
+    return out.getvalue()
+
+
+def _box(b, a, z, name):
+    """b[a:z] の箱の並びから name の箱を探し、(中身の始まり, 箱の終わり) を返す。"""
+    while a + 8 <= z:
+        n, t = struct.unpack_from(">I4s", b, a)
+        if n < 8 or a + n > z:
+            return None
+        if t == name:
+            return a + 8, a + n
+        a += n
+    return None
+
+
+def heif_hevc(heic):
+    """HEIC が HEVC の 1 コマだけ（新しい Flyover の画像はそう）なら、(hvcC の中身, コマのデータ
+    （4 バイトの長さ付きの NAL の並び）, 幅, 高さ)。分割された画像などほかの形なら None。"""
+    try:
+        meta = _box(heic, 0, len(heic), b"meta")
+        a, z = meta[0] + 4, meta[1]                   # meta は版と旗の 4 バイトのあとに箱が並ぶ
+        ii = _box(heic, a, z, b"iinf")
+        if heic[ii[0]] != 0 or struct.unpack_from(">H", heic, ii[0] + 4)[0] != 1:   # 項目が 1 つ（版 0）
+            return None
+        infe = _box(heic, ii[0] + 6, ii[1], b"infe")
+        if heic[infe[0]] < 2 or heic[infe[0] + 8:infe[0] + 12] != b"hvc1":
+            return None
+        ipco = _box(heic, *_box(heic, a, z, b"iprp"), b"ipco")
+        hvcc = _box(heic, *ipco, b"hvcC")
+        w, h = struct.unpack_from(">II", heic, _box(heic, *ipco, b"ispe")[0] + 4)
+        loc = _box(heic, a, z, b"iloc")[0]
+        if heic[loc] != 0 or heic[loc + 4:loc + 6] != b"\x44\x00":   # 版 0、位置と長さが 4 バイト
+            return None
+        n, _, _, ext, off, length = struct.unpack_from(">HHHHII", heic, loc + 6)
+        if n != 1 or ext != 1 or off + length > len(heic):
+            return None
+        return heic[hvcc[0]:hvcc[1]], heic[off:off + length], w, h
+    except (TypeError, struct.error):
+        return None
+
+
+def tile_glb(c3ms, quality=85, hevc=False):
+    """c3ms: 同じタイルの C3M（高さ区分ごと）の並び。三角形がなければ None。
+
+    hevc なら、新しい Flyover の画像（HEIC）は JPEG にせず、HEVC のままビューアに渡す（ビューアが
+    GPU の専用回路で展開して、Y と UV の面のままテクスチャにする）。その材質には画像を付けず、
+    extras.hevc に設定（config）とコマ（data）の bufferView、大きさ、番号（slab）を入れる。
+    どの材質の画像かは、頂点の属性 _SLAB（位置の 4 つ目の int16。HEVC でない材質は 255）で分ける。"""
     parts = []   # (ECEF の頂点, UV, 三角形, (C3M の番号, 材質の番号))
     splats = []  # (ECEF の頂点 (3N, 3), RGBA (N, 4))
     for ci, c in enumerate(c3ms):
@@ -73,21 +133,39 @@ def tile_glb(c3ms, quality=85):
         accessors.append(a)
         return len(accessors) - 1
 
-    images, materials, mat_index, prims = [], [], {}, []
+    def slab_attr(pos):
+        # 位置の 4 つ目の int16（もとは詰め物。材質の番号を入れておく）を指す属性
+        a = accessors[pos]
+        accessors.append({"bufferView": a["bufferView"], "byteOffset": 6, "componentType": INT16,
+                          "count": a["count"], "type": "SCALAR"})
+        return len(accessors) - 1
+
+    images, materials, mat_index, slabs, prims = [], [], {}, {}, []
     for X, UV, F, key in parts:
         if key not in mat_index:
             ci, mat = key
-            images.append({"bufferView": view(to_jpeg(c3ms[ci].materials[mat], quality)),
-                           "mimeType": "image/jpeg"})
-            materials.append({"pbrMetallicRoughness": {"baseColorTexture": {"index": len(images) - 1},
-                                                       "metallicFactor": 0, "roughnessFactor": 1},
-                              "doubleSided": True, "extensions": {"KHR_materials_unlit": {}}})
+            m = c3ms[ci].materials[mat]
+            hv = heif_hevc(m.image) if hevc and m.format == "heic" else None
+            if hv:
+                config, data, w, h = hv
+                slabs[key] = sum(s != 255 for s in slabs.values())
+                materials.append({"pbrMetallicRoughness": {"metallicFactor": 0, "roughnessFactor": 1},
+                                  "doubleSided": True, "extensions": {"KHR_materials_unlit": {}},
+                                  "extras": {"hevc": {"config": view(config), "data": view(data),
+                                                      "width": w, "height": h, "slab": slabs[key]}}})
+            else:
+                slabs[key] = 255
+                images.append({"bufferView": view(_jpeg_pot(m, quality)), "mimeType": "image/jpeg"})
+                materials.append({"pbrMetallicRoughness": {"baseColorTexture": {"index": len(images) - 1},
+                                                           "metallicFactor": 0, "roughnessFactor": 1},
+                                  "doubleSided": True, "extensions": {"KHR_materials_unlit": {}}})
             mat_index[key] = len(materials) - 1
         used, idx = np.unique(F, return_inverse=True)
         idx = idx.reshape(-1)          # numpy 2 は F と同じ形で返す
         q = np.round((X[used] - center) / step).astype(np.int32)
         P = np.zeros((len(used), 4), "<i2")      # 1 頂点 8 バイト（4 バイトの倍数にそろえる）
         P[:, :3] = q
+        P[:, 3] = slabs[key] if hevc else 0
         uv = UV[used].astype(np.float64)
         uv[:, 1] = 1 - uv[:, 1]        # C3M は v が上向き、glTF は下向き
         if uv.min() >= 0 and uv.max() <= 1:
@@ -96,7 +174,10 @@ def tile_glb(c3ms, quality=85):
             tex = accessor(uv.astype("<f4"), FLOAT, "VEC2", ARRAY_BUFFER)
         itype, idt = (UINT16, "<u2") if len(used) < 65536 else (UINT32, "<u4")
         pos = accessor(P, INT16, "VEC3", ARRAY_BUFFER, minmax=(q.min(0).tolist(), q.max(0).tolist()), stride=8)
-        prims.append({"attributes": {"POSITION": pos, "TEXCOORD_0": tex},
+        attrs = {"POSITION": pos, "TEXCOORD_0": tex}
+        if hevc:
+            attrs["_SLAB"] = slab_attr(pos)
+        prims.append({"attributes": attrs,
                       "indices": accessor(idx.astype(idt), itype, "SCALAR", ELEMENT_ARRAY_BUFFER),
                       "material": mat_index[key]})
     if splats:
@@ -109,6 +190,7 @@ def tile_glb(c3ms, quality=85):
             q = np.round((X - center) / step).astype(np.int32)
             P = np.zeros((len(q), 4), "<i2")
             P[:, :3] = q
+            P[:, 3] = 255                   # HEVC の材質ではない
             pos = accessor(P, INT16, "VEC3", ARRAY_BUFFER, minmax=(q.min(0).tolist(), q.max(0).tolist()), stride=8)
             # glTF の頂点の色は線形の値なので、sRGB の色を線形に直す（暗い色が潰れないよう 16 ビットで）
             c = rgba.astype(np.float64) / 255
@@ -120,8 +202,10 @@ def tile_glb(c3ms, quality=85):
             T[1::3, 0] = 255
             T[2::3, 1] = 255
             tex = accessor(T, UINT8, "VEC2", ARRAY_BUFFER, normalized=True, stride=4)
-            prims.append({"attributes": {"POSITION": pos, "COLOR_0": col, "TEXCOORD_0": tex},
-                          "material": len(materials) - 1})
+            attrs = {"POSITION": pos, "COLOR_0": col, "TEXCOORD_0": tex}
+            if hevc:
+                attrs["_SLAB"] = slab_attr(pos)
+            prims.append({"attributes": attrs, "material": len(materials) - 1})
     while len(bin_) % 4:
         bin_.append(0)
 
@@ -131,11 +215,12 @@ def tile_glb(c3ms, quality=85):
             "scene": 0, "scenes": [{"nodes": [0]}],
             "nodes": [{"mesh": 0, "translation": center.tolist(), "scale": [step] * 3}],
             "meshes": [{"primitives": prims}],
-            "materials": materials,
-            "textures": [{"source": i, "sampler": 0} for i in range(len(images))],
-            "samplers": [{"magFilter": 9729, "minFilter": 9987, "wrapS": 33071, "wrapT": 33071}],
-            "images": images, "accessors": accessors, "bufferViews": views,
+            "materials": materials, "accessors": accessors, "bufferViews": views,
             "buffers": [{"byteLength": len(bin_)}]}
+    if images:                          # glTF では空の並びは書かない
+        gltf.update({"textures": [{"source": i, "sampler": 0} for i in range(len(images))],
+                     "samplers": [{"magFilter": 9729, "minFilter": 9987, "wrapS": 33071, "wrapT": 33071}],
+                     "images": images})
     js = json.dumps(gltf, separators=(",", ":")).encode()
     js += b" " * (-len(js) % 4)
     return b"".join([struct.pack("<4sII", b"glTF", 2, 12 + 8 + len(js) + 8 + len(bin_)),
