@@ -357,6 +357,7 @@ addEventListener('keydown', e => {
     case 'u': resetView({ top: true }); break;
     case 'r': resetView({ north: true, top: true }); break;
     case 'o': set2D(!mode2D); break;
+    case 'p': screenshot(e.shiftKey ? '4k' : 'screen'); break;
     case ' ': e.preventDefault(); stopAll(); held.clear(); break;
   }
 });
@@ -426,6 +427,103 @@ function set2D(on) {
 }
 dimBtn.onclick = () => set2D(!mode2D);
 
+// スクリーンショット: 地球儀と 3D だけ（ボタンなどは入らない）を PNG で保存する。大きさは今の画面か、
+// HD・2K・4K。データは Apple のものなので、画面と同じ出典を右下に入れる。
+// 新しい Flyover をきれいに写すため、写す間は画面の外のタイルを読まず、地球儀・地形・3D を読み終えて
+// 落ち着くまで待つ（最大 90 秒）。大きな画面で描きながらだとモデルを作るのが遅い（1 コマごとに少しずつ
+// 進む）ので、読み込みは写す大きさと同じ縦横比の小さな画面で、タイルの細かさだけ写す大きさに合わせて
+// （lodScale 倍）行い、読み終えてから写す大きさにして描く。WebGL のキャンバスは描いた直後でないと
+// 空なので、描いたとき（postRender）に写す
+const SHOT_SIZES = { screen: null, hd: [1920, 1080], '2k': [2560, 1440], '4k': [3840, 2160] };
+let shooting = false, lodScale = 1;
+function waitSettled(limit) {
+  const t0 = performance.now();
+  let calm = 0;
+  return new Promise(res => {
+    const tick = () => {
+      scene.requestRender();
+      calm = pendingFly === 0 && globeQueue === 0 && globe.tilesLoaded ? calm + 1 : 0;
+      if ((calm >= 10 && performance.now() - t0 > 500) || performance.now() - t0 > limit) res(); else setTimeout(tick, 100);
+    };
+    tick();
+  });
+}
+async function screenshot(key = 'screen') {
+  if (shooting) return;
+  shooting = true;
+  const size = SHOT_SIZES[key], el = viewer.container, old = viewer.resolutionScale, dpr = devicePixelRatio;
+  const css = { width: el.style.width, height: el.style.height, right: el.style.right, bottom: el.style.bottom };
+  const setSize = (w, h) => {
+    Object.assign(el.style, { right: 'auto', bottom: 'auto', width: w + 'px', height: h + 'px' });
+    viewer.resize();
+  };
+  try {
+    let W, H;
+    if (size) {
+      const gl = scene.context._gl;
+      const lim = Math.min(gl.getParameter(gl.MAX_RENDERBUFFER_SIZE), ...gl.getParameter(gl.MAX_VIEWPORT_DIMS));
+      const f = Math.min(1, lim / Math.max(...size));
+      W = Math.round(size[0] * f); H = Math.round(size[1] * f);
+      viewer.resolutionScale = 1;
+      // 読み込み: 画面に収まる大きさで（同じ縦横比）
+      const s = Math.max(1, W / dpr / innerWidth, H / dpr / innerHeight);
+      setSize(W / dpr / s, H / dpr / s);
+      lodScale = s;
+    }
+    dirty = true;
+    await waitSettled(90000);
+    if (size) {
+      // 写す大きさにする（タイルの細かさは同じ。地球儀の画像は細かいものを読むので、もう一度待つ）
+      lodScale = 1;
+      setSize(W / dpr, H / dpr);
+      dirty = true;
+      await waitSettled(30000);
+    }
+    await new Promise(res => {
+      const remove = scene.postRender.addEventListener(() => { remove(); saveShot(); res(); });
+      scene.requestRender();
+    });
+  } finally {
+    lodScale = 1;
+    dirty = true;
+    Object.assign(el.style, css);
+    viewer.resolutionScale = old;
+    viewer.resize();
+    scene.requestRender();
+    shooting = false;
+  }
+}
+function saveShot() {
+  const c = document.createElement('canvas');
+  c.width = canvas.width; c.height = canvas.height;
+  const g = c.getContext('2d');
+  g.drawImage(canvas, 0, 0);
+  const s = Math.max(1, c.height / 900), text = '画像・3D © Apple';
+  g.font = `${Math.round(12 * s)}px system-ui, sans-serif`;
+  const w = g.measureText(text).width, pad = 6 * s;
+  g.fillStyle = 'rgba(0,0,0,0.5)';
+  g.fillRect(c.width - w - 3 * pad, c.height - 26 * s, w + 2 * pad, 20 * s);
+  g.fillStyle = '#fff';
+  g.textBaseline = 'middle';
+  g.fillText(text, c.width - w - 2 * pad, c.height - 16 * s);
+  const m = location.hash.slice(1).split(',');
+  const t = new Date(), p = n => String(n).padStart(2, '0');
+  const name = `flyover_${m.length >= 2 ? m[0] + '_' + m[1] + '_' : ''}${t.getFullYear()}${p(t.getMonth() + 1)}${p(t.getDate())}-${p(t.getHours())}${p(t.getMinutes())}${p(t.getSeconds())}.png`;
+  c.toBlob(b => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b); a.download = name; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }, 'image/png');
+}
+const shotMenu = document.getElementById('shot-menu');
+document.getElementById('shot-btn').onclick = () => { shotMenu.hidden = !shotMenu.hidden; };
+shotMenu.addEventListener('click', e => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  shotMenu.hidden = true;
+  screenshot(b.dataset.size);
+});
+
 // ---------------------------------------------------------------- Flyover のある地域
 
 const covered = new Set(cfg.coverage.map(([x, y]) => x + ',' + y));
@@ -448,6 +546,7 @@ const REFINE_PX = 520 / devicePixelRatio;   // タイルがこの幅より大き
 const MAX_ACTIVE = 48;
 const MAX_OFFSCREEN = 24;  // そのうち画面の外の先読みに使う数（見えているものの枠を空けておく）
 const MAX_MODELS = 240;    // これを超えたら、しばらく使っていないものから捨てる（GPU のメモリを食うので）
+const MAX_MODELS_SHOT = 600;   // スクリーンショットを写す間（4K では 240 では足りず、捨てては読み直す）
 // 新しい Flyover の画像は、HEVC のまま受け取って GPU の専用回路で展開し（hevc.js）、Y と UV の面の
 // ままテクスチャにする。サーバーで JPEG にする手間がなく、GPU のメモリも RGBA の 4 割ほどで済む。
 // 専用回路で展開できない（Chrome は HEVC をソフトウェアでは展開しない）ときと ?hevc=0 のときは JPEG
@@ -710,7 +809,7 @@ function updateFlyover() {
   const cam = ellipsoid.cartesianToCartographic(camPos);
   if (!mode2D && cam && cam.height < 400e3) {
     const cv = camera.frustum.computeCullingVolume(camPos, camera.directionWC, camera.upWC);
-    const k = canvas.clientHeight / (2 * Math.tan(camera.frustum.fovy / 2));
+    const k = lodScale * canvas.clientHeight / (2 * Math.tan(camera.frustum.fovy / 2));   // 写すときは写す大きさの細かさ
     const now = performance.now();
     // 回したときにすぐ出せるよう、カメラのまわりこの距離までは、画面の外（後ろ側）も先に読む
     const aroundR = C.Math.clamp(altitude() * 2.5, 1500, 20000);
@@ -735,7 +834,7 @@ function updateFlyover() {
       t.refine = false;
       const d = dist(t);
       // 粗いズーム 13 のタイル（遠景）は数が少ないので、もっと遠くまで先に読んでおく
-      if (!t.vis && d > (t.z <= FLY.min ? aroundR * 4 : aroundR)) return true;
+      if (!t.vis && (shooting || d > (t.z <= FLY.min ? aroundR * 4 : aroundR))) return true;   // 写す間は画面の外を読まない
       t.touched = frame;                 // 見ている所か、そのまわり（捨てるときの順番に使う）
       if (t.z < FLY.min) {
         t.refine = t.width / 2 ** (FLY.min - t.z) * k / d >= SHOW_PX;
@@ -812,9 +911,10 @@ function updateFlyover() {
   }
   // 捨てる: 見ている所とそのまわりで最近たどっていないものから（親は子で置き換わって表示して
   // いなくても、穴を埋める役なので残す）
-  if (n > MAX_MODELS) {             // 毎コマにならないよう、20 個ぶん余裕を作る
+  const maxModels = shooting ? MAX_MODELS_SHOT : MAX_MODELS;
+  if (n > maxModels) {              // 毎コマにならないよう、20 個ぶん余裕を作る
     const old = [...tiles.values()].filter(t => t.model && t.touched !== frame).sort((a, b) => (a.touched || 0) - (b.touched || 0));
-    for (const t of old.slice(0, n - MAX_MODELS + 20)) {
+    for (const t of old.slice(0, n - maxModels + 20)) {
       flyover.remove(t.model);      // remove は destroy もする（シェーダーは捨てないので別に捨てる）
       if (t.shader) t.shader.destroy();
       t.model = null; t.shader = null; t.state = 'none';
@@ -868,7 +968,7 @@ const shownView = new C.Matrix4();
 let cursorAt = 0;
 setInterval(() => {
   // 読み込み中
-  $('loading').hidden = !(pendingFly > 0 || globeQueue > 0);
+  $('loading').hidden = !(pendingFly > 0 || globeQueue > 0 || shooting);
   // 描き直しもマウスの動きもなければ、同じ表示のままなので何もしない
   if (rendered === shownRender && !mouseMoved) return;
   shownRender = rendered;
