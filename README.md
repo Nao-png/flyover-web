@@ -82,6 +82,7 @@ python scripts/serve.py out                                          # http://lo
 | `--jobs` | 8 | 同時に取得するタイルの数 |
 | `--obj` | なし | OBJ にも書き出す（ファイル名を指定。例: `--obj out/kanazawa.obj`） |
 | `--quality` | 90 | 画像の JPEG の画質（95 以上なら色を間引かない） |
+| `--hevc` | なし | 新しい Flyover の画像を JPEG にせず HEVC のまま書く（ブラウザが GPU で展開する。画像のファイルは 1/5 ほどになり、写真を圧縮し直さないので画質も落ちない。HEVC を GPU で展開できるブラウザでしか見られない） |
 | `--cache` | `cache` | 取得したデータの保存先 |
 
 ## 仕組み

@@ -63,6 +63,19 @@ def fetch_heights(z, get_many):
         n = 4
 
 
+def parse_heights(raws, parse=c3m.parse):
+    """高さ区分ごとのバイト列を parse で読む（別のプロセスで動かす用）。([(区分, 読んだもの)], [(区分, 読めなかった理由)])。
+    読めない区分は飛ばして理由を返す（プロセスの間の受け渡しの失敗と区別できるように、例外にしない）。"""
+    ok, failed = [], []
+    for h, b in enumerate(raws):
+        if b:
+            try:
+                ok.append((h, parse(b)))
+            except Exception as e:
+                failed.append((h, str(e)))
+    return ok, failed
+
+
 def build_glb(raws, name, parse=c3m.parse, strict=False, hevc=False):
     """高さ区分ごとの C3M（parse が r3d.parse なら R3D）のバイト列から glb を作る（別のプロセスで動かす）。
     読めない区分は飛ばす。strict なら、1 つでも読めなければ None（ほかの形式で作り直せるように）。

@@ -82,6 +82,7 @@ For the 9×9 tiles around Higashi Chaya (about 280 m square, 88 tiles, 150,000 t
 | `--jobs` | 8 | Number of tiles fetched at once |
 | `--obj` | none | Also export OBJ (give a file name, e.g. `--obj out/kanazawa.obj`) |
 | `--quality` | 90 | JPEG quality of the images (95 or more keeps full color resolution) |
+| `--hevc` | none | Write new-Flyover images as HEVC instead of JPEG (the browser decodes them on the GPU; image files are about 1/5 the size, and photos are not recompressed, so no quality loss; only viewable in browsers that can decode HEVC on the GPU) |
 | `--cache` | `cache` | Where fetched data is saved |
 
 ## How it works
