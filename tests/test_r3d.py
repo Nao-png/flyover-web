@@ -128,10 +128,10 @@ def test_uv_indices_on_two_triangles():
     # 四角形を 2 つの三角形に分けたもの。辺 (1, 2) を共有し、継ぎ目がなければ UV は 4 つ、あれば 6 つ
     cor = np.array([0, 1, 2, 3, 2, 1], np.int64)
     a = np.array([3, -1, -1, 0, -1, -1], np.int64)
-    res, n = r3d._k_uv_indices(cor, a, np.zeros(2, np.uint8), 2, 4)
-    assert n == 4 and res.tolist() == [0, 1, 2, 3, 2, 1]
-    res, n = r3d._k_uv_indices(cor, a, np.array([1, 0], np.uint8), 2, 4)   # 三角形 0 の角 0 の向かいが継ぎ目
-    assert n == 6 and res.tolist() == [0, 1, 2, 3, 4, 5]
+    res, n, chart = r3d._k_uv_indices(cor, a, np.zeros(2, np.uint8), 2, 4)
+    assert n == 4 and res.tolist() == [0, 1, 2, 3, 2, 1] and chart.tolist() == [0, 0]
+    res, n, chart = r3d._k_uv_indices(cor, a, np.array([1, 0], np.uint8), 2, 4)   # 三角形 0 の角 0 の向かいが継ぎ目
+    assert n == 6 and res.tolist() == [0, 1, 2, 3, 4, 5] and chart.tolist() == [0, 1]
 
 
 def test_parse_rejects_other_data():
@@ -155,7 +155,7 @@ def test_version1_container_sections():
     assert sec[(1, 3)] == (a, a + len(splat))
     assert sec[(2, 2)] == (a + len(splat), a + len(splat) + len(mesh))
     assert r3d.texture(data, sec) == heic
-    assert not r3d.partial_texture(data, sec)
+    assert not r3d.repeat_texture(data, sec, 0)
     # 画像のないもの（メッシュが空で、スプラットだけ）
     sec = r3d.sections(head + bytes(32) + splat + mesh)
     assert (2, 3) not in sec and sec[(2, 2)][1] == len(head) + 32 + len(splat) + len(mesh)

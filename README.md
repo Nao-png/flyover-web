@@ -65,6 +65,7 @@ Alt キーを押しながら動かすと、ゆっくり動きます。
 
 ```bash
 python scripts/export.py 36.5722 136.6680 --out out/higashi-chaya   # 金沢・ひがし茶屋街
+python scripts/export.py --bbox 34.6418 135.3729 34.6601 135.4045 --r3d --quality 100 --block 15 --out out/yumeshima   # 夢洲全体を区画に分けて
 python scripts/serve.py out                                          # http://localhost:8000/higashi-chaya/
 ```
 
@@ -75,10 +76,12 @@ python scripts/serve.py out                                          # http://lo
 | `--out` | （必須） | 書き出すフォルダ |
 | `--zoom` | 20 | タイルの細かさ（20 で 1 タイル約 30 m 四方） |
 | `--radius` | 4 | 中心のタイルから前後左右に何タイル取るか（4 で 9×9 タイル） |
-| `--heights` | 4 | 要求する高さの区分の数（高い建物ほど多く要る） |
-| `--jobs` | 4 | 同時に要求する数 |
+| `--bbox` | なし | 中心と `--radius` の代わりに、南・西・北・東の緯度経度で範囲を指定 |
+| `--r3d` | なし | 新しい Flyover（iOS 27）を使う。ないか読めないタイルだけ古い Flyover にする |
+| `--block` | なし | N×N タイルずつ別のフォルダに書き出し、一覧のページを置く（広い範囲を 1 ページにすると画像が GPU に載りきらない） |
+| `--jobs` | 8 | 同時に取得するタイルの数 |
 | `--obj` | なし | OBJ にも書き出す（ファイル名を指定。例: `--obj out/kanazawa.obj`） |
-| `--quality` | 90 | 画像の JPEG の画質 |
+| `--quality` | 90 | 画像の JPEG の画質（95 以上なら色を間引かない） |
 | `--cache` | `cache` | 取得したデータの保存先 |
 
 ## 仕組み

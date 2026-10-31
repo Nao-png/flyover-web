@@ -16,6 +16,7 @@ from . import edgebreaker, huffman
 class Material:
     image: bytes
     format: str          # "jpeg" か "heic"
+    repeat: bool = False  # 画像をくり返して貼る（R3D の水面などの塗りつぶし用。UV が 0〜1 の外に出る）
 
 
 @dataclass
