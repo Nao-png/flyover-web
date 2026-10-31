@@ -6,6 +6,9 @@ meta.json。新しい Flyover（R3D）のスプラットは、まとめて 1 つ
 import io
 import json
 import os
+import shutil
+import struct
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -44,7 +47,53 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b0d10);
 
 const loader = new THREE.TextureLoader();
-const texs = await Promise.all(meta.groups.map(g => g.file && loader.loadAsync(g.file)));   // 並行して読む
+// HEVC のまま書き出した画像（--hevc）は、作業用のスレッド（hevc.js）で GPU の専用回路を使って展開し、
+// 明るさ（Y）と色（UV）の面にする。ファイルは [hvcC の長さ（LE の u32）][hvcC][コマ]
+let hevcWorker = null, hevcId = 0;
+const hevcWait = new Map();
+async function decodeHevc(file) {
+  if (!('VideoDecoder' in window)) throw new Error('このブラウザは HEVC を展開できない（WebCodecs がない）');
+  if (!hevcWorker) {
+    hevcWorker = new Worker('hevc.js');
+    hevcWorker.onmessage = ({ data }) => { const w = hevcWait.get(data.id); hevcWait.delete(data.id); w(data); };
+  }
+  const b = new Uint8Array(await (await fetch(file)).arrayBuffer());
+  const n = new DataView(b.buffer).getUint32(0, true);
+  const id = ++hevcId;
+  const r = await new Promise(res => { hevcWait.set(id, res);
+    hevcWorker.postMessage({ id, images: [{ config: b.slice(4, 4 + n), data: b.slice(4 + n) }] }); });
+  if (r.error) throw new Error(file + ': ' + r.error);
+  return r.out[0];
+}
+let texs;
+try {
+  texs = await Promise.all(meta.groups.map(g => g.file ? loader.loadAsync(g.file) : g.hevc ? decodeHevc(g.hevc) : null));   // 並行して読む
+} catch (e) {
+  document.getElementById('n').textContent = '画像を展開できない: ' + e.message + '（HEVC を GPU で展開できる Chrome などで開くか、--hevc なしで書き出す）';
+  throw e;
+}
+// HEVC の Y と UV から色にする（HEIC には色の決め方が入っていないので、HEIF の決まりどおり BT.601 の
+// フルレンジ。sRGB の値を線形に直す。UV の v は上向きで、面は上の行から並ぶので上下を返す）
+function hevcColor(uvTex) {
+  return sh => {
+    sh.uniforms.uvTex = { value: uvTex };
+    sh.fragmentShader = 'uniform sampler2D uvTex;\\n' + sh.fragmentShader.replace('#include <map_fragment>', `vec2 t_ = vec2(vMapUv.x, 1.0 - vMapUv.y);
+  float y_ = texture2D(map, t_).r;
+  vec2 c_ = texture2D(uvTex, t_).rg - 0.5;
+  vec3 s_ = clamp(vec3(y_ + 1.402 * c_.y, y_ - 0.344136 * c_.x - 0.714136 * c_.y, y_ + 1.772 * c_.x), 0.0, 1.0);
+  diffuseColor.rgb *= mix(s_ / 12.92, pow((s_ + 0.055) / 1.055, vec3(2.4)), step(0.04045, s_));`);
+  };
+}
+function plane(data, w, h, format) {
+  const t = new THREE.DataTexture(data, w, h, format);
+  t.unpackAlignment = 1;
+  t.generateMipmaps = true;
+  t.minFilter = THREE.LinearMipmapLinearFilter;
+  t.magFilter = THREE.LinearFilter;
+  t.anisotropy = 4;
+  t.needsUpdate = true;
+  return t;
+}
 // スプラットの不透明度 = (27 × 重心座標の積) ^ 指数（中心で 1、縁で 0。指数は glb.SPLAT_SOFTNESS）
 const softness = { value: meta.splatSoftness || 1.5 };
 function softSplats(sh) {
@@ -68,6 +117,13 @@ for (const [k, g] of meta.groups.entries()) {
     geo.setAttribute('color', new THREE.BufferAttribute(new Uint16Array(buf, g.col, g.nv * 4), 4, true));
     mat = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, depthWrite: false, side: THREE.DoubleSide });
     mat.onBeforeCompile = softSplats;
+  } else if (g.hevc) {
+    const yTex = plane(tex.y, tex.w, tex.h, THREE.RedFormat);
+    const uvTex = plane(tex.uv, (tex.w + 1) >> 1, (tex.h + 1) >> 1, THREE.RGFormat);
+    geo.setAttribute('uv', uv);
+    geo.setIndex(new THREE.BufferAttribute(new Uint32Array(buf, g.idx, g.nt * 3), 1));
+    mat = new THREE.MeshBasicMaterial({ map: yTex, side: THREE.DoubleSide });
+    mat.onBeforeCompile = hevcColor(uvTex);
   } else {
     tex.colorSpace = THREE.SRGBColorSpace;
     tex.anisotropy = 4;
@@ -174,6 +230,10 @@ def to_jpeg(material, quality=90):
     return out.getvalue()
 
 
+def _save_jpeg(material, path, quality):
+    open(path, "wb").write(to_jpeg(material, quality))
+
+
 def _parts(tiles):
     """(名前, 材質, ECEF の頂点, UV, 三角形) の並びと、スプラットの (ECEF の頂点 (3N, 3), RGBA (N, 4)) の
     並び。
@@ -195,8 +255,10 @@ def _parts(tiles):
     return parts, splats
 
 
-def write(tiles, out, info, quality=90):
-    """tiles: [(名前, C3M)]。info: meta.json に足す情報（lat, lon, region）。"""
+def write(tiles, out, info, quality=90, hevc=False):
+    """tiles: [(名前, C3M)]。info: meta.json に足す情報（lat, lon, region）。hevc なら、新しい Flyover の
+    HEVC の 1 コマの画像（くり返して貼るもの以外）を、JPEG にせずそのまま書く（ブラウザの GPU で展開する。
+    JPEG にしないので速いが、HEVC を GPU で展開できるブラウザでしか見られない）。"""
     parts, splats = _parts(tiles)
     if not parts:
         raise ValueError("三角形が 1 つもない")
@@ -205,7 +267,12 @@ def write(tiles, out, info, quality=90):
     R = enu_basis(mid)
     ground = np.percentile((allv - mid) @ R.T[:, 2], 2)
 
+    from . import glb
+
     os.makedirs(os.path.join(out, "tex"), exist_ok=True)
+    # 画像の変換（HEIC の展開と JPEG）は GIL を放すので、スレッドで並べる（8 本で 4 倍ほど速い）
+    pool = ThreadPoolExecutor(min(8, os.cpu_count() or 1))
+    saving = []
     groups, blobs, off = [], [], 0
     lo, hi = np.full(3, np.inf), np.full(3, -np.inf)
     for key, material, X, UV, F in parts:
@@ -215,9 +282,16 @@ def write(tiles, out, info, quality=90):
         P[:, 2] -= ground
         lo, hi = np.minimum(lo, P.min(0)), np.maximum(hi, P.max(0))
         uv = UV[used]   # v は上向き（OBJ と同じ）。three.js の既定（flipY）にそのまま合う
-        fn = f"tex/{key}.jpg"
-        open(os.path.join(out, fn), "wb").write(to_jpeg(material, quality))
-        g = {"file": fn, "nv": len(used), "nt": len(F)}
+        hv = glb.heif_hevc(material.image) if hevc and material.format == "heic" and not getattr(material, "repeat", False) else None
+        if hv:
+            fn = f"tex/{key}.hevc"
+            with open(os.path.join(out, fn), "wb") as fh:
+                fh.write(struct.pack("<I", len(hv[0])) + hv[0] + hv[1])
+            g = {"file": None, "hevc": fn, "nv": len(used), "nt": len(F)}
+        else:
+            fn = f"tex/{key}.jpg"
+            saving.append(pool.submit(_save_jpeg, material, os.path.join(out, fn), quality))
+            g = {"file": fn, "nv": len(used), "nt": len(F)}
         if getattr(material, "repeat", False):
             g["repeat"] = True           # 水面などの塗りつぶし用の画像。くり返して貼る
         for k, arr in (("pos", P.astype("<f4")), ("uv", uv.astype("<f4")), ("idx", F.astype("<u4"))):
@@ -242,6 +316,9 @@ def write(tiles, out, info, quality=90):
             blobs.append(arr.tobytes())
             off += len(blobs[-1])
         groups.append(g)
+    for s in saving:
+        s.result()
+    pool.shutdown()
     with open(os.path.join(out, "mesh.bin"), "wb") as fh:
         for b in blobs:
             fh.write(b)
@@ -251,6 +328,8 @@ def write(tiles, out, info, quality=90):
                 radius=float(max(np.abs(lo[:2]).max(), np.abs(hi[:2]).max())))
     json.dump(meta, open(os.path.join(out, "meta.json"), "w"))
     open(os.path.join(out, "index.html"), "w", encoding="utf-8").write(HTML)
+    if any("hevc" in g for g in groups):
+        shutil.copyfile(os.path.join(os.path.dirname(__file__), "earth", "hevc.js"), os.path.join(out, "hevc.js"))
     return sum(g["nt"] for g in groups), hi - lo
 
 

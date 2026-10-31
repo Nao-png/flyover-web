@@ -33,7 +33,8 @@ ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER = 34962, 34963
 def _jpeg_pot(material, quality):
     """材質の画像を、縦横をそれぞれ 1 つ下の 2 のべき乗に縮めた JPEG に。Cesium は 2 のべき乗でない
     画像を、縮小用の段（ミップマップ）を作る前に次の 2 のべき乗まで広げる（新しい Flyover に多い
-    1152〜1376 px は 2048 px になり、GPU のメモリが 2.5 倍ほどになる）ので、先にこちらで縮めておく。"""
+    1152〜1376 px は 2048 px になり、GPU のメモリが 2.5 倍ほどになる）ので、先にこちらで縮めておく。
+    縮め方は BICUBIC（LANCZOS とほとんど同じ画（差は 51 dB）で、縮めるのが 1 枚 3 ms ほど速い）。"""
     from PIL import Image
     from pillow_heif import register_heif_opener
 
@@ -43,7 +44,7 @@ def _jpeg_pot(material, quality):
     if size == img.size:
         return to_jpeg(material, quality)
     out = io.BytesIO()
-    img.convert("RGB").resize(size, Image.LANCZOS).save(out, "JPEG", quality=quality)
+    img.convert("RGB").resize(size, Image.BICUBIC).save(out, "JPEG", quality=quality)
     return out.getvalue()
 
 

@@ -20,13 +20,13 @@ import math
 import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import flyover  # noqa: E402
 from flyover import r3d, web  # noqa: E402
-from flyover.earth import fetch_heights  # noqa: E402
+from flyover.earth import fetch_heights, parse_heights  # noqa: E402
 
 
 def tile_lat_lon(x, y, z):
@@ -50,6 +50,8 @@ def main():
     ap.add_argument("--cache", default="cache", help="マニフェストとタイルの保存先")
     ap.add_argument("--obj", help="OBJ にも書き出す（ファイル名。--block なら各フォルダに置く）")
     ap.add_argument("--quality", type=int, default=90, help="画像の JPEG の画質（95 以上なら色を間引かない）")
+    ap.add_argument("--hevc", action="store_true",
+                    help="新しい Flyover の画像を JPEG にせず HEVC のまま書く（速いが、HEVC を GPU で展開できるブラウザ専用）")
     a = ap.parse_args()
 
     z = a.zoom
@@ -76,25 +78,22 @@ def main():
         if a.r3d:
             raws = fetch_heights(z, lambda hs: [client.r3d_tile_cached(region, x, y, z, h) for h in hs])
             if any(raws):
-                try:   # 1 区分でも読めなければタイルごと C3M にする（ビューアと同じ）
-                    return xy, "r3d", [(f"{x}_{y}_{h}", r3d.parse(b)) for h, b in enumerate(raws) if b], 0
-                except Exception as e:
-                    print(f"  {x} {y}: R3D が読めないので C3M にする（{e}）", flush=True)
+                tiles, failed = cpu.submit(parse_heights, raws, r3d.parse).result()
+                if not failed:
+                    return xy, "r3d", [(f"{x}_{y}_{h}", c) for h, c in tiles], 0
+                # 1 区分でも読めなければタイルごと C3M にする（ビューアと同じ）
+                print(f"  {x} {y}: R3D が読めないので C3M にする（{failed[0][1]}）", flush=True)
         raws = fetch_heights(z, lambda hs: [client.tile_cached(region, x, y, z, h) for h in hs])
-        tiles, failed = [], 0
-        for h, b in enumerate(raws):
-            if b:
-                try:
-                    tiles.append((f"{x}_{y}_{h}", flyover.parse(b)))
-                except Exception as e:   # 読めない区分は飛ばす
-                    failed += 1
-                    print(f"  {x} {y} h={h}: {e}", flush=True)
-        return xy, "c3m" if tiles else None, tiles, failed
+        tiles, failed = cpu.submit(parse_heights, raws).result()
+        for h, e in failed:
+            print(f"  {x} {y} h={h}: {e}", flush=True)
+        return xy, "c3m" if tiles else None, [(f"{x}_{y}_{h}", c) for h, c in tiles], len(failed)
 
     bs = a.block or max(x1 - x0, y1 - y0) + 1
     blocks = [(r, c) for r in range((y1 - y0) // bs + 1) for c in range((x1 - x0) // bs + 1)]
     done, t = {}, time.time()
-    with ThreadPoolExecutor(a.jobs) as pool:
+    # 取得はスレッドで、読むのは別のプロセスで並べる（読む処理の多くは GIL を放さない）
+    with ThreadPoolExecutor(a.jobs) as pool, ProcessPoolExecutor(os.cpu_count()) as cpu:
         for r, c in blocks:
             bx0, by0 = x0 + c * bs, y0 + r * bs
             bx1, by1 = min(bx0 + bs - 1, x1), min(by0 + bs - 1, y1)
@@ -119,7 +118,7 @@ def main():
             region = client.region_of_tile((bx0 + bx1) // 2, (by0 + by1) // 2, z)
             try:
                 nt, size = web.write(tiles, out, {"lat": lat, "lon": lon,
-                                                  "region": region["name"] if region else ""}, a.quality)
+                                                  "region": region["name"] if region else ""}, a.quality, a.hevc)
             except ValueError as e:   # 範囲の端の帯しかない
                 print(f"  書き出さない（{e}）", flush=True)
                 continue
