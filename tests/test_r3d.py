@@ -18,6 +18,9 @@ def test_v2_and_small_numbers():
     assert r3d._v2(bytes([0x5F, 0x88, 0x01]), 0) == (95 + (8 << 7) + (1 << 14), 3)
     assert r3d._small(bytes([0x08]), 0) == (8, 1)
     assert r3d._small(bytes([0x55, 0x02]), 0) == (149, 2)
+    # 2 バイト目が 0x80 以上なら 3 バイト（8,192 以上）
+    assert r3d._small(bytes([0x72, 0x8F, 0x01, 0xAD]), 0) == (9202, 3)
+    assert r3d._small(bytes([0x63, 0x80, 0x01]), 0) == (8227, 3)
 
 
 def test_jdir_reads_lengths_and_kind_bytes():
@@ -111,15 +114,15 @@ def _prog(*ops):
 
 def test_replay_predictions():
     # 1 つ目 = 直前の予測（はじめ 0）+ D、2 つ目 = 1 つ目 + D、3 つ目 = 中点（0 に向けて切り捨て）+ D、
-    # 平行四辺形 = a + b - c + D。2 では中点も「直前の予測」になり（UV）、4 ではならない（位置）
+    # 平行四辺形 = a + b - c + D。中点も「直前の予測」になる
     D = np.array([10, 4, -3, 1, 2], np.int64)
     out = r3d._k_replay(_prog((0, 0), (1, 1, 0), (2, 2, 0, 1), (3, 3, 0, 1, 2), (0, 4)), D, 5).tolist()
     mid = (10 + 14 + 1) // 2
     assert out[:3] == [10, 14, mid - 3]
     assert out[3] == 10 + 14 - (mid - 3) + 1
     assert out[4] == (10 + 14 - (mid - 3)) + 2
-    out = r3d._k_replay(_prog((0, 0), (1, 1, 0), (4, 2, 0, 1), (0, 3)), np.array([10, 4, 0, 5]), 4).tolist()
-    assert out[3] == 0 + 5                  # 中点は直前の予測にならない
+    out = r3d._k_replay(_prog((0, 0), (1, 1, 0), (2, 2, 0, 1), (0, 3)), np.array([10, 4, 0, 5]), 4).tolist()
+    assert out[3] == (10 + 14 + 1) // 2 + 5  # 頂点が 3 つのかたまりの次は、その中点から
     neg = r3d._k_replay(_prog((0, 0), (1, 1, 0), (2, 2, 0, 1)), np.array([-10, -5, 0]), 3).tolist()
     assert neg[2] == -12                    # (-10 + -15 + 1) / 2 = -12（-12.0 の切り捨て）
 
