@@ -678,8 +678,9 @@ def _k_uv_indices(cor, a, nib, F, V):
     （角 0,1,2 に新しい UV）、深さ優先でたどる。三角形に入ったら角 2,1,0 の順に隣を見て、継ぎ目でなく
     未処理で、残りの 2 辺のどちらも（継ぎ目でない辺で）処理済みの三角形に接していないものを控え、控えた
     順にまだ未処理なら入る。入った先の 2 角は辺の UV を写し、先の角はこのチャートでその頂点に UV が
-    あればそれ、なければ新しい UV。"""
+    あればそれ、なければ新しい UV。三角形ごとのチャートの番号（0 から）も返す。"""
     done = np.zeros(F, np.uint8)
+    tri_chart = np.zeros(F, np.int64)
     res = np.full(3 * F, -1, np.int64)
     uvof = np.zeros(V, np.int64)
     stamp = np.zeros(V, np.int64)        # その頂点の UV が何番目のチャートのものか
@@ -693,6 +694,7 @@ def _k_uv_indices(cor, a, nib, F, V):
         if done[st]:
             continue
         chart += 1
+        tri_chart[st] = chart - 1
         for c in range(3 * st, 3 * st + 3):
             res[c] = n
             uvof[cor[c]] = n
@@ -736,6 +738,7 @@ def _k_uv_indices(cor, a, nib, F, V):
                 if done[av // 3]:
                     continue
                 done[av // 3] = 1
+                tri_chart[av // 3] = chart - 1
                 ab, ib = av // 3 * 3, ii // 3 * 3
                 res[ab + (av + 2) % 3] = res[ib + (ii + 1) % 3]
                 res[ab + (av + 1) % 3] = res[ib + (ii + 2) % 3]
@@ -746,7 +749,7 @@ def _k_uv_indices(cor, a, nib, F, V):
                     n += 1
                 res[av] = uvof[v]
                 cur = av
-    return res, n
+    return res, n, tri_chart
 
 
 @_jit
@@ -798,9 +801,9 @@ def _image_size(heic):
     return struct.unpack_from(">II", heic, i + 8)
 
 
-def decode_mesh(s, heic):
-    """メッシュの区画 s を読む。(位置 (V, 3) f32, 角ごとの頂点 (F, 3), UV (U, 2) f32（v は上向き）,
-    角ごとの UV の番号 (F, 3))。"""
+def decode_mesh(s, sizes):
+    """メッシュの区画 s を読む。sizes はテクスチャごとの (幅, 高さ)。(位置 (V, 3) f32, 角ごとの頂点 (F, 3),
+    UV (U, 2) f32（v は上向き）, 角ごとの UV の番号 (F, 3), 三角形ごとのテクスチャの番号 (F,))。"""
     step = np.float32(struct.unpack_from("<f", s, 8)[0])
     fc, a, V, i = _topology(s)
     F = len(fc)
@@ -836,17 +839,42 @@ def decode_mesh(s, heic):
         nib = np.stack([nb & 15, nb >> 4], 1).ravel()[:F].copy()
     if len(nib) != F:
         raise ValueError("継ぎ目の印が足りない")
-    res, U = _k_uv_indices(cor, a, nib, F, V)
-    # チャートの数、チャートごとの番号（ふつうは空のブロック。0 と 1 が半々ほどのこともあり、意味は
-    # 分からない。使わない）、UV のブロック
+    res, U, tri_chart = _k_uv_indices(cor, a, nib, F, V)
+    # チャートの数、チャートごとのテクスチャの番号（テクスチャが 1 枚なら空のブロック）、UV のブロック
     charts, i = _small(s, k + L)
     L, k = _compact(s, i)
+    atlas = _chart_atlas(s, k, L, charts)
+    if charts != tri_chart.max() + 1 or atlas.max() >= len(sizes):
+        raise ValueError("チャートの数かテクスチャの番号が合わない")
     L, k = _compact(s, k + L)
     uprog = _k_uv_prog(res, a, nib, F, U)
     iu = np.stack([_pick(uprog, o, U) for o in _components(_lanes(s, k, L, 8, U), 2, U)], 1)
-    W, H = _image_size(heic)
-    uv = iu.astype(np.float32) * (np.float32(1) / (np.float32(4) * np.array([W, H], np.float32)))
-    return pos, fc, uv, res.reshape(-1, 3)
+    # UV の値は、そのチャートのテクスチャの画素の 4 倍の単位（UV の番号はチャートごとに別）
+    tri_atlas = atlas[tri_chart]
+    uv_atlas = np.zeros(U, np.int64)
+    uv_atlas[res] = np.repeat(tri_atlas, 3)
+    WH = np.array(sizes, np.float32)[uv_atlas]
+    uv = iu.astype(np.float32) * (np.float32(1) / (np.float32(4) * WH))
+    return pos, fc, uv, res.reshape(-1, 3), tri_atlas
+
+
+def _chart_atlas(s, k, L, charts):
+    """チャートごとのテクスチャの番号。int32 の並びで、小さければそのまま（LE）、そうでなければ 4 レーンの
+    BYET（値はレーン 0 か、レーン 0 がなければレーン 1。どちらもなければ全部 0）。"""
+    if not charts:
+        return np.zeros(0, np.int64)
+    if s[k:k + 3] != BYET:
+        if L != 4 * charts:
+            raise ValueError("チャートごとのテクスチャの番号の長さが合わない")
+        return np.frombuffer(s[k:k + L], "<i4").astype(np.int64)
+    lanes = _lanes(s, k, L, 4, charts)
+    if set(lanes) - {0, 1} or len(lanes) > 1:
+        raise ValueError("チャートごとのテクスチャの番号のレーンが思っているのと違う")
+    if not lanes:
+        return np.zeros(charts, np.int64)
+    t, modes = next(iter(lanes.values()))
+    m = "H" if t == 1 else "T"           # 1 レーン。印がないので種類で選ぶ（継ぎ目のブロックと同じ）
+    return np.asarray(modes[m] if m in modes else next(iter(modes.values())), np.int64)
 
 
 # ---- 三角形のスプラット（part 1） --------------------------------------------------
@@ -856,7 +884,12 @@ class Splats:
     """柔らかい三角形の並び。Apple は三角形の内側ほど濃く、縁で消えるように描いている。"""
     vertices: np.ndarray     # (N, 3, 3) float32、メッシュと同じ局所座標
     rgba: np.ndarray         # (N, 4) uint8
-    params: np.ndarray       # (N, 4) float32（0.05〜1、八面体の法線 2 つ、0〜π。描き方での意味は未確認）
+    # (N, 4) float32。刻みはどれも 0.05。2・3 番目は八面体で詰めた法線（u, v を 2x-1 にして折り返す。三角形の面の
+    # 向きとほぼ一致し、空の開けた側を向く）。4 番目（0〜3.15）は上がふさがっているほど小さく、木の内側や下で 0、
+    # 外側や上で 3.15 に張り付く（遮蔽か空の見え方。ズームによらない）。1 番目（0.05〜1、0.7 あたりが多く、1 で
+    # 張り付く）は形や色とほとんど関係がなく、ズームが低い大きなスプラットほど大きい（意味は不明。縁のぼかしの指数として使うと、
+    # Apple の画面との比べで一律の指数より少し遠くなる）
+    params: np.ndarray
 
 
 def _mode_bytes(o, p, n, mode, counted=False):
@@ -972,7 +1005,9 @@ def sections(data):
     out = {}
     for tag, s, e in _tlv(data, 11, len(data)):
         for t, a, z in _tlv(data, s + 4, e):
-            out[(tag, t)] = (a, z)
+            if (tag, t) == (2, 3):       # 画像の区画はテクスチャの枚数だけ並ぶ（チャートごとにどれを使うかが決まる）
+                out.setdefault("atlases", []).append((a, z))
+            out.setdefault((tag, t), (a, z))
     return out
 
 
@@ -994,35 +1029,36 @@ def _sections_v1(data):
                 raise ValueError("版 1 の画像の箱が思っているのと違う")
             e += n
         out[(2, 3)] = (im, e)
+        out["atlases"] = [(im, e)]
     return out
 
 
-def _image_items(data, sec):
-    """画像の項目 [(番号, 始め, 終わり)]（版 1 では HEIC が 1 つ）。"""
-    a, z = sec[(2, 3)]
+def _image_items(data, sec, k=0):
+    """k 枚目のテクスチャの画像の区画の項目 [(番号, 始め, 終わり)]（版 1 では HEIC が 1 つ）。"""
+    a, z = sec["atlases"][k]
     if data[a + 4:a + 8] == b"ftyp":
         return [(1, a, z)]
     return _tlv(data, a, z)
 
 
-def texture(data, sec=None):
-    """テクスチャの HEIC（画像の項目の最初）。"""
+def texture(data, sec=None, k=0):
+    """k 枚目のテクスチャの HEIC（その画像の区画の項目の最初）。"""
     sec = sec or sections(data)
-    t, s, e = _image_items(data, sec)[0]
+    t, s, e = _image_items(data, sec, k)[0]
     i = data.find(b"ftyp", s, e) - 4
     if i < s:
         raise ValueError("テクスチャがない")
     return bytes(data[i:e])
 
 
-def partial_texture(data, sec):
-    """画像の項目 13 があるか。海沿いの低いズームのタイル（z13〜14）にあり、入っている画像は海などの
-    塗りつぶし用だけで、陸の写真は入っていない（陸の三角形の UV は画像の外を指す）。"""
-    return any(t == 13 for t, s, e in _image_items(data, sec))
+def repeat_texture(data, sec, k):
+    """k 枚目のテクスチャに画像の項目 13（1 か 2）があるか。あるものは水面などをくり返して貼る小さな画像
+    （16 px 角のこともある）で、UV は 0〜1 の外に出る。海沿いのタイルに多い。"""
+    return any(t == 13 for t, s, e in _image_items(data, sec, k))
 
 
 def parse(data):
-    """R3D を読んで、c3m.parse と同じ形（材質 1 つ、メッシュ 1 つ）で返す。"""
+    """R3D を読んで、c3m.parse と同じ形（テクスチャごとの材質、メッシュ 1 つ）で返す。"""
     sec = sections(data)
     a, _ = sec[(2, 1)]
     d = struct.unpack_from("<12d", data, a)
@@ -1040,18 +1076,20 @@ def parse(data):
             splats = None
     if (2, 3) not in sec:                # 画像がない（高い区分にある、メッシュの空なもの）
         return C3M(rot, trans, [], [], splats)
-    heic = texture(data, sec)
+    heics = [texture(data, sec, k) for k in range(len(sec["atlases"]))]
     a, z = sec[(2, 2)]
-    pos, fc, uv, fuv = decode_mesh(data[a:z], heic)
-    if partial_texture(data, sec) and (uv.min() < -0.01 or uv.max() > 1.01):
-        raise ValueError("陸の写真がタイルに入っていない（海沿いの低いズームのタイル）")
+    pos, fc, uv, fuv, tri_atlas = decode_mesh(data[a:z], [_image_size(h) for h in heics])
+    repeat = [repeat_texture(data, sec, k) for k in range(len(heics))]
     # UV の番号ごとに頂点を分ける（UV の番号は 1 つの頂点にしか付かない）
     vert = np.zeros(len(uv), np.int64)
     vert[fuv.ravel()] = fc.ravel()
-    if not np.isfinite(pos).all() or np.abs(pos).max() > 1e4 or uv.min() < -1 or uv.max() > 2:
+    clamp = fuv[~np.array(repeat)[tri_atlas]].ravel()     # くり返さないテクスチャの UV だけ範囲を確かめる
+    if (not np.isfinite(pos).all() or np.abs(pos).max() > 1e4 or not np.isfinite(uv).all()
+            or len(clamp) and (uv[clamp].min() < -1 or uv[clamp].max() > 2)):
         raise ValueError("頂点か UV がタイルから大きく外れている（読み違え）")
-    mesh = Mesh(pos[vert], uv, {0: fuv.astype(np.int32)})    # v は c3m.Mesh と同じく上向き
-    return C3M(rot, trans, [Material(heic, "heic")], [mesh], splats)
+    groups = {k: fuv[tri_atlas == k].astype(np.int32) for k in range(len(heics)) if (tri_atlas == k).any()}
+    mesh = Mesh(pos[vert], uv, groups)    # v は c3m.Mesh と同じく上向き
+    return C3M(rot, trans, [Material(h, "heic", r) for h, r in zip(heics, repeat)], [mesh], splats)
 
 
 def warm():

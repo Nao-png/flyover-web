@@ -65,6 +65,7 @@ Fetch the tiles around a given point and save them as a set of files you can vie
 
 ```bash
 python scripts/export.py 36.5722 136.6680 --out out/higashi-chaya   # Higashi Chaya District, Kanazawa
+python scripts/export.py --bbox 34.6418 135.3729 34.6601 135.4045 --r3d --quality 100 --block 15 --out out/yumeshima   # all of Yumeshima, in blocks
 python scripts/serve.py out                                          # http://localhost:8000/higashi-chaya/
 ```
 
@@ -75,10 +76,12 @@ For the 9×9 tiles around Higashi Chaya (about 280 m square, 88 tiles, 150,000 t
 | `--out` | (required) | Output folder |
 | `--zoom` | 20 | Tile detail (at 20, one tile is about 30 m square) |
 | `--radius` | 4 | How many tiles to fetch in each direction from the center tile (4 gives 9×9 tiles) |
-| `--heights` | 4 | Number of height slabs to request (taller buildings need more) |
-| `--jobs` | 4 | Number of concurrent requests |
+| `--bbox` | none | Give the area as south, west, north, east latitude/longitude instead of a center and `--radius` |
+| `--r3d` | off | Use the new Flyover (iOS 27); only tiles without it, or that fail to parse, use the old Flyover |
+| `--block` | none | Write N×N tiles per folder, plus an index page (a large area on one page does not fit in GPU memory) |
+| `--jobs` | 8 | Number of tiles fetched at once |
 | `--obj` | none | Also export OBJ (give a file name, e.g. `--obj out/kanazawa.obj`) |
-| `--quality` | 90 | JPEG quality of the images |
+| `--quality` | 90 | JPEG quality of the images (95 or more keeps full color resolution) |
 | `--cache` | `cache` | Where fetched data is saved |
 
 ## How it works

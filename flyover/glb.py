@@ -20,8 +20,13 @@ import numpy as np
 from .web import to_jpeg
 
 UINT8, FLOAT, INT16, UINT16, UINT32 = 5121, 5126, 5122, 5123, 5125
-SPLAT_SOFTNESS = 0.5     # スプラットの縁のぼかし: 不透明度 = (27 × 重心座標の積) ^ これ
+# スプラットの縁のぼかし: 不透明度 = (27 × 重心座標の積) ^ これ。iOS 27 のマップの夢洲の画面 3 枚と、視点を合わせて
+# 比べて決めた（0.25〜3 のうち 1.5 がいちばん近い。スプラットの 1 番目の値を 1 枚ずつ使うと少し遠くなる）
+SPLAT_SOFTNESS = 1.5
 MAIN = 0        # C3M のメッシュの種類のうち、本体（c3m.Mesh.kind を見よ）
+# HEVC のまま渡す画像の数の上限。1 枚で Y と UV の 2 つのテクスチャを使い、シェーダーで使えるテクスチャは
+# 16 個までのことが多い（R3D は高さ区分ごとにテクスチャが 2 枚以上のこともある）。超えた分は JPEG にする
+HEVC_MAX = 6
 ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER = 34962, 34963
 
 
@@ -145,17 +150,20 @@ def tile_glb(c3ms, quality=85, hevc=False):
         if key not in mat_index:
             ci, mat = key
             m = c3ms[ci].materials[mat]
-            hv = heif_hevc(m.image) if hevc and m.format == "heic" else None
+            nh = sum(s != 255 for s in slabs.values())
+            hv = (heif_hevc(m.image) if hevc and m.format == "heic" and not m.repeat and nh < HEVC_MAX
+                  else None)              # くり返して貼る画像は JPEG にする（標本の取り方で wrap を指定する）
             if hv:
                 config, data, w, h = hv
-                slabs[key] = sum(s != 255 for s in slabs.values())
+                slabs[key] = nh
                 materials.append({"pbrMetallicRoughness": {"metallicFactor": 0, "roughnessFactor": 1},
                                   "doubleSided": True, "extensions": {"KHR_materials_unlit": {}},
                                   "extras": {"hevc": {"config": view(config), "data": view(data),
                                                       "width": w, "height": h, "slab": slabs[key]}}})
             else:
                 slabs[key] = 255
-                images.append({"bufferView": view(_jpeg_pot(m, quality)), "mimeType": "image/jpeg"})
+                images.append({"bufferView": view(_jpeg_pot(m, quality)), "mimeType": "image/jpeg",
+                               "repeat": m.repeat})
                 materials.append({"pbrMetallicRoughness": {"baseColorTexture": {"index": len(images) - 1},
                                                            "metallicFactor": 0, "roughnessFactor": 1},
                                   "doubleSided": True, "extensions": {"KHR_materials_unlit": {}}})
@@ -181,6 +189,13 @@ def tile_glb(c3ms, quality=85, hevc=False):
                       "indices": accessor(idx.astype(idt), itype, "SCALAR", ELEMENT_ARRAY_BUFFER),
                       "material": mat_index[key]})
     if splats:
+        # 1 つにまとめて、低いものから順に描く。半透明なので奥から描かないと手前の色が奥の色に塗られて濁る。
+        # 視点はたいてい上なので、高さの順で奥からの順の代わりになる（Apple の画面との比べで、視点ごとに
+        # 並べ直したのと同じ近さになった）
+        X = np.vstack([X for X, _ in splats]).reshape(-1, 3, 3)
+        rgba = np.vstack([rgba for _, rgba in splats])
+        order = np.argsort(X.mean(1) @ (center / np.linalg.norm(center)), kind="stable")
+        splats = [(X[order].reshape(-1, 3), rgba[order])]
         images.append({"bufferView": view(_soft_triangle()), "mimeType": "image/png"})
         materials.append({"pbrMetallicRoughness": {"baseColorTexture": {"index": len(images) - 1},
                                                    "metallicFactor": 0, "roughnessFactor": 1},
@@ -218,8 +233,10 @@ def tile_glb(c3ms, quality=85, hevc=False):
             "materials": materials, "accessors": accessors, "bufferViews": views,
             "buffers": [{"byteLength": len(bin_)}]}
     if images:                          # glTF では空の並びは書かない
-        gltf.update({"textures": [{"source": i, "sampler": 0} for i in range(len(images))],
-                     "samplers": [{"magFilter": 9729, "minFilter": 9987, "wrapS": 33071, "wrapT": 33071}],
+        # 標本の取り方 0 は端で止める、1 はくり返す（水面などの塗りつぶし用の画像）
+        gltf.update({"textures": [{"source": i, "sampler": int(im.pop("repeat", False))} for i, im in enumerate(images)],
+                     "samplers": [{"magFilter": 9729, "minFilter": 9987, "wrapS": 33071, "wrapT": 33071},
+                                  {"magFilter": 9729, "minFilter": 9987, "wrapS": 10497, "wrapT": 10497}],
                      "images": images})
     js = json.dumps(gltf, separators=(",", ":")).encode()
     js += b" " * (-len(js) % 4)

@@ -1,7 +1,7 @@
 """読んだタイルを、ブラウザ（three.js）で見る一式に書き出す。
 
 出力: index.html、mesh.bin（材質ごとの頂点・UV・三角形）、tex/*.jpg（材質ごとの画像）、
-meta.json。座標は範囲の中心での東・北・上（メートル）で、いちばん低いあたりを高さ 0 にする。
+meta.json。新しい Flyover（R3D）のスプラットは、まとめて 1 つの組（頂点の色付き、低いものから順）にする。座標は範囲の中心での東・北・上（メートル）で、いちばん低いあたりを高さ 0 にする。
 """
 import io
 import json
@@ -27,7 +27,8 @@ HTML = """<!DOCTYPE html>
   <label>明るさ <input id="gain" type="range" min="50" max="250" step="5" value="100"></label>
   <label><input id="wire" type="checkbox"> 三角形の辺</label>
   <div style="margin-top:6px;opacity:.75">左ドラッグ: 回転 / 右ドラッグ: 平行移動 / ホイール: 拡大<br>
-  ダブルクリック: そこを回転の中心に</div>
+  ダブルクリック: そこを回転の中心に<br>
+  WASD: 移動 / Q・E: 下・上 / Shift: 速く</div>
 </div>
 <script type="importmap">
 { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
@@ -43,20 +44,41 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b0d10);
 
 const loader = new THREE.TextureLoader();
-const texs = await Promise.all(meta.groups.map(g => loader.loadAsync(g.file)));   // 並行して読む
+const texs = await Promise.all(meta.groups.map(g => g.file && loader.loadAsync(g.file)));   // 並行して読む
+// スプラットの不透明度 = (27 × 重心座標の積) ^ 指数（中心で 1、縁で 0。指数は glb.SPLAT_SOFTNESS）
+const softness = { value: meta.splatSoftness || 1.5 };
+function softSplats(sh) {
+  sh.uniforms.softness = softness;
+  sh.vertexShader = 'attribute vec2 bary;\\nvarying vec2 vBary;\\n' +
+    sh.vertexShader.replace('#include <begin_vertex>', '#include <begin_vertex>\\nvBary = bary;');
+  sh.fragmentShader = 'uniform float softness;\\nvarying vec2 vBary;\\n' +
+    sh.fragmentShader.replace('#include <map_fragment>', `float w_ = 1.0 - vBary.x - vBary.y;
+  diffuseColor.a *= pow(clamp(27.0 * vBary.x * vBary.y * w_, 0.0, 1.0), softness);`);
+}
 const mats = [], meshes = [];
 let tris = 0;
 for (const [k, g] of meta.groups.entries()) {
   const tex = texs[k];
-  tex.colorSpace = THREE.SRGBColorSpace;
-  tex.anisotropy = 4;
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(buf, g.pos, g.nv * 3), 3));
-  geo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(buf, g.uv, g.nv * 2), 2));
-  geo.setIndex(new THREE.BufferAttribute(new Uint32Array(buf, g.idx, g.nt * 3), 1));
+  const uv = new THREE.BufferAttribute(new Float32Array(buf, g.uv, g.nv * 2), 2);
+  let mat;
+  if (g.splat) {   // スプラット: 頂点の色（線形の RGBA）の三角形を、縁ほど透明にして、並んでいる順（低いものから）に描く
+    geo.setAttribute('bary', uv);
+    geo.setAttribute('color', new THREE.BufferAttribute(new Uint16Array(buf, g.col, g.nv * 4), 4, true));
+    mat = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, depthWrite: false, side: THREE.DoubleSide });
+    mat.onBeforeCompile = softSplats;
+  } else {
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.anisotropy = 4;
+    if (g.repeat) tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    geo.setAttribute('uv', uv);
+    geo.setIndex(new THREE.BufferAttribute(new Uint32Array(buf, g.idx, g.nt * 3), 1));
+    mat = new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide });
+  }
   geo.computeBoundingSphere();
-  const mat = new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide });
   const m = new THREE.Mesh(geo, mat);
+  if (g.splat) m.renderOrder = 1;
   scene.add(m); mats.push(mat); meshes.push(m);
   tris += g.nt;
 }
@@ -75,7 +97,7 @@ const ctl = new OrbitControls(cam, ren.domElement);
 ctl.target.set(0, 0, 0);
 ctl.enableDamping = true;
 ctl.update();
-window.view = { cam, ctl, meta };   // コンソールから視点を動かす用
+window.view = { cam, ctl, meta, ren, scene };   // コンソールから視点を動かしたり、描いたりする用
 
 document.getElementById('n').textContent =
   tris.toLocaleString() + ' 三角形 · タイル ' + meta.tiles + ' 枚';
@@ -100,7 +122,32 @@ addEventListener('resize', () => {
   cam.aspect = innerWidth / innerHeight; cam.updateProjectionMatrix();
   ren.setSize(innerWidth, innerHeight);
 });
-(function loop() { requestAnimationFrame(loop); ctl.update(); ren.render(scene, cam); })();
+// WASD で前後左右（水平）、Q・E で上下に、視点と回転の中心をいっしょに動かす。
+// 速さは回転の中心までの距離に比例（近くではゆっくり、引いた所では速く）
+const keys = new Set();
+addEventListener('keydown', e => { if (!e.ctrlKey && !e.metaKey && !e.altKey) keys.add(e.code); });
+addEventListener('keyup', e => keys.delete(e.code));
+addEventListener('blur', () => keys.clear());
+const clock = new THREE.Clock();
+const fwd = new THREE.Vector3(), right = new THREE.Vector3(), step = new THREE.Vector3(), UP = new THREE.Vector3(0, 0, 1);
+function move(dt) {
+  const k = c => keys.has(c) ? 1 : 0;
+  const f = k('KeyW') - k('KeyS'), s = k('KeyD') - k('KeyA'), u = k('KeyE') - k('KeyQ');
+  if (!f && !s && !u) return;
+  cam.getWorldDirection(fwd).setZ(0);
+  if (fwd.lengthSq() < 1e-6) fwd.set(0, 1, 0).applyQuaternion(cam.quaternion).setZ(0);   // 真下を見ているときは画面の上を前に
+  fwd.normalize();
+  right.crossVectors(fwd, UP);
+  const speed = Math.min(Math.max(cam.position.distanceTo(ctl.target) * 0.8, 4), 200) * (keys.has('ShiftLeft') || keys.has('ShiftRight') ? 3 : 1);
+  step.set(0, 0, 0).addScaledVector(fwd, f).addScaledVector(right, s).addScaledVector(UP, u).normalize().multiplyScalar(speed * dt);
+  cam.position.add(step);
+  ctl.target.add(step);
+}
+(function loop() {
+  requestAnimationFrame(loop);
+  move(Math.min(clock.getDelta(), 0.1));
+  ctl.update(); ren.render(scene, cam);
+})();
 </script>
 """
 
@@ -114,7 +161,7 @@ def enu_basis(p):
 
 
 def to_jpeg(material, quality=90):
-    """材質の画像を JPEG のバイト列に（HEIC は変換する）。"""
+    """材質の画像を JPEG のバイト列に（HEIC は変換する）。画質 95 以上なら色を間引かない（4:4:4）。"""
     if material.format == "jpeg":
         return material.image
     from PIL import Image
@@ -122,18 +169,35 @@ def to_jpeg(material, quality=90):
 
     register_heif_opener()
     out = io.BytesIO()
-    Image.open(io.BytesIO(material.image)).convert("RGB").save(out, "JPEG", quality=quality)
+    Image.open(io.BytesIO(material.image)).convert("RGB").save(out, "JPEG", quality=quality,
+                                                         subsampling=0 if quality >= 95 else -1)
     return out.getvalue()
+
+
+def _parts(tiles):
+    """(名前, 材質, ECEF の頂点, UV, 三角形) の並びと、スプラットの (ECEF の頂点 (3N, 3), RGBA (N, 4)) の
+    並び。
+    範囲の端の、平らな地図につなぐための帯や面（Mesh.kind が 0 でないもの）は入れない。"""
+    parts, splats = [], []
+    for name, c in tiles:
+        for mi, m in enumerate(c.meshes):
+            if m.kind != 0:
+                continue
+            X = c.to_ecef(m.vertices)
+            for mat, F in m.groups.items():
+                if len(F):
+                    parts.append((f"{name}_{mi}_{mat}", c.materials[mat], X, m.uv, F))
+        sp = getattr(c, "splats", None)
+        if sp is not None:
+            keep = sp.rgba[:, 3] > 0    # 見えないもの（不透明度 0）は入れない
+            if keep.any():
+                splats.append((c.to_ecef(sp.vertices[keep].reshape(-1, 3)), sp.rgba[keep]))
+    return parts, splats
 
 
 def write(tiles, out, info, quality=90):
     """tiles: [(名前, C3M)]。info: meta.json に足す情報（lat, lon, region）。"""
-    parts = []   # (名前, 材質, ECEF の頂点, UV, 三角形)
-    for name, c in tiles:
-        for mi, m in enumerate(c.meshes):
-            X = c.to_ecef(m.vertices)
-            for mat, F in m.groups.items():
-                parts.append((f"{name}_{mi}_{mat}", c.materials[mat], X, m.uv, F))
+    parts, splats = _parts(tiles)
     if not parts:
         raise ValueError("三角形が 1 つもない")
     allv = np.vstack([p[2] for p in parts])
@@ -154,7 +218,26 @@ def write(tiles, out, info, quality=90):
         fn = f"tex/{key}.jpg"
         open(os.path.join(out, fn), "wb").write(to_jpeg(material, quality))
         g = {"file": fn, "nv": len(used), "nt": len(F)}
+        if getattr(material, "repeat", False):
+            g["repeat"] = True           # 水面などの塗りつぶし用の画像。くり返して貼る
         for k, arr in (("pos", P.astype("<f4")), ("uv", uv.astype("<f4")), ("idx", F.astype("<u4"))):
+            g[k] = off
+            blobs.append(arr.tobytes())
+            off += len(blobs[-1])
+        groups.append(g)
+    if splats:
+        P = (np.vstack([X for X, _ in splats]) - mid) @ R.T
+        P[:, 2] -= ground
+        c = np.vstack([rgba for _, rgba in splats]).astype(np.float64) / 255
+        # 低いものから順に描く（glb.tile_glb と同じ。奥から描かないと色が濁る）
+        order = np.argsort(P.reshape(-1, 3, 3)[:, :, 2].mean(1), kind="stable")
+        P, c = P.reshape(-1, 3, 3)[order].reshape(-1, 3), c[order]
+        # three.js の頂点の色は線形の値なので、sRGB の色を線形に直す（暗い色が潰れないよう 16 ビットで）
+        c[:, :3] = np.where(c[:, :3] <= 0.04045, c[:, :3] / 12.92, ((c[:, :3] + 0.055) / 1.055) ** 2.4)
+        uv = np.tile(np.array([[0, 0], [1, 0], [0, 1]], np.float32), (len(c), 1))  # 3 つの頂点の重心座標 (u, v)
+        g = {"file": None, "nv": len(P), "nt": len(c), "splat": True}
+        for k, arr in (("pos", P.astype("<f4")), ("uv", uv.astype("<f4")),
+                       ("col", np.repeat(np.round(c * 65535).astype("<u2"), 3, axis=0))):
             g[k] = off
             blobs.append(arr.tobytes())
             off += len(blobs[-1])
@@ -162,7 +245,9 @@ def write(tiles, out, info, quality=90):
     with open(os.path.join(out, "mesh.bin"), "wb") as fh:
         for b in blobs:
             fh.write(b)
-    meta = dict(info, tiles=len(tiles), groups=groups,
+    from .glb import SPLAT_SOFTNESS
+
+    meta = dict(info, tiles=len(tiles), groups=groups, splatSoftness=SPLAT_SOFTNESS,
                 radius=float(max(np.abs(lo[:2]).max(), np.abs(hi[:2]).max())))
     json.dump(meta, open(os.path.join(out, "meta.json"), "w"))
     open(os.path.join(out, "index.html"), "w", encoding="utf-8").write(HTML)
@@ -173,13 +258,15 @@ def write_obj(tiles, path, quality=90):
     """OBJ と MTL と画像に書き出す（Blender などで開く用）。座標は write と同じ東・北・上。"""
     base = os.path.splitext(path)[0]
     d = os.path.dirname(os.path.abspath(path))
-    allv = np.vstack([c.to_ecef(m.vertices) for _, c in tiles for m in c.meshes])
+    allv = np.vstack([c.to_ecef(m.vertices) for _, c in tiles for m in c.meshes if m.kind == 0])
     mid = (allv.min(0) + allv.max(0)) / 2
     R = enu_basis(mid)
     ground = np.percentile((allv - mid) @ R.T[:, 2], 2)
     obj, mtl, n = [f"mtllib {os.path.basename(base)}.mtl"], [], 1
     for name, c in tiles:
         for mi, m in enumerate(c.meshes):
+            if m.kind != 0:             # 範囲の端の帯や面は入れない
+                continue
             P = (c.to_ecef(m.vertices) - mid) @ R.T
             P[:, 2] -= ground
             obj.append(f"o {name}_{mi}")

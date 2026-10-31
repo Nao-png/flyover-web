@@ -150,7 +150,7 @@ class Earth:
         if region is None:
             return None
         hevc = hevc and self.r3d
-        kind = ("glb98_11h" if hevc else "glb98_11") if self.r3d else "glb4"    # 作り方を変えたら番号を上げる
+        kind = ("glb98_13h" if hevc else "glb98_13") if self.r3d else "glb4"    # 作り方を変えたら番号を上げる
         d = os.path.join(self.cache_dir, kind, f"{region['region']}_{region['version']}", str(z))
         path = os.path.join(d, f"{x}_{y}.glb")
         t0 = time.perf_counter()
