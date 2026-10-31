@@ -137,6 +137,16 @@ def test_uv_indices_on_two_triangles():
     assert n == 6 and res.tolist() == [0, 1, 2, 3, 4, 5] and chart.tolist() == [0, 1]
 
 
+def test_uv_prog_crosses_edges_with_the_same_uvs():
+    # 上と同じ 2 つの三角形。辺の両側の UV の番号が同じなら（継ぎ目の印があっても）渡って平行四辺形で予測し、
+    # 違えば渡らずに新しい三角形から始める
+    a = np.array([3, -1, -1, 0, -1, -1], np.int64)
+    prog = r3d._k_uv_prog(np.array([0, 1, 2, 3, 2, 1], np.int64), a, 2, 4)
+    assert prog.tolist()[3:] == [[3, 3, 1, 2, 0]]
+    prog = r3d._k_uv_prog(np.array([0, 1, 2, 3, 4, 5], np.int64), a, 2, 6)
+    assert [k for k, *_ in prog.tolist()] == [0, 1, 2, 0, 1, 2]
+
+
 def test_parse_rejects_other_data():
     with pytest.raises(ValueError):
         r3d.parse(b"C3M\x03\x07" + bytes(200))

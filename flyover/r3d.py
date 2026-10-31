@@ -757,8 +757,9 @@ def _k_uv_indices(cor, a, nib, F, V):
 
 
 @_jit
-def _k_uv_prog(res, a, nib, F, U):
-    """UV の値: 継ぎ目を境にしたチャートごとの幅優先（角は 0,1,2 の順）。始めの三角形は
+def _k_uv_prog(res, a, F, U):
+    """UV の値: 幅優先（角は 0,1,2 の順）で、辺の両側の UV の番号が同じなら渡る（継ぎ目の印があっても。
+    海沿いのタイルには、印が付いていて両側の UV が同じ辺がある）。始めの三角形は
     直前の予測 + D、1 つ目 + D、中点 + D（中点を直前の予測にする）。値は UV 番号の順に並ぶ。"""
     known = np.zeros(U, np.uint8)
     done = np.zeros(F, np.uint8)
@@ -785,7 +786,10 @@ def _k_uv_prog(res, a, nib, F, U):
             head += 1
             for ii in range(b0, b0 + 3):
                 av = a[ii]
-                if av >= 0 and not done[av // 3] and not _k_seam(a, nib, ii):
+                if av < 0 or done[av // 3]:
+                    continue
+                ab = av // 3 * 3
+                if res[b0 + (ii + 1) % 3] == res[ab + (av + 2) % 3] and res[b0 + (ii + 2) % 3] == res[ab + (av + 1) % 3]:
                     done[av // 3] = 1
                     queue[tail] = av
                     tail += 1
@@ -851,7 +855,7 @@ def decode_mesh(s, sizes):
     if charts != tri_chart.max() + 1 or atlas.max() >= len(sizes):
         raise ValueError("チャートの数かテクスチャの番号が合わない")
     L, k = _compact(s, k + L)
-    uprog = _k_uv_prog(res, a, nib, F, U)
+    uprog = _k_uv_prog(res, a, F, U)
     iu = np.stack([_pick(uprog, o, U) for o in _components(_lanes(s, k, L, 8, U), 2, U)], 1)
     # UV の値は、そのチャートのテクスチャの画素の 4 倍の単位（UV の番号はチャートごとに別）
     tri_atlas = atlas[tri_chart]
@@ -1107,4 +1111,4 @@ def warm():
     _k_replay(np.zeros((0, 5), np.int64), z, 0)
     _k_position_prog(z, z, 0, 0)
     _k_uv_indices(z, z, u, 0, 0)
-    _k_uv_prog(z, z, u, 0, 0)
+    _k_uv_prog(z, z, 0, 0)
