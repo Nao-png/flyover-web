@@ -84,10 +84,14 @@ def _compact(b, i):
 
 
 def _small(b, i):
-    """0x40 未満なら 1 バイト、そうでなければ下位 6 ビットと次のバイトの 64 倍。"""
+    """0x40 未満なら 1 バイト。そうでなければ下位 6 ビットに、次のバイトの下位 7 ビットの 64 倍を足す。
+    次のバイトが 0x80 以上なら、さらに 3 バイト目の 8192 倍を足す。"""
     if b[i] < 0x40:
         return b[i], i + 1
-    return (b[i] & 0x3F) | (b[i + 1] << 6), i + 2
+    v = (b[i] & 0x3F) | (b[i + 1] & 0x7F) << 6
+    if b[i + 1] < 0x80:
+        return v, i + 2
+    return v | b[i + 2] << 13, i + 3
 
 
 def _tlv(b, a, e):
@@ -580,7 +584,7 @@ def _clers(s, bits, cj, CL, vals):
 def _k_replay(prog, D, n):
     """予測の手順 prog（m x 5）を残差 D（ジグザグを戻したもの）で再生する。手順の 0 列目:
     0 = 直前の予測 + D、1 = 元 + D、2 = 中点（C の切り捨て）+ D で中点を直前の予測にする、
-    3 = 平行四辺形 a + b - c + D、4 = 中点 + D で直前の予測は変えない。"""
+    3 = 平行四辺形 a + b - c + D。"""
     out = np.zeros(n, np.int64)
     last = 0
     for i in range(prog.shape[0]):
@@ -589,11 +593,10 @@ def _k_replay(prog, D, n):
             out[v] = last + D[v]
         elif k == 1:
             out[v] = out[a] + D[v]
-        elif k == 2 or k == 4:
+        elif k == 2:
             t = out[a] + out[b] + 1
             mid = t // 2 if t >= 0 else -((-t) // 2)
-            if k == 2:
-                last = mid
+            last = mid
             out[v] = mid + D[v]
         else:
             last = out[a] + out[b] - out[c]
@@ -618,7 +621,8 @@ def _pick(prog, opts, n):
 @_jit
 def _k_position_prog(cor, a, F, V):
     """位置: 三角形の幅優先（未処理で番号の一番小さい三角形から、角は 0,1,2 の順）。
-    始めの三角形の頂点は 直前の予測 + D、1 つ目 + D、中点 + D（中点は直前の予測にしない）。
+    始めの三角形の頂点は 直前の予測 + D、1 つ目 + D、中点 + D（中点を直前の予測にする。頂点が 3 つだけの
+    かたまりの次のかたまりは、その中点から始まる）。
     入った三角形の先の頂点がまだなら平行四辺形 + D。"""
     seen = np.zeros(V, np.uint8)
     done = np.zeros(F, np.uint8)
@@ -639,7 +643,7 @@ def _k_position_prog(cor, a, F, V):
             seen[s1] = 1
             m += 1
         if not seen[s2]:
-            prog[m, 0], prog[m, 1], prog[m, 2], prog[m, 3] = 4, s2, s0, s1
+            prog[m, 0], prog[m, 1], prog[m, 2], prog[m, 3] = 2, s2, s0, s1
             seen[s2] = 1
             m += 1
         done[st] = 1
