@@ -29,6 +29,8 @@ HTML = """<!DOCTYPE html>
   <div id="place" style="opacity:.75"></div>
   <label>明るさ <input id="gain" type="range" min="50" max="250" step="5" value="100"></label>
   <label><input id="wire" type="checkbox"> 三角形の辺</label>
+  <div style="margin-top:6px"><button id="shot">スクリーンショットを保存（P）</button>
+  <select id="shotk"><option value="screen">画面と同じ</option><option value="hd">HD（1920×1080）</option><option value="2k">2K（2560×1440）</option><option value="4k">4K（3840×2160）</option></select></div>
   <div style="margin-top:6px;opacity:.75">左ドラッグ: 回転 / 右ドラッグ: 平行移動 / ホイール: 拡大<br>
   ダブルクリック: そこを回転の中心に<br>
   WASD: 移動 / Q・E: 下・上 / Shift: 速く</div>
@@ -165,6 +167,51 @@ document.getElementById('gain').oninput = e => {
 document.getElementById('wire').onchange = e => {
   for (const m of mats) m.wireframe = e.target.checked;
 };
+
+// スクリーンショット: 3D だけを PNG で保存する。大きさは今の画面か、HD・2K・4K（その大きさで描き直す）。
+// データは Apple のものなので出典を右下に入れる。描いた直後でないと WebGL のキャンバスは空なので、
+// ここで描いてすぐ写す
+const SHOT_SIZES = { screen: null, hd: [1920, 1080], '2k': [2560, 1440], '4k': [3840, 2160] };
+function screenshot(key = 'screen') {
+  const size = SHOT_SIZES[key], src = ren.domElement;
+  const pr = ren.getPixelRatio(), cur = ren.getSize(new THREE.Vector2()), aspect = cam.aspect;
+  if (size) {
+    const gl = ren.getContext();
+    const lim = Math.min(gl.getParameter(gl.MAX_RENDERBUFFER_SIZE), ...gl.getParameter(gl.MAX_VIEWPORT_DIMS));
+    const f = Math.min(1, lim / Math.max(...size)), W = Math.round(size[0] * f), H = Math.round(size[1] * f);
+    ren.setPixelRatio(1); ren.setSize(W, H, false);
+    cam.aspect = W / H; cam.updateProjectionMatrix();
+  }
+  ren.render(scene, cam);
+  const c = document.createElement('canvas');
+  c.width = src.width; c.height = src.height;
+  const g = c.getContext('2d');
+  g.drawImage(src, 0, 0);
+  const s = Math.max(1, c.height / 900), text = '画像・3D © Apple';
+  g.font = `${Math.round(12 * s)}px system-ui, sans-serif`;
+  const w = g.measureText(text).width, pad = 6 * s;
+  g.fillStyle = 'rgba(0,0,0,0.5)';
+  g.fillRect(c.width - w - 3 * pad, c.height - 26 * s, w + 2 * pad, 20 * s);
+  g.fillStyle = '#fff';
+  g.textBaseline = 'middle';
+  g.fillText(text, c.width - w - 2 * pad, c.height - 16 * s);
+  if (size) {
+    ren.setPixelRatio(pr); ren.setSize(cur.x, cur.y, false);
+    cam.aspect = aspect; cam.updateProjectionMatrix();
+  }
+  const t = new Date(), p = n => String(n).padStart(2, '0');
+  const name = `flyover_${meta.lat.toFixed(5)}_${meta.lon.toFixed(5)}_${t.getFullYear()}${p(t.getMonth() + 1)}${p(t.getDate())}-${p(t.getHours())}${p(t.getMinutes())}${p(t.getSeconds())}.png`;
+  c.toBlob(b => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b); a.download = name; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }, 'image/png');
+}
+const shotK = document.getElementById('shotk');
+document.getElementById('shot').onclick = () => screenshot(shotK.value);
+addEventListener('keydown', e => {
+  if (e.code === 'KeyP' && !e.ctrlKey && !e.metaKey && !e.altKey && !e.repeat) screenshot(e.shiftKey ? '4k' : shotK.value);
+});
 
 const ray = new THREE.Raycaster();
 ren.domElement.addEventListener('dblclick', e => {

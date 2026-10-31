@@ -41,6 +41,12 @@ button { font: inherit; color: inherit; cursor: pointer; }
 #compass svg { width: 34px; height: 34px; }
 #needle { transform-origin: 20px 20px; }
 #dim-btn { font-size: 12px; letter-spacing: .02em; }
+#shot { position: relative; }
+#shot-menu { position: absolute; right: 42px; top: 50%; transform: translateY(-50%); display: flex; gap: 4px;
+             padding: 4px; border-radius: 8px; background: var(--panel-solid); box-shadow: var(--shadow); white-space: nowrap; }
+#shot-menu[hidden] { display: none; }
+#shot-menu button { border: 0; border-radius: 6px; padding: 4px 8px; background: transparent; color: inherit; font: inherit; }
+#shot-menu button:hover { background: #303134; }
 .zoom { display: flex; flex-direction: column; border-radius: 20px; overflow: hidden; background: var(--panel-solid);
         box-shadow: var(--shadow); }
 .zoom button { width: 40px; height: 40px; border: 0; background: none; font-size: 22px; line-height: 1; padding: 0; }
