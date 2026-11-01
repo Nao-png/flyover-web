@@ -49,18 +49,26 @@ def first_heights(z):
     return 1 if z <= 15 else 2 if z == 16 else 4
 
 
-def fetch_heights(z, get_many):
-    """タイルの高さ区分ごとの C3M の並び。get_many(区分の番号の並び) は、それぞれのバイト列か
-    None（データなし）の並びを返す。高さ区分は飛び飛びにあることがある（h = 1 がなく 2 がある）
-    ので、最後に要求した区分にデータがあれば、次の 4 つも要求する。"""
+def fetch_heights(z, get_many, r3d=False):
+    """タイルの高さ区分ごとの C3M（r3d なら R3D）の並び。get_many(区分の番号の並び) は、それぞれの
+    バイト列か None（データなし）の並びを返す。高さ区分は飛び飛びにあることがある（h = 1 がなく 2 が
+    ある）ので、最後に要求した区分にデータがあれば、次の 4 つも要求する。
+
+    R3D では、h = 0〜3 の上が 4〜7 でなく 8〜15 に続くタイルがある（麻布台で、4〜7 が空のまま 8〜15 が
+    約 300 m まで続く。0〜3 が空で 12・14・15 だけにあるタイルもある）。そのため、ズーム 17 以上の R3D は、
+    3 にデータがあるか 0〜3 がすべて空なら、4〜15 をまとめて要求する（4〜7 にあるタイルも多いので、
+    4〜7 も要求する。手元では 4〜7 と 8〜15 の両方にあるタイルはなかった）。"""
     raws, h, n = [], 0, first_heights(z)
     while True:
         got = get_many(range(h, h + n))
         raws += got
         h += n
-        if n == 1 or not got[-1]:
+        if r3d and h == n == 4 and (got[-1] or not any(got)):
+            n = 12
+        elif n == 1 or not got[-1]:
             return raws
-        n = 4
+        else:
+            n = 4
 
 
 def parse_heights(raws, parse=c3m.parse):
@@ -163,7 +171,7 @@ class Earth:
         if region is None:
             return None
         hevc = hevc and self.r3d
-        kind = ("glb98_15h" if hevc else "glb98_15") if self.r3d else "glb4"    # 作り方を変えたら番号を上げる
+        kind = ("glb98_16h" if hevc else "glb98_16") if self.r3d else "glb4"    # 作り方を変えたら番号を上げる
         d = os.path.join(self.cache_dir, kind, f"{region['region']}_{region['version']}", str(z))
         path = os.path.join(d, f"{x}_{y}.glb")
         t0 = time.perf_counter()
@@ -175,7 +183,7 @@ class Earth:
             out = None
             if self.r3d and z >= R3D_MIN_ZOOM:
                 raws = fetch_heights(z, lambda hs: self.map(
-                    lambda k: self.client.r3d_tile_cached(region, x, y, z, k), hs))
+                    lambda k: self.client.r3d_tile_cached(region, x, y, z, k), hs), r3d=True)
                 t1 = time.perf_counter()
                 # R3D があれば C3M は取らない。R3D の取得が時間切れなら、ここで例外になって
                 # 保存せずに 502 を返し、ビューアがあとで取り直す

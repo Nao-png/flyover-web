@@ -76,7 +76,7 @@ def main():
         if region is None:
             return xy, None, [], 0
         if a.r3d:
-            raws = fetch_heights(z, lambda hs: [client.r3d_tile_cached(region, x, y, z, h) for h in hs])
+            raws = fetch_heights(z, lambda hs: [client.r3d_tile_cached(region, x, y, z, h) for h in hs], r3d=True)
             if any(raws):
                 tiles, failed = cpu.submit(parse_heights, raws, r3d.parse).result()
                 if not failed:
