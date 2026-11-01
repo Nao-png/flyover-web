@@ -233,6 +233,38 @@ def test_fetch_heights_requests_only_needed_slabs():
     assert fetch_heights(20, get)[5] == b"x" and asked == list(range(8))
 
 
+def test_fetch_heights_r3d_looks_past_empty_4_to_7():
+    from flyover.earth import fetch_heights
+
+    def fake(present):
+        asked = []
+
+        def get_many(hs):
+            asked.extend(hs)
+            return [b"x" if h in present else None for h in hs]
+        return asked, get_many
+
+    # 麻布台の森 JP タワー（0〜3 の上は 4〜7 が空で、8〜14 に続く）
+    tower = {0, 1, 2, 3, *range(8, 15)}
+    asked, get = fake(tower)
+    raws = fetch_heights(20, get, r3d=True)
+    assert {h for h, b in enumerate(raws) if b} == tower and asked == list(range(16))
+    asked, get = fake(tower)
+    assert len(fetch_heights(20, get)) == 8 and asked == list(range(8))     # C3M は今までどおり 4〜7 で止める
+    # 0〜3 がすべて空で、12・14・15 だけにある（東京タワーの上のほう）。15 にあるので 16〜19 も見る
+    asked, get = fake({12, 14, 15})
+    assert len(fetch_heights(20, get, r3d=True)) == 20 and asked == list(range(20))
+    # 4〜7 に続くタイルも拾う
+    asked, get = fake({0, 1, 2, 3, 4, 5})
+    assert fetch_heights(20, get, r3d=True)[5] == b"x" and asked == list(range(16))
+    # 3 が空なら 4 より上は見ない（今までどおり）
+    asked, get = fake({0, 1})
+    assert len(fetch_heights(20, get, r3d=True)) == 4 and asked == [0, 1, 2, 3]
+    # ズーム 16 以下は今までどおり
+    asked, get = fake(set())
+    assert fetch_heights(15, get, r3d=True) == [None] and asked == [0]
+
+
 def test_net_sends_a_second_request_when_slow(monkeypatch):
     import asyncio
     import time
