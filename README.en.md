@@ -6,7 +6,7 @@ A tool for viewing Apple Maps Flyover (3D aerial imagery of cities) in a browser
 It runs on Python alone; no Mac or Apple apps are needed.
 
 - **Globe viewer** — Zoom in from the whole Earth, like Google Earth, and cities with Flyover appear in 3D. The controls are the same as Google Earth
-- **Export** — Save the area around a given point as a set of files you can view in the browser, or as OBJ (a 3D format that Blender and similar tools can open)
+- **Export** — Save the area around a given point as a set of files you can view in the browser, or as OBJ or glb (3D formats that Blender and similar tools can open)
 
 > [!WARNING]
 > This tool fetches Apple Maps data through interfaces that Apple does not offer to the public. This may violate Apple's terms of service. Use it at your own risk, and do not redistribute the data you fetch. This project is not affiliated with Apple.
@@ -80,7 +80,8 @@ For the 9×9 tiles around Higashi Chaya (about 280 m square, 88 tiles, 150,000 t
 | `--r3d` | off | Use the new Flyover (iOS 27); only tiles without it, or that fail to parse, use the old Flyover |
 | `--block` | none | Write N×N tiles per folder, plus an index page (a large area on one page does not fit in GPU memory) |
 | `--jobs` | 8 | Number of tiles fetched at once |
-| `--obj` | none | Also export OBJ (give a file name, e.g. `--obj out/kanazawa.obj`) |
+| `--obj` | none | Also export OBJ (give a file name, e.g. `--obj out/kanazawa.obj`). With `--r3d`, splats such as trees become triangles with vertex colors (`splats`). OBJ has no transparency, so their soft edges are lost |
+| `--glb` | none | Also export glb (glTF) (give a file name, e.g. `--glb out/yumeshima.glb`). With `--r3d`, splats are included as semi-transparent triangles with vertex colors and soft edges, as in the viewer. Opens in Blender, three.js, Windows 3D Viewer, and others |
 | `--quality` | 90 | JPEG quality of the images (95 or more keeps full color resolution) |
 | `--hevc` | none | Write new-Flyover images as HEVC instead of JPEG (the browser decodes them on the GPU; image files are about 1/5 the size, and photos are not recompressed, so no quality loss; only viewable in browsers that can decode HEVC on the GPU) |
 | `--cache` | `cache` | Where fetched data is saved |
@@ -106,7 +107,7 @@ For the details, and for what makes loading fast, see [docs/how-it-works.en.md](
 | `flyover/c3m.py`, `edgebreaker.py`, `huffman.py`, `_fast.py` | Reading and decoding C3M (`_fast.py` is a faster version using numba) |
 | `flyover/r3d.py` | Reading the mesh and splats of the new Flyover (style 98, R3D) |
 | `flyover/glb.py`, `terrain.py`, `earth.py`, `earth/` | Server and page for the globe viewer |
-| `flyover/web.py` | Export (for the browser and OBJ) |
+| `flyover/web.py` | Export (for the browser, OBJ, and glb) |
 | `tools/retroplasma-2026.patch` | Fixes for running the Go version against today's Apple servers (for the comparison) |
 
 ## Tests

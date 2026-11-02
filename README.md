@@ -6,7 +6,7 @@ Apple マップの Flyover（街の 3D 航空写真）を、Windows のブラウ
 Python だけで動き、Mac も Apple のアプリも要りません。
 
 - **地球儀ビューア** — Google Earth のように地球全体から寄っていくと、Flyover のある街が 3D で表示されます。操作も Google Earth と同じです
-- **書き出し** — 指定した地点のまわりを、ブラウザで見られる一式や OBJ（Blender などで開ける 3D の形式）に書き出します
+- **書き出し** — 指定した地点のまわりを、ブラウザで見られる一式や OBJ・glb（Blender などで開ける 3D の形式）に書き出します
 
 > [!WARNING]
 > このツールは、Apple が一般には公開していない仕組みを使って Apple マップのデータを取得します。Apple の利用規約に反する可能性があります。使うのは自己責任で、取得したデータを再配布しないでください。このプロジェクトは Apple とは関係ありません。
@@ -80,7 +80,8 @@ python scripts/serve.py out                                          # http://lo
 | `--r3d` | なし | 新しい Flyover（iOS 27）を使う。ないか読めないタイルだけ古い Flyover にする |
 | `--block` | なし | N×N タイルずつ別のフォルダに書き出し、一覧のページを置く（広い範囲を 1 ページにすると画像が GPU に載りきらない） |
 | `--jobs` | 8 | 同時に取得するタイルの数 |
-| `--obj` | なし | OBJ にも書き出す（ファイル名を指定。例: `--obj out/kanazawa.obj`） |
+| `--obj` | なし | OBJ にも書き出す（ファイル名を指定。例: `--obj out/kanazawa.obj`）。`--r3d` なら、木などのスプラットは頂点に色の付いた三角形（`splats`）になる。OBJ には透明度がないので、ふちのぼかしはなくなる |
+| `--glb` | なし | glb（glTF）にも書き出す（ファイル名を指定。例: `--glb out/yumeshima.glb`）。`--r3d` のスプラットも、ビューアと同じく頂点の色と縁のぼかしの付いた半透明の三角形で入る。Blender、three.js、Windows の 3D ビューアーなどで開ける |
 | `--quality` | 90 | 画像の JPEG の画質（95 以上なら色を間引かない） |
 | `--hevc` | なし | 新しい Flyover の画像を JPEG にせず HEVC のまま書く（ブラウザが GPU で展開する。画像のファイルは 1/5 ほどになり、写真を圧縮し直さないので画質も落ちない。HEVC を GPU で展開できるブラウザでしか見られない） |
 | `--cache` | `cache` | 取得したデータの保存先 |
@@ -106,7 +107,7 @@ python scripts/serve.py out                                          # http://lo
 | `flyover/c3m.py`、`edgebreaker.py`、`huffman.py`、`_fast.py` | C3M の読み取りと展開（`_fast.py` は numba で速くした版） |
 | `flyover/r3d.py` | 新しい Flyover（style 98、R3D）のメッシュとスプラットの読み取り |
 | `flyover/glb.py`、`terrain.py`、`earth.py`、`earth/` | 地球儀ビューアのサーバーと画面 |
-| `flyover/web.py` | 書き出し（ブラウザ用と OBJ） |
+| `flyover/web.py` | 書き出し（ブラウザ用と OBJ と glb） |
 | `tools/retroplasma-2026.patch` | Go 版を今の Apple のサーバーで動かすための修正（照合用） |
 
 ## テスト

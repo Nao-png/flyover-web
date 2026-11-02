@@ -381,7 +381,8 @@ def write(tiles, out, info, quality=90, hevc=False):
 
 
 def write_obj(tiles, path, quality=90):
-    """OBJ と MTL と画像に書き出す（Blender などで開く用）。座標は write と同じ東・北・上。"""
+    """OBJ と MTL と画像に書き出す（Blender などで開く用）。座標は write と同じ東・北・上。新しい Flyover の
+    スプラットは、頂点の色の付いた三角形の "splats" にする。"""
     base = os.path.splitext(path)[0]
     d = os.path.dirname(os.path.abspath(path))
     allv = np.vstack([c.to_ecef(m.vertices) for _, c in tiles for m in c.meshes if m.kind == 0])
@@ -406,5 +407,129 @@ def write_obj(tiles, path, quality=90):
                 obj.append(f"usemtl {key}")
                 obj += [f"f {a + n}/{a + n} {b + n}/{b + n} {cc + n}/{cc + n}" for a, b, cc in F]
             n += len(P)
+    _, splats = _parts(tiles)
+    if splats:
+        # 新しい Flyover のスプラット（木など）は、頂点の色の付いた三角形にする（OBJ には不透明度がないので、
+        # ふちのぼかしはなくなる）。v の後ろの r g b は Blender や MeshLab が読む拡張
+        P = (np.vstack([X for X, _ in splats]) - mid) @ R.T
+        P[:, 2] -= ground
+        c = np.repeat(np.vstack([rgba for _, rgba in splats])[:, :3] / 255, 3, axis=0)
+        obj += ["o splats", "usemtl splats"]
+        obj += [f"v {x:.3f} {y:.3f} {z:.3f} {r:.3f} {g:.3f} {b:.3f}" for (x, y, z), (r, g, b) in zip(P, c)]
+        obj += [f"f {i} {i + 1} {i + 2}" for i in range(n, n + len(P), 3)]
+        mtl += ["newmtl splats", "Kd 1 1 1", "illum 0", ""]
     open(base + ".obj", "w").write("\n".join(obj) + "\n")
     open(base + ".mtl", "w").write("\n".join(mtl) + "\n")
+
+
+def write_glb(tiles, path, quality=90):
+    """1 つの glb に書き出す（Blender などで開く用）。座標は write と同じ東・北・上のメートルを、glTF の
+    決まり（Y が上、-Z が北）に置き換えたもの。材質は光の影響を受けない KHR_materials_unlit。新しい
+    Flyover のスプラットは、ビューアと同じく頂点の色（RGBA）と縁ほど透明になる画像を掛けた半透明の
+    三角形にし、低いものから順に並べる（半透明の中の順は、たいていのソフトが書いた順に描く）。"""
+    from .glb import ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER, FLOAT, UINT16, UINT32, _soft_triangle
+
+    parts, splats = _parts(tiles)
+    if not parts:
+        raise ValueError("三角形が 1 つもない")
+    allv = np.vstack([p[2] for p in parts])
+    mid = (allv.min(0) + allv.max(0)) / 2
+    R = enu_basis(mid)
+    ground = np.percentile((allv - mid) @ R.T[:, 2], 2)
+
+    def local(X):
+        P = (X - mid) @ R.T
+        P[:, 2] -= ground
+        return np.stack([P[:, 0], P[:, 2], -P[:, 1]], 1).astype("<f4")   # 東・北・上 -> x, y, z（Y が上）
+
+    bin_, views, accessors = bytearray(), [], []
+
+    def accessor(arr, ctype, kind, target=None, minmax=False, normalized=False):
+        while len(bin_) % 4:
+            bin_.append(0)
+        views.append({"buffer": 0, "byteOffset": len(bin_), "byteLength": arr.nbytes})
+        if target:
+            views[-1]["target"] = target
+        bin_.extend(arr.tobytes())
+        a = {"bufferView": len(views) - 1, "componentType": ctype, "count": len(arr), "type": kind}
+        if minmax:
+            a["min"], a["max"] = arr.min(0).tolist(), arr.max(0).tolist()
+        if normalized:
+            a["normalized"] = True
+        accessors.append(a)
+        return len(accessors) - 1
+
+    def image(data, mime):
+        while len(bin_) % 4:
+            bin_.append(0)
+        views.append({"buffer": 0, "byteOffset": len(bin_), "byteLength": len(data)})
+        bin_.extend(data)
+        return {"bufferView": len(views) - 1, "mimeType": mime}
+
+    # 同じ材質は 1 度だけ。画像の変換は GIL を放すのでスレッドで並べる
+    mats = {}
+    for _, material, *_ in parts:
+        mats.setdefault(id(material), material)
+    with ThreadPoolExecutor(min(8, os.cpu_count() or 1)) as pool:
+        jpegs = dict(zip(mats, pool.map(lambda m: to_jpeg(m, quality), mats.values())))
+    images, textures, materials, mat_index = [], [], [], {}
+    for k, m in mats.items():
+        images.append(image(jpegs[k], "image/jpeg"))
+        # 標本の取り方 0 は端で止める、1 はくり返す（水面などの塗りつぶし用の画像）
+        textures.append({"source": len(images) - 1, "sampler": int(getattr(m, "repeat", False))})
+        materials.append({"pbrMetallicRoughness": {"baseColorTexture": {"index": len(textures) - 1},
+                                                   "metallicFactor": 0, "roughnessFactor": 1},
+                          "doubleSided": True, "extensions": {"KHR_materials_unlit": {}}})
+        mat_index[k] = len(materials) - 1
+
+    meshes = []
+    for key, material, X, UV, F in parts:
+        used, F = np.unique(F, return_inverse=True)
+        uv = UV[used].astype("<f4")
+        uv[:, 1] = 1 - uv[:, 1]        # C3M は v が上向き、glTF は下向き
+        itype, idt = (UINT16, "<u2") if len(used) < 65536 else (UINT32, "<u4")
+        meshes.append({"name": key, "primitives": [{
+            "attributes": {"POSITION": accessor(local(X[used]), FLOAT, "VEC3", ARRAY_BUFFER, minmax=True),
+                           "TEXCOORD_0": accessor(uv, FLOAT, "VEC2", ARRAY_BUFFER)},
+            "indices": accessor(F.reshape(-1).astype(idt), itype, "SCALAR", ELEMENT_ARRAY_BUFFER),
+            "material": mat_index[id(material)]}]})
+    if splats:
+        P = local(np.vstack([X for X, _ in splats])).reshape(-1, 3, 3)
+        rgba = np.vstack([rgba for _, rgba in splats])
+        order = np.argsort(P[:, :, 1].mean(1), kind="stable")   # 低いものから（glb.tile_glb と同じ）
+        P, rgba = P[order].reshape(-1, 3), rgba[order]
+        # glTF の頂点の色は線形の値なので、sRGB の色を線形に直す（暗い色が潰れないよう 16 ビットで）
+        c = rgba.astype(np.float64) / 255
+        c[:, :3] = np.where(c[:, :3] <= 0.04045, c[:, :3] / 12.92, ((c[:, :3] + 0.055) / 1.055) ** 2.4)
+        col = np.repeat(np.round(c * 65535).astype("<u2"), 3, axis=0)
+        # 三角形ごとに、縁ほど透明になる画像の (0,0)・(1,0)・(0,1) の角を当てる
+        T = np.tile(np.array([[0, 0], [1, 0], [0, 1]], "<f4"), (len(rgba), 1))
+        images.append(image(_soft_triangle(), "image/png"))
+        textures.append({"source": len(images) - 1, "sampler": 0})
+        materials.append({"name": "splats",
+                          "pbrMetallicRoughness": {"baseColorTexture": {"index": len(textures) - 1},
+                                                   "metallicFactor": 0, "roughnessFactor": 1},
+                          "alphaMode": "BLEND", "doubleSided": True, "extensions": {"KHR_materials_unlit": {}}})
+        meshes.append({"name": "splats", "primitives": [{
+            "attributes": {"POSITION": accessor(P, FLOAT, "VEC3", ARRAY_BUFFER, minmax=True),
+                           "COLOR_0": accessor(col, UINT16, "VEC4", ARRAY_BUFFER, normalized=True),
+                           "TEXCOORD_0": accessor(T, FLOAT, "VEC2", ARRAY_BUFFER)},
+            "material": len(materials) - 1}]})
+    while len(bin_) % 4:
+        bin_.append(0)
+
+    gltf = {"asset": {"version": "2.0", "generator": "flyover-web"},
+            "extensionsUsed": ["KHR_materials_unlit"],
+            "scene": 0, "scenes": [{"nodes": list(range(len(meshes)))}],
+            "nodes": [{"name": m["name"], "mesh": i} for i, m in enumerate(meshes)],
+            "meshes": meshes, "materials": materials, "accessors": accessors, "bufferViews": views,
+            "buffers": [{"byteLength": len(bin_)}], "images": images, "textures": textures,
+            "samplers": [{"magFilter": 9729, "minFilter": 9987, "wrapS": 33071, "wrapT": 33071},
+                         {"magFilter": 9729, "minFilter": 9987, "wrapS": 10497, "wrapT": 10497}]}
+    js = json.dumps(gltf, separators=(",", ":"), ensure_ascii=False).encode()
+    js += b" " * (-len(js) % 4)
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<4sII", b"glTF", 2, 12 + 8 + len(js) + 8 + len(bin_)))
+        fh.write(struct.pack("<I4s", len(js), b"JSON") + js)
+        fh.write(struct.pack("<I4s", len(bin_), b"BIN\0"))
+        fh.write(bin_)
