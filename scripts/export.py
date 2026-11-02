@@ -10,7 +10,8 @@
 データがあれば上も要求する。データのないタイルは飛ばす。--r3d なら新しい Flyover（R3D）を使い、
 R3D がないか読めないタイルだけ C3M にする。--block N なら N x N タイルずつ別のフォルダに書き出し、
 その一覧の index.html を --out に置く（広い範囲を 1 枚のページにすると、画像が GPU に載りきらない）。
-取得したタイルは --cache に保存し、次からはそれを使う。--obj を付けると OBJ にも書き出す。
+取得したタイルは --cache に保存し、次からはそれを使う。--obj を付けると OBJ にも、--glb を付けると
+glb にも書き出す。
 
 取得したデータは Apple の著作物。リポジトリには入れないこと。
 """
@@ -49,6 +50,7 @@ def main():
     ap.add_argument("--jobs", type=int, default=8, help="同時に取得するタイルの数")
     ap.add_argument("--cache", default="cache", help="マニフェストとタイルの保存先")
     ap.add_argument("--obj", help="OBJ にも書き出す（ファイル名。--block なら各フォルダに置く）")
+    ap.add_argument("--glb", help="glb にも書き出す（ファイル名。--block なら各フォルダに置く）")
     ap.add_argument("--quality", type=int, default=90, help="画像の JPEG の画質（95 以上なら色を間引かない）")
     ap.add_argument("--hevc", action="store_true",
                     help="新しい Flyover の画像を JPEG にせず HEVC のまま書く（速いが、HEVC を GPU で展開できるブラウザ専用）")
@@ -127,6 +129,10 @@ def main():
                 path = os.path.join(out, os.path.basename(a.obj)) if a.block else a.obj
                 web.write_obj(tiles, path, a.quality)
                 print(f"  OBJ -> {path}", flush=True)
+            if a.glb:
+                path = os.path.join(out, os.path.basename(a.glb)) if a.block else a.glb
+                web.write_glb(tiles, path, a.quality)
+                print(f"  glb -> {path}", flush=True)
             done[r, c] = (lat, lon, nt, count["r3d"] + count["c3m"])
     if not done:
         sys.exit("この範囲に Flyover のデータがない")
