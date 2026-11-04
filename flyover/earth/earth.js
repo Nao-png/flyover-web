@@ -925,7 +925,10 @@ function updateFlyover() {
 
 // ---------------------------------------------------------------- 毎コマ
 
-let last = performance.now(), pendingFly = 0, globeQueue = 0, updateMs = 0;
+// 読み込みだけが進んでいる間に描く間隔。HEVC の梅田（171 タイル）で、毎コマ描くと 38 秒で 81 タイル
+// しか出なかったのが、100 ms では 14 秒で全部出た（50 ms では 16 秒）
+const LOADING_FRAME_MS = 100;
+let last = performance.now(), pendingFly = 0, globeQueue = 0, updateMs = 0, loadingFrame = 0;
 globe.tileLoadProgressEvent.addEventListener(n => { globeQueue = n; dirty = true; });
 scene.preUpdate.addEventListener(() => {
   const now = performance.now(), dt = Math.min(0.1, (now - last) / 1000);
@@ -939,9 +942,12 @@ scene.preUpdate.addEventListener(() => {
   const t0 = performance.now();
   pendingFly = updateFlyover();
   updateMs = performance.now() - t0;
-  // 読み込み中（モデルや地形は描くときに処理が進む）や、動きがあるときは次のコマも描く。
-  // 地球儀は描かないと読み込みが始まらないので、最初は読み終えるまで描き続ける
-  if (anim || held.size || active > 0 || globeQueue > 0 || !globe.tilesLoaded) scene.requestRender();
+  // 動きがあるときは次のコマも描く。読み込み中（モデルや地形は描くときに処理が進む。地球儀は描かないと
+  // 読み込みが始まらないので、最初は読み終えるまで描く）も描くが、止まっているなら LOADING_FRAME_MS ごとに
+  // 間引く。毎コマ描くと GPU が埋まり、HEVC の画像の展開（GPU の専用回路）がほとんど進まなくなる
+  if (anim || held.size) scene.requestRender();
+  else if ((active > 0 || globeQueue > 0 || !globe.tilesLoaded) && !loadingFrame)
+    loadingFrame = setTimeout(() => { loadingFrame = 0; scene.requestRender(); }, LOADING_FRAME_MS);
 });
 
 // ---------------------------------------------------------------- 下の帯
