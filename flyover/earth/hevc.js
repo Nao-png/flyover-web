@@ -58,7 +58,7 @@ async function planes(frame) {
   return { w, h, y, uv };
 }
 
-// 1 つずつ順に展開する（専用回路は同時に使える数に限りがある）
+// このスレッドの中では 1 つずつ順に展開する（並べるときは earth.js がスレッドを増やす）
 let queue = Promise.resolve();
 onmessage = ({ data: { id, images } }) => {
   queue = queue.then(async () => {
