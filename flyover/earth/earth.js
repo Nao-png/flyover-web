@@ -567,7 +567,7 @@ class Tile {
     this.width = this.rect.width * 6378137 * Math.cos(C.Rectangle.center(this.rect).latitude);
     this.state = 'none';     // none | loading | ready | empty | failed
     this.model = null; this.obb = null; this.used = 0; this.wanted = 0; this.wantedAt = 0; this.touched = 0;
-    this.abort = null; this.failedAt = 0;
+    this.abort = null; this.failedAt = 0; this.pri = Infinity;
     this.mask = 0; this.clip = 0;   // 表示する 4 分の 1（0 は全部）と、モデルに今かけてある切り方
   }
   // 見えるかどうかを調べる箱（建物の高さまで含める）と、距離を測る薄い箱（地面のあたり）。
@@ -656,17 +656,37 @@ async function load(t, offscreen) {
     dirty = true;              // 選び直す
   }
 }
-const hevcWorker = hevc ? new Worker('hevc.js') : null;
-const hevcWait = new Map();
-let hevcId = 0;
-if (hevcWorker) hevcWorker.onmessage = ({ data }) => {
-  const w = hevcWait.get(data.id);
-  hevcWait.delete(data.id);
-  data.error ? w.reject(new Error(data.error)) : w.resolve(data.out);
+// 展開は作業用のスレッド HEVC_WORKERS 本に 1 タイルずつ渡し、渡す順はそのときに選ぶ（届いた順に
+// 渡すと、先に届いた画面の外のタイルや小さく見えるタイルの後ろで、見えているタイルが待たされる）。
+// 今見えているものを先に、画面で大きく見えるもの（Tile#pri が小さいもの）から。梅田（HEVC）で、見えて
+// いる範囲が出るまでが 1 本では 18 秒、2 本で 14 秒、3 本で 12 秒（6 本でも 12 秒）
+const HEVC_WORKERS = 3;
+const hevcWorkers = hevc ? Array.from({ length: HEVC_WORKERS }, () => ({ worker: new Worker('hevc.js'), job: null })) : [];
+const hevcPending = [];
+for (const w of hevcWorkers) w.worker.onmessage = ({ data }) => {
+  const job = w.job;
+  w.job = null;
+  data.error ? job.reject(new Error(data.error)) : job.resolve(data.out);
+  hevcNext();
 };
-const hevcDecode = images => new Promise((resolve, reject) => {
-  hevcWait.set(++hevcId, { resolve, reject });
-  hevcWorker.postMessage({ id: hevcId, images });
+function hevcNext() {
+  // しばらく（4 秒）要らなかったものは展開しない（読みかけを取りやめるのと同じ）
+  const now = performance.now();
+  for (let i = hevcPending.length - 1; i >= 0; i--) {
+    if (now - hevcPending[i].t.wantedAt > 4000) hevcPending.splice(i, 1)[0].reject(new DOMException('要らなくなった', 'AbortError'));
+  }
+  const rank = ({ t }) => (t.vis && t.wanted === frame ? 0 : 1e9) + t.pri;
+  for (const w of hevcWorkers) {
+    if (w.job || !hevcPending.length) continue;
+    let best = 0;
+    for (let i = 1; i < hevcPending.length; i++) if (rank(hevcPending[i]) < rank(hevcPending[best])) best = i;
+    w.job = hevcPending.splice(best, 1)[0];
+    w.worker.postMessage({ id: 0, images: w.job.images });
+  }
+}
+const hevcDecode = (t, images) => new Promise((resolve, reject) => {
+  hevcPending.push({ t, images, resolve, reject });
+  hevcNext();
 });
 
 // glb の材質の extras.hevc（flyover/glb.py の tile_glb を見よ）から、HEVC の設定とコマを番号順に取り出す
@@ -728,8 +748,9 @@ async function makeModel(t, buf, useHevc) {
     const images = glbHevc(buf);
     if (images.length) {
       try {
-        shader = hevcShader(await hevcDecode(images));
+        shader = hevcShader(await hevcDecode(t, images));
       } catch (e) {
+        if (e.name === 'AbortError') throw e;
         hevc = false;           // 以後は JPEG で受け取る
         e.retry = true;
         throw e;
@@ -816,10 +837,10 @@ function updateFlyover() {
     const dist = t => Math.max(1, Math.sqrt(t.flat().distanceSquaredTo(camPos)));
     const visible = t => cv.computeVisibility(t.box()) !== C.Intersect.OUTSIDE;
     const want = (t, d, vis) => {
-      t.wanted = frame; t.wantedAt = now;
+      t.wanted = frame; t.wantedAt = now; t.pri = d / t.width;
       if (t.state === 'failed' && now - t.failedAt > 15000) t.state = 'none';
       // 画面で大きく見えるものから。画面の外のものは後回し
-      if (t.state === 'none') queue.push({ t, vis, pri: d / t.width });
+      if (t.state === 'none') queue.push({ t, vis, pri: t.pri });
     };
     // 読み込み済みの子孫（3 段下まで）で埋め尽くせるか。必要なタイルが届くまでの代わりに使う
     // （離れたときに、手持ちの細かいタイルを隠して穴にしない）
