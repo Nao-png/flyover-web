@@ -804,11 +804,20 @@ def _k_uv_prog(res, a, F, U):
     return prog[:m]
 
 
-def _image_size(heic):
-    i = heic.find(b"ispe")
+def _image_size(image):
+    """HEIC か JPEG の (幅, 高さ)。"""
+    if image[:2] == b"\xff\xd8":         # JPEG: 大きさは SOF0〜SOF15 の区画にある（DHT、JPG、DAC を除く）
+        i = 2
+        while i + 9 < len(image) and image[i] == 0xFF:
+            if 0xC0 <= image[i + 1] <= 0xCF and image[i + 1] not in (0xC4, 0xC8, 0xCC):
+                h, w = struct.unpack_from(">HH", image, i + 5)
+                return w, h
+            i += 2 + struct.unpack_from(">H", image, i + 2)[0]
+        raise ValueError("画像の大きさが分からない")
+    i = image.find(b"ispe")
     if i < 0:
         raise ValueError("画像の大きさが分からない")
-    return struct.unpack_from(">II", heic, i + 8)
+    return struct.unpack_from(">II", image, i + 8)
 
 
 def decode_mesh(s, sizes):
@@ -1054,12 +1063,15 @@ def _image_items(data, sec, k=0):
 
 
 def texture(data, sec=None, k=0):
-    """k 枚目のテクスチャの HEIC（その画像の区画の項目の最初）。"""
+    """k 枚目のテクスチャ（その画像の区画の項目の最初）。ふつうは HEIC。古い Flyover の形を入れ直した
+    地域（パリなど）には JPEG のものがある（項目の見出し 10 バイトほどのすぐあとに FF D8 FF）。"""
     sec = sec or sections(data)
     t, s, e = _image_items(data, sec, k)[0]
     i = data.find(b"ftyp", s, e) - 4
     if i < s:
-        raise ValueError("テクスチャがない")
+        i = data.find(b"\xff\xd8\xff", s, min(e, s + 32))
+        if i < 0:
+            raise ValueError("テクスチャがない")
     return bytes(data[i:e])
 
 
@@ -1101,7 +1113,8 @@ def parse(data):
         raise ValueError("頂点か UV がタイルから大きく外れている（読み違え）")
     groups = {k: fuv[tri_atlas == k].astype(np.int32) for k in range(len(heics)) if (tri_atlas == k).any()}
     mesh = Mesh(pos[vert], uv, groups)    # v は c3m.Mesh と同じく上向き
-    return C3M(rot, trans, [Material(h, "heic", r) for h, r in zip(heics, repeat)], [mesh], splats)
+    return C3M(rot, trans, [Material(h, "jpeg" if h[:2] == b"\xff\xd8" else "heic", r) for h, r in zip(heics, repeat)],
+               [mesh], splats)
 
 
 def warm():

@@ -199,3 +199,10 @@ def test_splat_texture_is_soft_triangle():
     a = np.asarray(Image.open(BytesIO(glb._soft_triangle(32))))[..., 3]
     assert a[10, 10] > 200                  # 重心の近くは濃い
     assert a[0, 0] < 60 and a[31, 31] == 0  # 角と三角形の外は透明
+
+
+def test_image_size_reads_jpeg_and_heic():
+    # JPEG は SOF の区画（ここでは APP0 のあとの SOF0）に 高さ、幅 の順で入っている
+    jpeg = bytes([0xFF, 0xD8, 0xFF, 0xE0]) + struct.pack(">H", 4) + b"JF" + bytes([0xFF, 0xC0]) + struct.pack(">HBHH", 11, 8, 480, 512)
+    assert r3d._image_size(jpeg + bytes(8)) == (512, 480)
+    assert r3d._image_size(b"....ispe" + bytes(4) + struct.pack(">II", 928, 864)) == (928, 864)
