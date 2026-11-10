@@ -106,6 +106,7 @@ For the details, and for what makes loading fast, see [docs/how-it-works.en.md](
 | `flyover/client.py` | Requests to Apple (manifest, region selection, authentication, tile fetching) |
 | `flyover/c3m.py`, `edgebreaker.py`, `huffman.py`, `_fast.py` | Reading and decoding C3M (`_fast.py` is a faster version using numba) |
 | `flyover/r3d.py` | Reading the mesh and splats of the new Flyover (style 98, R3D) |
+| `flyover/c3mm.py` | Reads the index of the new Flyover (style 100): which height slabs of which tiles have data |
 | `flyover/glb.py`, `terrain.py`, `earth.py`, `earth/` | Server and page for the globe viewer |
 | `flyover/web.py` | Export (for the browser, OBJ, and glb) |
 | `tools/retroplasma-2026.patch` | Fixes for running the Go version against today's Apple servers (for the comparison) |

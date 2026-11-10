@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import flyover  # noqa: E402
 from flyover import r3d, web  # noqa: E402
-from flyover.earth import fetch_heights, parse_heights  # noqa: E402
+from flyover.earth import fetch_heights, fetch_r3d, parse_heights  # noqa: E402
 
 
 def tile_lat_lon(x, y, z):
@@ -78,7 +78,7 @@ def main():
         if region is None:
             return xy, None, [], 0
         if a.r3d:
-            raws = fetch_heights(z, lambda hs: [client.r3d_tile_cached(region, x, y, z, h) for h in hs], r3d=True)
+            raws = fetch_r3d(client, region, x, y, z, lambda hs, one: [one(h) for h in hs])
             if any(raws):
                 tiles, failed = cpu.submit(parse_heights, raws, r3d.parse).result()
                 if not failed:
