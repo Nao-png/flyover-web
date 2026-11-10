@@ -16,6 +16,7 @@
 
 iOS 27 の新しい Flyover（style 98、R3D）は、iOS 27 として要求したマニフェストにだけ載っている。
 タイルの番号の付け方と高さ区分は C3M と同じで、v には地域の版ではなく style 98 の版を付ける。
+どのタイルのどの高さ区分にデータがあるかは、目録（style 100、flyover/c3mm.py）で調べる。
 """
 import asyncio
 import base64
@@ -33,6 +34,8 @@ from urllib.parse import quote, urlparse
 import requests
 import requests.adapters
 
+from . import c3mm
+
 MANIFEST_URL = ("https://gspe35-ssl.ls.apple.com/geo_manifest/dynamic/config?application=geod"
                 "&application_version=1&country_code=US&hardware=MacBookPro11,2&os=osx"
                 "&os_build=20B29&os_version=11.0.1")
@@ -41,6 +44,7 @@ TOKEN_P1 = "4cjLaD4jGRwlQ9U"      # GeoServices の GEOURLAuthenticationGenerate
 STYLE_SATELLITE = 7               # 衛星画像（JPEG、256 px のタイル）
 STYLE_C3M = 15
 STYLE_R3D = 98                    # iOS 27 の新しい Flyover（flyover/r3d.py）
+STYLE_R3D_INDEX = 100             # その目録（flyover/c3mm.py）。ズーム 9 と 13 のタイルで要求する
 MANIFEST_URL_IOS27 = MANIFEST_URL.replace(
     "hardware=MacBookPro11,2&os=osx&os_build=20B29&os_version=11.0.1",
     "hardware=iPhone18,1&os=ios&os_build=24A335&os_version=27.0")
@@ -260,6 +264,8 @@ class Client:
         self.regions = parse_altitude(self._cached(name, base + "xml/" + name))
         self.c3m_url = self.manifest.styles[STYLE_C3M]
         self._r3d = None                        # (URL, 版)。r3d_source が初めて呼ばれたときに決める
+        self._r3d_index = None                  # 目録の (URL, 版)
+        self._indexes, self._index_lock, self._index_locks = {}, threading.Lock(), {}   # 読んだ目録（新しく使った順）
         self._by_tile = {}
         for r in self.regions:
             m = re.fullmatch(r"Reg_z9_(\d+)_(\d+)", r["name"] or "")
@@ -344,7 +350,51 @@ class Client:
         if self._r3d is None:
             m = Manifest(self._cached("ResourceManifest-ios27.pbd", MANIFEST_URL_IOS27, max_age=3600))
             self._r3d = (m.styles[STYLE_R3D], m.versions[STYLE_R3D]) if STYLE_R3D in m.styles else ()
+            self._r3d_index = ((m.styles[STYLE_R3D_INDEX], m.versions[STYLE_R3D_INDEX])
+                               if STYLE_R3D_INDEX in m.styles else ())
         return self._r3d or None
+
+    def r3d_heights(self, x, y, z):
+        """新しい Flyover のタイルの、データのある高さ区分の並び（なければ空）。目録（flyover/c3mm.py）
+        から調べるので、タイルを試しに要求しなくて済む。目録が取れないか読めなければ None。"""
+        if not self.r3d_source() or not self._r3d_index or not 13 <= z <= 20:
+            return None
+        iz = 9 if z <= 16 else 13
+        key = (iz, x >> (z - iz), y >> (z - iz))
+        with self._index_lock:
+            lock = self._index_locks.setdefault(key, threading.Lock())
+        with lock:                              # 同じ目録を 2 度取らない（別の目録は待たせない）
+            with self._index_lock:
+                known = key in self._indexes
+                index = self._indexes.pop(key, None)
+            if not known:
+                try:
+                    index = self._load_index(*key)
+                except Exception as e:
+                    print(f"  目録 {key}: {e}", flush=True)
+                    return None
+            with self._index_lock:
+                self._indexes[key] = index
+                while len(self._indexes) > 16:
+                    del self._indexes[next(iter(self._indexes))]
+        return index.heights.get((z, x, y), []) if index else []
+
+    def _load_index(self, z, x, y):
+        """目録 1 枚（cache/style100/<版>/ に保存する）。データのない所は None。"""
+        url, v = self._r3d_index
+        path = os.path.join(self.cache_dir, f"style{STYLE_R3D_INDEX}", str(v), str(z), f"{x}_{y}.c3mm")
+        if os.path.exists(path):
+            b = open(path, "rb").read()
+        else:
+            r = self._get(f"{url}?style={STYLE_R3D_INDEX}&v={v}&x={x}&y={y}&z={z}")
+            if r.status_code in (204, 404):
+                b = b""
+            else:
+                r.raise_for_status()
+                b = r.content
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            _write(path, b)
+        return c3mm.Index(b) if b else None
 
     def r3d_tile(self, region, x, y, z, h):
         """R3D（style 98）のバイト列。データのないタイルは None。"""

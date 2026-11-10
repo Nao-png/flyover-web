@@ -71,6 +71,19 @@ def fetch_heights(z, get_many, r3d=False):
             n = 4
 
 
+def fetch_r3d(client, region, x, y, z, get_many):
+    """タイルの高さ区分ごとの R3D の並び。目録（Client.r3d_heights）にある区分だけを要求する。目録が
+    使えなければ、fetch_heights で探す。get_many(区分の番号の並び, 1 つ取る関数) は、取ったものの並びを返す。"""
+    get = lambda h: client.r3d_tile_cached(region, x, y, z, h)
+    hs = client.r3d_heights(x, y, z)
+    if hs is None:
+        return fetch_heights(z, lambda hs: get_many(hs, get), r3d=True)
+    raws = [None] * (hs[-1] + 1 if hs else 0)
+    for h, b in zip(hs, get_many(hs, get)):
+        raws[h] = b
+    return raws
+
+
 def parse_heights(raws, parse=c3m.parse):
     """高さ区分ごとのバイト列を parse で読む（別のプロセスで動かす用）。([(区分, 読んだもの)], [(区分, 読めなかった理由)])。
     読めない区分は飛ばして理由を返す（プロセスの間の受け渡しの失敗と区別できるように、例外にしない）。"""
@@ -182,8 +195,7 @@ class Earth:
             t0 = time.perf_counter()
             out = None
             if self.r3d and z >= R3D_MIN_ZOOM:
-                raws = fetch_heights(z, lambda hs: self.map(
-                    lambda k: self.client.r3d_tile_cached(region, x, y, z, k), hs), r3d=True)
+                raws = fetch_r3d(self.client, region, x, y, z, lambda hs, get: self.map(get, hs))
                 t1 = time.perf_counter()
                 # R3D があれば C3M は取らない。R3D の取得が時間切れなら、ここで例外になって
                 # 保存せずに 502 を返し、ビューアがあとで取り直す

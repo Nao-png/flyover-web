@@ -106,6 +106,7 @@ python scripts/serve.py out                                          # http://lo
 | `flyover/client.py` | Apple への要求（設定ファイル、地域の選択、認証、タイルの取得） |
 | `flyover/c3m.py`、`edgebreaker.py`、`huffman.py`、`_fast.py` | C3M の読み取りと展開（`_fast.py` は numba で速くした版） |
 | `flyover/r3d.py` | 新しい Flyover（style 98、R3D）のメッシュとスプラットの読み取り |
+| `flyover/c3mm.py` | 新しい Flyover の目録（style 100）の読み取り。どのタイルのどの高さ区分にデータがあるか |
 | `flyover/glb.py`、`terrain.py`、`earth.py`、`earth/` | 地球儀ビューアのサーバーと画面 |
 | `flyover/web.py` | 書き出し（ブラウザ用と OBJ と glb） |
 | `tools/retroplasma-2026.patch` | Go 版を今の Apple のサーバーで動かすための修正（照合用） |
