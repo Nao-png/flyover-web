@@ -12,7 +12,8 @@
   空の応答を飛ばす
 
 地域は、名前 Reg_z9_X_Y が示すズーム 9 のタイルで選ぶ（元のツールは中心がいちばん近い
-地域を選んでいて、地域の重なる東京などでは外れる）。
+地域を選んでいて、地域の重なる東京などでは外れる）。名前がタイル番号でない地域（パリなど）は、
+中心と半径から、かかるズーム 9 のタイルに割り当てる。
 
 iOS 27 の新しい Flyover（style 98、R3D）は、iOS 27 として要求したマニフェストにだけ載っている。
 タイルの番号の付け方と高さ区分は C3M と同じで、v には地域の版ではなく style 98 の版を付ける。
@@ -271,6 +272,12 @@ class Client:
             m = re.fullmatch(r"Reg_z9_(\d+)_(\d+)", r["name"] or "")
             if m:
                 self._by_tile[(int(m[1]), int(m[2]))] = r
+        # 名前がタイル番号でない地域（パリ、シアトルなど 53 か所）は、中心から半径 [m] の中にかかる
+        # ズーム 9 のタイルに割り当てる（タイル番号の名前の地域があるタイルはそちらのまま）
+        for r in self.regions:
+            if not re.fullmatch(r"Reg_z9_(\d+)_(\d+)", r["name"] or ""):
+                for k in _tiles_within(r["lat"], r["lon"], r["radius"], 9):
+                    self._by_tile.setdefault(k, r)
 
     def _cached(self, name, url, max_age=None):
         path = os.path.join(self.cache_dir, name)
@@ -471,6 +478,26 @@ def parse_altitude(raw):
                     "version": int(t.get("version", 0)), "radius": float(t.get("radius", 0)),
                     "lat": math.degrees(float(t.get("latitude"))),
                     "lon": math.degrees(float(t.get("longitude")))})
+    return out
+
+
+def _tiles_within(lat, lon, radius, z):
+    """中心 (lat, lon) から radius [m] の円にかかる、ズーム z のタイル番号 (x, y) の並び。"""
+    n = 1 << z
+    mlat = 111320.0
+    mlon = mlat * math.cos(math.radians(lat))
+    edge = lambda y: math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))   # タイルの北の端の緯度
+    cx, cy = tile_xy(lat, lon, z)
+    out, k = [], 1
+    while 360 / n * mlon * (k - 1) <= radius:
+        k += 1
+    for x in range(cx - k, cx + k + 1):
+        for y in range(max(cy - k, 0), min(cy + k, n - 1) + 1):
+            w, e = x / n * 360 - 180, (x + 1) / n * 360 - 180
+            dx = max(w - lon, 0, lon - e) * mlon              # 円の中心からタイルのいちばん近い点まで
+            dy = max(edge(y + 1) - lat, 0, lat - edge(y)) * mlat
+            if math.hypot(dx, dy) <= radius:
+                out.append((x % n, y))
     return out
 
 

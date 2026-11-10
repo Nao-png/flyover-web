@@ -107,3 +107,13 @@ def test_auth_url_decrypts_to_path_and_session(monkeypatch):
 def test_parse_rejects_other_data():
     with pytest.raises(ValueError):
         parse(b"not a c3m file" * 20)
+
+
+def test_tiles_within_radius():
+    from flyover.client import _tiles_within, tile_xy
+    # パリ（半径 41 km）: 中心のタイルと、円がかかる隣のタイル。遠いタイルは入らない
+    got = _tiles_within(48.8197, 2.4155, 41415.0, 9)
+    assert tile_xy(48.8197, 2.4155, 9) in got
+    assert tile_xy(48.8584, 2.2945, 9) in got
+    assert tile_xy(50.0, 2.4155, 9) not in got
+    assert len(got) == len(set(got)) <= 9
