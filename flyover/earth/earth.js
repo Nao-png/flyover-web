@@ -701,6 +701,292 @@ function glbHevc(buf) {
     .map(h => ({ config: part(h.config), data: part(h.data) }));
 }
 
+// ?season=sakura（桜）か ?season=momiji（紅葉）で、木（緑のスプラット）の色を変える。芝生などはメッシュの写真
+// なので、スプラットだけを変えれば、おもに木が変わる（新宿御苑で、緑のスプラットのうち地面から 3 m 未満は 4%）。
+// メッシュの写真は変えない。木の一部がメッシュでできている所（大手町の街路樹など）では、メッシュの緑が残るので、
+// スプラットも変えずに木ごと緑のままにする（markTreeSplats）。古い Flyover を入れ直した地域（パリなど）には
+// スプラットがないので、木も変わらない。色のむらは地球の座標から作るなめらかな雑音で決める（タイルの境目や
+// 細かさが変わっても同じ。升目ごとにばらばらの色にすると、森で市松模様に見える）
+const SEASONS = { sakura: 0, momiji: 1, check: 2 };   // check: スプラットの見分け方を色で見る（確かめ用）
+const season = cfg.r3d ? SEASONS[new URLSearchParams(location.search).get('season')] : undefined;
+const seasonGlsl = season === undefined ? '' : `
+float seasonHash(vec3 p) {
+  p = mod(p, 1024.0);              // 大きな数のまま sin に入れると精度が落ちて模様が崩れる
+  return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+}
+// 升目の角の値をなめらかにつないだ雑音（0〜1）
+float seasonNoise(vec3 p) {
+  vec3 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(seasonHash(i), seasonHash(i + vec3(1, 0, 0)), f.x),
+                 mix(seasonHash(i + vec3(0, 1, 0)), seasonHash(i + vec3(1, 1, 0)), f.x), f.y),
+             mix(mix(seasonHash(i + vec3(0, 0, 1)), seasonHash(i + vec3(1, 0, 1)), f.x),
+                 mix(seasonHash(i + vec3(0, 1, 1)), seasonHash(i + vec3(1, 1, 1)), f.x), f.y), f.z);
+}
+// 頂点の色の最下位ビットの印（markTreeSplats）
+float seasonBit(float v) {
+  return mod(floor(v * 65535.0 + 0.5), 2.0);
+}
+void seasonTint(inout czm_modelMaterial material, vec3 pw, vec4 color) {
+  vec3 c = czm_linearToSrgb(color.rgb);
+  bool leafy = seasonBit(color.r) > 0.5, many = seasonBit(color.g) > 0.5, keep = seasonBit(color.b) > 0.5;
+  if (${season} == 2) {            // 緑: 緑のまま、赤紫: 葉の形で茂みの中、黄: 葉の形でまばら、水色: 細長い
+    if (color != vec4(1.0))
+      material.diffuse = keep ? vec3(0.0, 1.0, 0.2) : !leafy ? vec3(0.0, 0.8, 1.0) : many ? vec3(1.0, 0.0, 1.0) : vec3(1.0, 0.9, 0.0);
+    return;
+  }
+  if (keep || !leafy) return;      // 緑のメッシュのある木（markTreeSplats）と、葉の形でないもの
+  float mx = max(c.r, max(c.g, c.b)), d = mx - min(c.r, min(c.g, c.b));
+  if (d < 0.012) return;           // ほぼ灰色（暗いスプラットの色相はあてにならない）
+  float h = mx == c.g ? 60.0 * ((c.b - c.r) / d + 2.0)
+          : mx == c.r ? 60.0 * mod((c.g - c.b) / d, 6.0) : 60.0 * ((c.r - c.g) / d + 4.0);
+  // 葉の形のスプラットの緑だけ。境目はなだらかに。建物の縁のスプラットにも、白っぽい緑や銅ぶきの屋根の青緑の
+  // ものがあり、色では葉と分けられないので、形とまわりの数で分ける（宮内庁庁舎と大手町の街路樹で確かめた）。
+  // 茂みの中のものは広く（色相 45〜195°。青緑や淡い緑の葉もある）、まばらなものは、はっきりした葉の緑
+  // （色相 55〜150°で、ある程度あざやかなもの）だけ変える。木の内側の暗い緑は、色の差は小さくても彩度はあるので変わる
+  float w = many ? smoothstep(38.0, 50.0, h) * (1.0 - smoothstep(190.0, 205.0, h)) * smoothstep(0.03, 0.08, d / mx)
+                 : smoothstep(48.0, 62.0, h) * (1.0 - smoothstep(145.0, 160.0, h)) * smoothstep(0.10, 0.18, d / mx);
+  w *= smoothstep(0.012, 0.025, d);
+  if (w <= 0.0) return;
+  float L = dot(c, vec3(0.299, 0.587, 0.114));
+  // t: 木のまとまりくらい（十数 m）でゆっくり変わる値。f: 枝くらい（2〜3 m）で変わる値。どちらも 0〜1 に広げる
+  float t = clamp((0.7 * seasonNoise(pw / 14.0) + 0.3 * seasonNoise(pw / 5.0) - 0.5) * 2.4 + 0.5, 0.0, 1.0);
+  float f = clamp((seasonNoise(pw / 2.5) - 0.5) * 2.0 + 0.5, 0.0, 1.0);
+  vec3 col;
+  if (${season} == 0) {
+    // 桜: 薄いピンクから白。明るさは元の明るさに比例させる（陰を持ち上げると、木の形が平らになり、
+    // スプラットの縁が白くけば立って見える）。花は葉より明るいので全体は少し明るく
+    vec3 pink = mix(vec3(0.96, 0.66, 0.76), vec3(1.0, 0.90, 0.93), clamp(0.6 * t + 0.4 * f, 0.0, 1.0));
+    col = pink * clamp(L * 2.8, 0.0, 1.15);
+  } else {
+    // 紅葉: 木ごとに赤・橙・黄色。色合いだけを変え、明るさは画素ごとに元の明るさに比例させる（明るさに
+    // 下限を付けると、木の間の陰まで橙になって平らに見える）。黄色は元の葉の明るさのままだと濁るので明るめに
+    vec3 red = vec3(0.78, 0.13, 0.07), orange = vec3(0.92, 0.42, 0.08), yellow = vec3(0.93, 0.74, 0.16);
+    float k = clamp(t + 0.25 * (f - 0.5), 0.0, 1.0);
+    col = k < 0.5 ? mix(red, orange, k * 2.0) : mix(orange, yellow, k * 2.0 - 1.0);
+    col *= mix(1.05, 1.7, k) * L / dot(col, vec3(0.299, 0.587, 0.114));
+  }
+  material.diffuse = czm_srgbToLinear(mix(c, clamp(col, 0.0, 1.0), w));
+}`;
+
+// メッシュの材質の写真の色を見て、(u, v) が葉の緑かを返す関数を作る（写真がなければ null）。水面などの
+// くり返して貼る画像は見ない。緑の決め方: 色相 50〜165°（銅ぶきの屋根の青緑は外す）、彩度 0.15 以上、
+// 色の差 0.05 以上
+function isLeafGreen(r, g, b) {
+  const mx = Math.max(r, g, b), d = mx - Math.min(r, g, b);
+  if (d < 0.05 * 255 || d < 0.15 * mx) return false;
+  const h = mx === g ? 60 * ((b - r) / d + 2) : mx === r ? 60 * (((g - b) / d + 6) % 6) : 60 * ((r - g) / d + 4);
+  return h >= 50 && h <= 165;
+}
+async function meshSampler(g, buf, jl, m, planes) {
+  const hv = m.extras && m.extras.hevc;
+  if (hv) {
+    const p = planes && planes[hv.slab];
+    if (!p) return null;
+    const cw = (p.w + 1) >> 1;
+    return (u, v) => {
+      const x = Math.min(p.w - 1, Math.max(0, Math.floor(u * p.w))), y = Math.min(p.h - 1, Math.max(0, Math.floor(v * p.h)));
+      const Y = p.y[y * p.w + x], o = ((y >> 1) * cw + (x >> 1)) * 2, U = p.uv[o] - 128, V = p.uv[o + 1] - 128;
+      return isLeafGreen(Y + 1.402 * V, Y - 0.344136 * U - 0.714136 * V, Y + 1.772 * U);
+    };
+  }
+  const bt = m.pbrMetallicRoughness && m.pbrMetallicRoughness.baseColorTexture;
+  if (!bt || m.alphaMode === 'BLEND') return null;            // スプラットの材質
+  const tex = g.textures[bt.index];
+  if (tex.sampler === 1) return null;                         // くり返して貼る画像（水面など）
+  const im = g.images[tex.source], bv = g.bufferViews[im.bufferView];
+  const S = 256, o = 28 + jl + (bv.byteOffset || 0);
+  const bmp = await createImageBitmap(new Blob([buf.subarray(o, o + bv.byteLength)], { type: im.mimeType }),
+                                      { resizeWidth: S, resizeHeight: S, resizeQuality: 'low' });
+  const cv = new OffscreenCanvas(S, S), cx = cv.getContext('2d', { willReadFrequently: true });
+  cx.drawImage(bmp, 0, 0);
+  bmp.close();
+  const px = cx.getImageData(0, 0, S, S).data;
+  return (u, v) => {
+    const i = 4 * (Math.min(S - 1, Math.max(0, Math.floor(v * S))) * S + Math.min(S - 1, Math.max(0, Math.floor(u * S))));
+    return isLeafGreen(px[i], px[i + 1], px[i + 2]);
+  };
+}
+
+// スプラットごとに 3 つの印を、頂点の色の最下位ビットに入れる（色は 65535 分の 1 しか変わらない）。glb を
+// Cesium に渡す前に、buf をその場で書き換える
+// - 赤: 葉らしい形（詰まった三角形）か。建物の縁や手すりのスプラットは細長い線（いちばん長い辺の 2 乗 ÷ 面積の
+//   中央値が宮内庁の屋根の青緑で 92）、葉は詰まった三角形（大手町の街路樹で 4〜5、新宿御苑で 4 前後。
+//   正三角形で 2.3）なので、12 で分ける
+// - 緑: まわりにスプラットが多い（茂みの中）か。木は数十〜百数十の塊になる。建物の縁は線なので少ない
+//   （詰まった形のものでも）
+// - 青: 緑のままにするか。木の一部がメッシュ（写真を貼った形）でできている所（大手町の街路樹など）では、
+//   メッシュの緑は変えない（木のメッシュの写真まで塗ると、そばのビルの壁まで色が付いた）ので、スプラットも
+//   変えずに木ごと緑のままにする。写真が緑で地面より 2.5 m 以上高いメッシュのすぐそばのスプラットと、それを
+//   多く（3 割以上）含む葉のスプラットの塊（升目でつながったもの）が対象。写真の色は、HEVC の面（planes）か、
+//   glb の中の JPEG を縮めて読む。細かいタイル（fine、ズーム 19 以上）だけで見る。粗いタイルでは森の樹冠も
+//   メッシュになっているが、大きなスプラットがそれを覆うので、変えても緑は見えない（緑のままにすると、遠くから
+//   見た森がまるごと緑になる）。そのため、メッシュのある木は、近づくと緑に変わる
+async function markTreeSplats(buf, planes, fine) {
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const jl = dv.getUint32(12, true);
+  const g = JSON.parse(new TextDecoder().decode(buf.subarray(20, 20 + jl)));
+  const prims = g.meshes[0].primitives;
+  const splat = prims.find(p => p.attributes.COLOR_0 !== undefined);
+  if (!splat) return;
+  const start = i => {
+    const a = g.accessors[i];
+    return 28 + jl + (g.bufferViews[a.bufferView].byteOffset || 0) + (a.byteOffset || 0);
+  };
+  const po = start(splat.attributes.POSITION), co = start(splat.attributes.COLOR_0);
+  const nv = g.accessors[splat.attributes.POSITION].count, n = Math.floor(nv / 3);
+  const X = new Float32Array(3 * nv);                 // 頂点の位置（int16 の刻み）
+  for (let j = 0; j < nv; j++) for (let e = 0; e < 3; e++) X[3 * j + e] = dv.getInt16(po + 8 * j + 2 * e, true);
+  // 形（いちばん長い辺の 2 乗 ÷ 面積）と中心
+  const edge = new Float32Array(n), cx = new Float32Array(3 * n), leafy = new Uint8Array(n);
+  for (let k = 0; k < n; k++) {
+    const o = 9 * k;
+    const ax = X[o + 3] - X[o], ay = X[o + 4] - X[o + 1], az = X[o + 5] - X[o + 2];
+    const bx = X[o + 6] - X[o], by = X[o + 7] - X[o + 1], bz = X[o + 8] - X[o + 2];
+    const cxx = bx - ax, cy = by - ay, cz = bz - az;
+    const L2 = Math.max(ax * ax + ay * ay + az * az, bx * bx + by * by + bz * bz, cxx * cxx + cy * cy + cz * cz);
+    const cr = Math.hypot(ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx);   // 面積の 2 倍
+    leafy[k] = cr > 0 && 2 * L2 / cr < 12 ? 1 : 0;
+    edge[k] = Math.sqrt(L2);
+    for (let e = 0; e < 3; e++) cx[3 * k + e] = (X[o + e] + X[o + 3 + e] + X[o + 6 + e]) / 3;
+  }
+  // まわりの数: いちばん長い辺の中央値 × 1.5 を升目にして、中心が入る升目を数え、近い角を囲む 2 × 2 × 2 升の
+  // 合計を見る
+  const cell = 1.5 * (n ? edge.slice().sort()[n >> 1] : 1) || 1;
+  const ckey = (x, y, z) => x + 4096 * (y + 4096 * z);
+  const floorKey = k => ckey(Math.floor(cx[3 * k] / cell) + 2048, Math.floor(cx[3 * k + 1] / cell) + 2048,
+                             Math.floor(cx[3 * k + 2] / cell) + 2048);
+  const cellOf = new Int32Array(3 * n);                // 近い角
+  const counts = new Map();
+  for (let k = 0; k < n; k++) {
+    for (let e = 0; e < 3; e++) cellOf[3 * k + e] = Math.round(cx[3 * k + e] / cell) + 2048;
+    const kk = floorKey(k);
+    counts.set(kk, (counts.get(kk) || 0) + 1);
+  }
+  const around = (set, k) => {
+    let sum = 0;
+    for (let i = 0; i < 8; i++) {
+      const kk = ckey(cellOf[3 * k] - 1 + (i & 1), cellOf[3 * k + 1] - 1 + (i >> 1 & 1), cellOf[3 * k + 2] - 1 + (i >> 2));
+      sum += set instanceof Set ? (set.has(kk) ? 1 : 0) : set.get(kk) || 0;
+    }
+    return sum;
+  };
+
+  // 写真が緑で、地面より 2.5 m 以上高いメッシュの升目。地面の写真にも上から見た木が写っているので、
+  // 高さを見ないと、木の下の地面がどこでも緑になる（新宿御苑がまるごと緑のままになった）。地面の高さは、
+  // 上向き（タイルの中心の向き）に測ったメッシュの頂点の高さの、まわり 3 × 3 の柱（1 本 8 m 以上）の最小
+  const green = new Set();
+  if (fine) {
+    const T = g.nodes[0].translation || [0, 0, 1], step = (g.nodes[0].scale || [1])[0];
+    const up = T.map(x => x / Math.hypot(...T));
+    const ax1 = Math.abs(up[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
+    const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    const ev0 = cross(up, ax1), ev = ev0.map(x => x / Math.hypot(...ev0)), nvv = cross(up, ev);
+    const col = Math.max(8 / step, 2 * cell), rise = 2.5 / step;
+    const dot = (a, x, y, z) => a[0] * x + a[1] * y + a[2] * z;
+    const colKey = (x, y, z) => (Math.floor(dot(ev, x, y, z) / col) + 2048) * 4096 + Math.floor(dot(nvv, x, y, z) / col) + 2048;
+    const meshes = prims.filter(p => p !== splat && p.indices !== undefined);
+    const ground = new Map();
+    for (const p of meshes) {
+      const pp = start(p.attributes.POSITION), cnt = g.accessors[p.attributes.POSITION].count;
+      for (let j = 0; j < cnt; j++) {
+        const x = dv.getInt16(pp + 8 * j, true), y = dv.getInt16(pp + 8 * j + 2, true), z = dv.getInt16(pp + 8 * j + 4, true);
+        const k = colKey(x, y, z), h = dot(up, x, y, z);
+        if (!(ground.get(k) <= h)) ground.set(k, h);
+      }
+    }
+    const groundAt = (x, y, z) => {
+      const k = colKey(x, y, z);
+      let lo = Infinity;
+      for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) {
+        const h = ground.get(k + a * 4096 + b);
+        if (h < lo) lo = h;
+      }
+      return lo;
+    };
+    const samplers = await Promise.all(g.materials.map(m => meshSampler(g, buf, jl, m, planes)));
+    for (const p of meshes) {
+      const sample = samplers[p.material];
+      if (!sample) continue;
+      const pp = start(p.attributes.POSITION), ip = start(p.indices), uo = start(p.attributes.TEXCOORD_0);
+      const ia = g.accessors[p.indices], ua = g.accessors[p.attributes.TEXCOORD_0];
+      const big = ia.componentType === 5125, uf = ua.componentType === 5126;
+      const pos = (j, e) => dv.getInt16(pp + 8 * j + 2 * e, true);
+      const uv = (j, e) => uf ? dv.getFloat32(uo + 8 * j + 4 * e, true) : dv.getUint16(uo + 4 * j + 2 * e, true) / 65535;
+      const v = [0, 0, 0];
+      for (let q = 0; q + 2 < ia.count; q += 3) {
+        for (let m = 0; m < 3; m++) v[m] = big ? dv.getUint32(ip + 4 * (q + m), true) : dv.getUint16(ip + 2 * (q + m), true);
+        let L = 0;
+        for (let m = 0; m < 3; m++) {
+          const a = v[m], b = v[(m + 1) % 3];
+          L = Math.max(L, Math.hypot(pos(b, 0) - pos(a, 0), pos(b, 1) - pos(a, 1), pos(b, 2) - pos(a, 2)));
+        }
+        const ns = Math.min(Math.ceil(L / cell), 24) || 1;
+        for (let i = 0; i <= ns; i++) for (let j = 0; j <= ns - i; j++) {
+          const w1 = (i + 1 / 3) / (ns + 1), w2 = (j + 1 / 3) / (ns + 1), w0 = 1 - w1 - w2;
+          if (!sample(w0 * uv(v[0], 0) + w1 * uv(v[1], 0) + w2 * uv(v[2], 0),
+                      w0 * uv(v[0], 1) + w1 * uv(v[1], 1) + w2 * uv(v[2], 1))) continue;
+          const P3 = [0, 1, 2].map(e => w0 * pos(v[0], e) + w1 * pos(v[1], e) + w2 * pos(v[2], e));
+          if (dot(up, ...P3) - groundAt(...P3) < rise) continue;
+          green.add(ckey(...P3.map(x => Math.floor(x / cell) + 2048)));
+        }
+      }
+    }
+  }
+  // 葉のスプラットの塊（升目が隣り合うものをつなぐ）ごとに、緑のメッシュのそばのものの割合を見る
+  const keep = new Uint8Array(n);
+  if (green.size) {
+    const near = new Uint8Array(n);
+    for (let k = 0; k < n; k++) near[k] = around(green, k) > 0 ? 1 : 0;
+    const parent = new Map();
+    const find = a => {
+      while (parent.get(a) !== a) { const b = parent.get(parent.get(a)); parent.set(a, b); a = b; }
+      return a;
+    };
+    for (let k = 0; k < n; k++) if (leafy[k]) parent.set(floorKey(k), floorKey(k));
+    for (const a of [...parent.keys()]) {
+      const x = a % 4096, y = Math.floor(a / 4096) % 4096, z = Math.floor(a / 4096 / 4096);
+      for (let d = 0; d < 27; d++) {
+        const b = ckey(x + d % 3 - 1, y + Math.floor(d / 3) % 3 - 1, z + Math.floor(d / 9) - 1);
+        if (b > a && parent.has(b)) {
+          const ra = find(a), rb = find(b);
+          if (ra !== rb) parent.set(ra, rb);
+        }
+      }
+    }
+    const tot = new Map(), hit = new Map();
+    for (let k = 0; k < n; k++) if (leafy[k]) {
+      const r = find(floorKey(k));
+      tot.set(r, (tot.get(r) || 0) + 1);
+      if (near[k]) hit.set(r, (hit.get(r) || 0) + 1);
+    }
+    for (let k = 0; k < n; k++) {
+      if (near[k]) { keep[k] = 1; continue; }
+      if (!leafy[k]) continue;
+      const r = find(floorKey(k));
+      keep[k] = (hit.get(r) || 0) >= 0.3 * tot.get(r) ? 1 : 0;
+    }
+  }
+  for (let k = 0; k < n; k++) {
+    const many = around(counts, k) >= 60 ? 1 : 0;
+    for (let m = 0; m < 3; m++) {
+      const o = co + 8 * (3 * k + m);
+      dv.setUint16(o, (dv.getUint16(o, true) & ~1) | leafy[k], true);
+      dv.setUint16(o + 2, (dv.getUint16(o + 2, true) & ~1) | many, true);
+      dv.setUint16(o + 4, (dv.getUint16(o + 4, true) & ~1) | keep[k], true);
+    }
+  }
+}
+
+// 季節の色だけのシェーダー（HEVC でない glb）。頂点の色があるのはスプラットだけで、メッシュには Cesium が白を
+// 入れるので、写真（パリのような JPEG のテクスチャも）は変わらない
+function seasonShader() {
+  return new C.CustomShader({ fragmentShaderText: `${seasonGlsl}
+void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
+  seasonTint(material, fsInput.attributes.positionWC, fsInput.attributes.color_0);
+}` });
+}
+
 // HEVC を展開した Y と UV の面を貼るシェーダー。どの面かは頂点の属性 _SLAB（slab）で選ぶ（HEVC でない
 // 材質（スプラットなど）は 255 で、そのまま）。テクスチャは元の大きさのまま（WebGL2 では、配列から作る
 // テクスチャは 2 のべき乗に広げられない）
@@ -718,9 +1004,10 @@ function hevcShader(planes) {
     uniforms['u_uv' + i] = tex(p.uv, (p.w + 1) >> 1, (p.h + 1) >> 1, C.PixelFormat.LUMINANCE_ALPHA);
     pick += `${i ? 'else ' : ''}if (s == ${i}) { y = textureGrad(u_y${i}, st, dx, dy).r; c = textureGrad(u_uv${i}, st, dx, dy).ra; }\n`;
   });
-  return new C.CustomShader({ uniforms, fragmentShaderText: `
+  return new C.CustomShader({ uniforms, fragmentShaderText: `${seasonGlsl}
 void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
   int s = int(fsInput.attributes.slab + 0.5);
+  ${seasonGlsl ? 'if (s == 255) { seasonTint(material, fsInput.attributes.positionWC, fsInput.attributes.color_0); return; }' : ''}
   if (s >= ${planes.length}) return;
   vec2 st = fsInput.attributes.texCoord_0, dx = dFdx(st), dy = dFdy(st);
   float y = 0.0;
@@ -743,12 +1030,12 @@ function releasePlanes(t) {
 
 const NO_IBL = new C.ImageBasedLighting({ imageBasedLightingFactor: new C.Cartesian2(0, 0) });
 async function makeModel(t, buf, useHevc) {
-  let shader;
+  let shader, planes = null;
   if (useHevc) {
     const images = glbHevc(buf);
     if (images.length) {
       try {
-        shader = hevcShader(await hevcDecode(t, images));
+        planes = await hevcDecode(t, images);
       } catch (e) {
         if (e.name === 'AbortError') throw e;
         hevc = false;           // 以後は JPEG で受け取る
@@ -757,6 +1044,15 @@ async function makeModel(t, buf, useHevc) {
       }
     }
   }
+  if (seasonGlsl) {
+    try {
+      await markTreeSplats(buf, planes, t.z >= 19);
+    } catch (e) {
+      console.warn('季節の色の印', t.z, t.x, t.y, e);
+    }
+  }
+  if (planes) shader = hevcShader(planes);
+  else if (seasonGlsl) shader = useHevc ? hevcShader([]) : seasonShader();   // スプラットだけのタイルなど
   let model;
   try {
     model = await C.Model.fromGltfAsync({
