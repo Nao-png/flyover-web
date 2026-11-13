@@ -30,7 +30,7 @@ python scripts/earth.py
 
 ブラウザで http://localhost:8000/ を開きます。ポートを変えるときは `python scripts/earth.py 8080` のように指定します。
 
-iOS 27 の新しい Flyover（style 98）で見るときは `python scripts/earth.py --r3d` で起動します。新しい Flyover のあるところはすべてのズームでそれを使い、ないタイルだけ今までのもので表示します（[仕組み](docs/how-it-works.md#新しい-flyoverstyle-98)）。URL に `?season=sakura` を付けると木が桜に、`?season=momiji` で紅葉になります（木のスプラットの緑だけを塗り替える。木の一部がメッシュ（写真を貼った形）でできている所では、近くで見るとその木は丸ごと緑のままにし、古い Flyover を入れ直した地域（パリなど）の木は写真なので変わりません）。
+iOS 27 の新しい Flyover（style 98）で見るときは `python scripts/earth.py --r3d` で起動します。新しい Flyover のあるところはすべてのズームでそれを使い、ないタイルだけ今までのもので表示します（[仕組み](docs/how-it-works.md#新しい-flyoverstyle-98)）。URL に `?season=sakura` を付けると木が桜に、`?season=momiji` で紅葉になります（木のスプラットの緑だけを塗り替える。木の一部がメッシュ（写真を貼った形）でできている所では、近くで見るとその木は丸ごと緑のままにし、古い Flyover を入れ直した地域（パリなど）の木は写真なので変わりません）。`?light=morning`（朝）・`evening`（夕方）・`cloudy`（曇り）・`night`（夜）で、写真の影を取り除いて光の当たり方を変えます（新しい Flyover の日の当たり方の画像を使う）。
 
 ## 地球儀ビューア
 

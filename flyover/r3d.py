@@ -106,35 +106,37 @@ def _tlv(b, a, e):
 
 
 # ---- ハフマン符号の封筒 -----------------------------------------------------------
+# 封筒 1 つにつき numba を 1 回呼ぶ（表を読み、表の形を確かめ、引く表を作り、本体を読むまで）。
+# 状態の番号: 0 = 読めた、1 = 符号が長すぎる、2 = ハフマン符号を読めない、3 = 本体の終わりが合わない、
+# 4 = 表のビットが足りない、5 = 表の幅が決まらない
 
-class _Bits:
-    """LE の u32 の語を、上のビットから順に読む（bits は 1 ビット 1 バイト、p は次に読む位置）。"""
-
-    def __init__(self, b):
-        n = len(b) // 4
-        w = np.frombuffer(bytes(b[:4 * n]), "<u4").astype(">u4")
-        self.bits = np.unpackbits(w.view(np.uint8))
-        self.p = 0
+def _words(b):
+    """LE の u32 の語を上のビットから読むよう並べ直したバイト列（ビット p はバイト p // 8 の上から
+    p % 8 ビット目。語に満たない端は捨てる）と、そのビット数。"""
+    n = len(b) // 4
+    return np.frombuffer(bytes(b[:4 * n]), "<u4").astype(">u4").view(np.uint8), 32 * n
 
 
 @_jit
-def _k_read(bits, p, k):
-    """p ビット目から k ビットの数と次の位置。足りなければ位置 -1。"""
-    if p < 0 or p + k > bits.shape[0]:
+def _k_read(by, nbits, p, k):
+    """p ビット目から k ビット（62 まで）の数と次の位置。足りなければ位置 -1。"""
+    if p < 0 or p + k > nbits:
         return 0, -1
     v = 0
-    for i in range(k):
-        v = (v << 1) | int(bits[p + i])      # uint8 のままだと numba なしで桁あふれ
+    for i in range(p, p + k):
+        v = (v << 1) | (int(by[i >> 3]) >> (7 - (i & 7)) & 1)
     return v, p + k
 
 
 @_jit
-def _k_table(bits, p, width, empty):
-    """_table の中身。(記号, 符号長, 符号語, 次の位置)。ビットが足りなければ位置 -1、符号が 62 ビット
+def _k_table(by, nbits, p, width, empty):
+    """表: 記号の数 - 1、符号長の幅（3 ビット）、記号ごとに（符号長 - 1、符号語、値: 0 = 前 + 1、
+    11 = 絶対値、10 = 前 + 増分 + 1）。本体が空（empty）で記号が 1 つなら、符号長と符号語はなく、
+    符号の長さは 0。(記号, 符号長, 符号語, 次の位置)。ビットが足りなければ位置 -1、符号が 62 ビット
     より長ければ -2（int64 に入らない。正しい表の符号は 22 ビットまで）。"""
     z = np.zeros(0, np.int64)
-    n, p = _k_read(bits, p, width)
-    w, p = _k_read(bits, p, 3)
+    n, p = _k_read(by, nbits, p, width)
+    w, p = _k_read(by, nbits, p, 3)
     if p < 0:
         return z, z, z, -1
     n += 1
@@ -146,20 +148,20 @@ def _k_table(bits, p, width, empty):
         else:
             ln = 1
             if w:
-                ln, p = _k_read(bits, p, w)
+                ln, p = _k_read(by, nbits, p, w)
                 ln += 1
             if ln > 62:
                 return z, z, z, -2
-            code, p = _k_read(bits, p, ln)
-        f, p = _k_read(bits, p, 1)
+            code, p = _k_read(by, nbits, p, ln)
+        f, p = _k_read(by, nbits, p, 1)
         if f == 0:
             s = prev + 1
         else:
-            f, p = _k_read(bits, p, 1)
+            f, p = _k_read(by, nbits, p, 1)
             if f:
-                s, p = _k_read(bits, p, width)
+                s, p = _k_read(by, nbits, p, width)
             else:
-                s, p = _k_read(bits, p, width // 2)
+                s, p = _k_read(by, nbits, p, width // 2)
                 s += prev + 1
         if p < 0:
             return z, z, z, -1
@@ -168,54 +170,46 @@ def _k_table(bits, p, width, empty):
     return sym, lns, codes, p
 
 
-def _table(r, width, empty=False):
-    """記号の数 - 1、符号長の幅（3 ビット）、記号ごとに（符号長 - 1、符号語、値: 0 = 前 + 1、
-    11 = 絶対値、10 = 前 + 増分 + 1）。語の境目にそろえて終わる。本体が空（empty）で記号が 1 つなら、
-    符号長と符号語はなく、符号の長さは 0。(記号, 符号長, 符号語) の配列を返す。"""
-    sym, ln, code, p = _k_table(r.bits, r.p, width, empty)
-    if p == -1:
-        raise EOFError
-    if p == -2:
-        raise ValueError("符号が長すぎる")
-    r.p = p + (-p % 32)
-    return sym, ln, code
-
-
-def _prefix_free(tab):
+@_jit
+def _k_prefix_free(lns, codes):
     """どの符号語もほかの符号語の頭になっておらず、符号の長さで隙間なく埋まる（記号が 1 つなら可）。"""
-    sym, ln, code = tab
-    if len(ln) == 1:
+    n = lns.shape[0]
+    if n == 1:
         return True
-    mx = int(ln.max())
-    lo = code << (mx - ln)               # 符号語を mx ビットに伸ばした区間 [lo, lo + size)
-    size = np.int64(1) << (mx - ln)
-    o = np.argsort(lo, kind="stable")
-    if not (lo[o][:-1] + size[o][:-1] <= lo[o][1:]).all():
-        return False
-    return int(size.sum()) == 1 << mx      # 区間が重ならないので、和は 2^mx を超えない（桁あふれしない）
+    mx = 0
+    for i in range(n):
+        mx = max(mx, lns[i])
+    lo = np.empty(n, np.int64)           # 符号語を mx ビットに伸ばした区間 [lo, lo + size)
+    size = np.empty(n, np.int64)
+    for i in range(n):
+        lo[i] = codes[i] << (mx - lns[i])
+        size[i] = np.int64(1) << (mx - lns[i])
+    o = np.argsort(lo, kind="mergesort")
+    for i in range(n - 1):
+        if lo[o[i]] + size[o[i]] > lo[o[i + 1]]:
+            return False
+    tot = 0                              # 区間が重ならないので、和は 2^mx を超えない（桁あふれしない）
+    for i in range(n):
+        tot += size[i]
+    return tot == np.int64(1) << mx
 
 
 @_jit
-def _k_huff(bits, p, sym, lens, mx, count):
-    """bits の p ビット目から count 個。先の mx ビットで表を引く。(記号, 次の位置)。読めなければ位置 -1。"""
-    n = bits.shape[0]
+def _k_body(by, nbits, p, syms, lns, codes, count, strict):
+    """p ビット目から count 個の記号と状態。先の mx ビットで引く表を作り（後の記号が前の記号の区間を
+    上書きする）、ビットを溜めておいて mx ビットずつ覗く（終わりの先は 0 として読む）。strict なら、
+    読み終えた後の残りが 0 だけで最後の語の中に収まること。"""
     out = np.empty(count, np.int64)
-    for i in range(count):
-        if p >= n:
-            return out, -1
-        w = 0
-        for k in range(mx):
-            w = (w << 1) | (int(bits[p + k]) if p + k < n else 0)   # uint8 のままだと numba なしで桁あふれ
-        if lens[w] == 0:
-            return out, -1
-        out[i] = sym[w]
-        p += lens[w]
-    return out, p
-
-
-@_jit
-def _k_lookup(syms, lns, codes, mx):
-    """先の mx ビットで引く表 (記号, 符号長)。後の記号が前の記号の区間を上書きする。"""
+    if count == 0:
+        return out, 0
+    if lns.shape[0] == 1 and lns[0] == 0:
+        out[:] = syms[0]
+        return out, 0
+    mx = 0
+    for i in range(lns.shape[0]):
+        mx = max(mx, lns[i])
+    if mx > 22:
+        return out, 1
     sym = np.zeros(1 << mx, np.int64)
     lens = np.zeros(1 << mx, np.int64)
     for i in range(syms.shape[0]):
@@ -223,27 +217,66 @@ def _k_lookup(syms, lns, codes, mx):
         hi = lo + (1 << (mx - lns[i]))
         sym[lo:hi] = syms[i]
         lens[lo:hi] = lns[i]
-    return sym, lens
+    if p >= nbits:
+        return out, 2
+    nb = by.shape[0]
+    mask = (1 << mx) - 1
+    q = (p >> 3) + 1                     # 次に溜めるバイト
+    cnt = 8 - (p & 7)                    # buf の下の cnt ビットが、まだ読んでいないビット
+    buf = int(by[p >> 3]) & ((1 << cnt) - 1)
+    for i in range(count):
+        if p >= nbits:
+            return out, 2
+        while cnt < mx:
+            buf = (buf << 8) | (int(by[q]) if q < nb else 0)
+            cnt += 8
+            q += 1
+        v = (buf >> (cnt - mx)) & mask
+        L = lens[v]
+        if L == 0:
+            return out, 2
+        out[i] = sym[v]
+        p += L
+        cnt -= L
+        buf &= (1 << cnt) - 1
+    if strict:
+        if nbits - p >= 32:
+            return out, 3
+        for i in range(p, nbits):
+            if int(by[i >> 3]) >> (7 - (i & 7)) & 1:
+                return out, 3
+    return out, 0
 
 
-def _decode(r, tab, count, strict):
-    """count 個の記号（int64 の配列）。strict なら、読み終えた後の残りが 0 だけで最後の語の中に収まること。"""
-    if count == 0:
-        return np.zeros(0, np.int64)
-    syms, lns, codes = tab
-    if len(lns) == 1 and lns[0] == 0:
-        return np.full(count, syms[0], np.int64)
-    mx = int(lns.max())
-    if mx > 22:
-        raise ValueError("符号が長すぎる")
-    sym, lens = _k_lookup(syms, lns, codes, mx)
-    out, p = _k_huff(r.bits, r.p, sym, lens, mx, count)
+@_jit
+def _k_stream(by, nbits, width, count, strict):
+    """表と本体が続けて入った流れ（表は語の境目にそろえて終わる）。(記号, 状態)。"""
+    syms, lns, codes, p = _k_table(by, nbits, 0, width, False)
     if p < 0:
-        raise ValueError("ハフマン符号を読めない")
-    r.p = p
-    if strict and (len(r.bits) - r.p >= 32 or r.bits[r.p:].any()):
-        raise ValueError("本体の終わりが合わない")
-    return out
+        return np.zeros(0, np.int64), (4 if p == -1 else 1)
+    return _k_body(by, nbits, (p + 31) // 32 * 32, syms, lns, codes, count, strict)
+
+
+@_jit
+def _k_split(tby, tnbits, tlen, pby, pnbits, empty, count, strict):
+    """表（tlen バイト）と本体を分けたもの。表の幅は、表の流れをちょうど使い切り、符号の形が正しい
+    ほう（8 か 16）。(記号, 状態)。"""
+    for w in (8, 16):
+        syms, lns, codes, p = _k_table(tby, tnbits, 0, w, empty)
+        if p < 0:                        # ビットが足りないか、符号が長すぎる（この幅ではない）
+            continue
+        if (p + 31) // 32 * 4 == tlen and _k_prefix_free(lns, codes):
+            return _k_body(pby, pnbits, 0, syms, lns, codes, count, strict)
+    return np.zeros(0, np.int64), 5
+
+
+_ERRORS = {1: "符号が長すぎる", 2: "ハフマン符号を読めない", 3: "本体の終わりが合わない", 5: "表の幅が決まらない"}
+
+
+def _fail(st):
+    if st == 4:
+        raise EOFError
+    raise ValueError(_ERRORS[st])
 
 
 def _envelope(e, count, width=None, strict=True):
@@ -257,13 +290,13 @@ def _envelope(e, count, width=None, strict=True):
             return np.frombuffer(body, "<u2").astype(np.int64)
         raise ValueError("リテラルの長さが合わない")
     if h == 0x61000002:                  # 表と本体が続けて入った流れ
+        by, nb = _words(e[4:])
         for w in ((width,) if width else (8, 16)):
-            try:
-                r = _Bits(e[4:])
-                return _decode(r, _table(r, w), count, strict)
-            except (EOFError, ValueError):
-                if width:
-                    raise
+            out, st = _k_stream(by, nb, w, count, strict)
+            if st == 0:
+                return out
+            if width:
+                _fail(st)
         raise ValueError("ハフマン符号を読めない")
     if h & 0xFFFF00FF == 0x24000000:     # 表と本体を分けたもの。2 バイト目は本体を包む段数
         lvl = (h >> 8) & 0xFF
@@ -272,21 +305,14 @@ def _envelope(e, count, width=None, strict=True):
             return _envelope(e[16:], count, width, strict)
         T = e[16:16 + tl]
         P = e[16 + tl:16 + tl + pl] if lvl < 2 else e[16 + tl:]
-        tab = None
-        for w in (8, 16):                # 表の流れをちょうど使い切る幅
-            r = _Bits(T[4:])
-            try:
-                t = _table(r, w, lvl == 0 and pl == 0)
-            except (EOFError, ValueError):   # ビットが足りないか、符号が長すぎる（この幅ではない）
-                continue
-            if r.p // 8 == len(T) - 4 and _prefix_free(t):
-                tab = t
-                break
-        if tab is None:
-            raise ValueError("表の幅が決まらない")
         if lvl:
             P = _envelope(struct.pack("<I", 0x24000000 | (lvl - 1) << 8) + P, pl, 8).astype(np.uint8).tobytes()
-        return _decode(_Bits(P), tab, count, strict)
+        tby, tnb = _words(T[4:])
+        pby, pnb = _words(P)
+        out, st = _k_split(tby, tnb, len(T) - 4, pby, pnb, lvl == 0 and pl == 0, count, strict)
+        if st:
+            _fail(st)
+        return out
     raise ValueError(f"知らない封筒 {h:#x}")
 
 
@@ -971,10 +997,15 @@ def _lane_ints(lanes, c, n, base):
             continue
         sh = 8 * (b - 1) if b % 2 and (4 * c + b - 1) not in lanes else 8 * b
         opts.append([np.asarray(v, np.int64) << sh for v in lane[1].values()])
+    combos = list(itertools.product(*opts))
     best = None
-    for combo in itertools.product(*opts):
-        v = sum(combo, np.zeros(n, np.int64)) + base
-        v = (v + (1 << 31)) % (1 << 32) - (1 << 31)          # int32 で折り返す
+    for combo in combos:
+        v = np.full(n, base, np.int64)
+        for x in combo:
+            v += x
+        v = v.astype(np.int32).astype(np.int64)              # int32 で折り返す
+        if len(combos) == 1:
+            return v
         r = int(v.max() - v.min()) if n else 0
         if best is None or r < best[0]:
             best = (r, v)
@@ -1076,6 +1107,17 @@ def texture(data, sec=None, k=0):
     return bytes(data[i:e])
 
 
+def shade_image(data, sec, k):
+    """k 枚目のテクスチャの、日の当たり方の画像（項目 6。縦横半分の灰色の HEIF。撮ったときの日なたが白、
+    日かげが黒）。なければ None。"""
+    for t, s, e in _image_items(data, sec, k):
+        if t == 6:
+            i = data.find(b"ftyp", s, e) - 4
+            if i >= s:
+                return bytes(data[i:e])
+    return None
+
+
 def repeat_texture(data, sec, k):
     """k 枚目のテクスチャに画像の項目 13（1 か 2）があるか。あるものは水面などをくり返して貼る小さな画像
     （16 px 角のこともある）で、UV は 0〜1 の外に出る。海沿いのタイルに多い。"""
@@ -1114,7 +1156,9 @@ def parse(data):
         raise ValueError("頂点か UV がタイルから大きく外れている（読み違え）")
     groups = {k: fuv[tri_atlas == k].astype(np.int32) for k in range(len(heics)) if (tri_atlas == k).any()}
     mesh = Mesh(pos[vert], uv, groups)    # v は c3m.Mesh と同じく上向き
-    return C3M(rot, trans, [Material(h, "jpeg" if h[:2] == b"\xff\xd8" else "heic", r) for h, r in zip(heics, repeat)],
+    shades = [shade_image(data, sec, k) for k in range(len(heics))]
+    return C3M(rot, trans, [Material(h, "jpeg" if h[:2] == b"\xff\xd8" else "heic", r, sh)
+                            for h, r, sh in zip(heics, repeat, shades)],
                [mesh], splats)
 
 
@@ -1122,9 +1166,8 @@ def warm():
     """numba のコンパイル（か、残してある結果の読み込み）を先に済ませる（作業プロセスの起動時に）。"""
     z, u = np.zeros(0, np.int64), np.zeros(0, np.uint8)
     one = np.zeros(1, np.int64)
-    _k_huff(u, 0, one, one, 0, 0)
-    _k_table(u, 0, 8, False)
-    _k_lookup(one, one, one, 1)
+    _k_stream(u, 0, 8, 0, True)
+    _k_split(u, 0, 0, u, 0, False, 0, True)
     _k_fill(u, one, 1, True)
     _k_replay(np.zeros((0, 5), np.int64), z, 0)
     _k_position_prog(z, z, 0, 0)
