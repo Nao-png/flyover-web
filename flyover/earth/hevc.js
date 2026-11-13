@@ -1,13 +1,15 @@
 // 新しい Flyover の画像（HEVC の 1 コマ）を、WebCodecs で GPU の専用回路を使って展開し、
 // 明るさ（Y）と色（UV を交互に並べたもの）の面にして返す作業用のスレッド。
 //
-// 受け取るもの: { id, images: [{ config: hvcC の中身, data: コマ（長さ付きの NAL の並び） }] }
-// 返すもの: { id, out: [{ w, h, y: Uint8Array(w*h), uv: Uint8Array(ceil(w/2)*ceil(h/2)*2) }] }
-//           か、展開できなかったとき { id, error }
+// 受け取るもの: { id, images: [{ config: hvcC の中身, data: コマ（長さ付きの NAL の並び） }], gpu }
+// 返すもの: { id, out: [{ w, h, y: Uint8Array(w*h), uv: Uint8Array(ceil(w/2)*ceil(h/2)*2) }], ms }
+//           か、展開できなかったとき { id, error }。gpu なら out は [{ w, h, bitmap }]（GPU にある RGB の
+//           ImageBitmap。CPU に読み戻すと 1 枚 100 ms ほどかかるので、earth.js が GPU の中で Y と UV に戻す）
 
 // HEIC には色の決め方が入っていない。HEIF の決まり（libheif も同じ）どおり BT.601 のフルレンジ
 // として扱う（Chrome は何も言わないと BT.709 のリミテッドレンジとみなし、平均 8 段階ほどずれる）。
-// ここでは Y と UV の値をそのまま返すので、変換はシェーダー（earth.js）でする
+// 読み戻すときは Y と UV の値をそのまま返すので、変換はシェーダー（earth.js）でする。GPU のままの画像は、ここで
+// 渡す色の決め方でブラウザが RGB にする
 const COLOR = { matrix: 'smpte170m', fullRange: true, primaries: 'bt709', transfer: 'iec61966-2-1' };
 
 // hvcC から WebCodecs の codec 文字列を作る（ISO/IEC 14496-15 の付録 E）
@@ -22,18 +24,28 @@ function codecString(h) {
 }
 
 function decode(config, data) {
-  return new Promise((resolve, reject) => {
-    let frame = null;
-    const dec = new VideoDecoder({ output: f => { if (frame) frame.close(); frame = f; }, error: reject });
+  // 展開器はこのスレッドで 1 つを使い回す（作るのに時間がかかる）。設定が前と同じなら設定し直さない。
+  // 失敗すると展開器は閉じるので、次は作り直す
+  if (!dec || dec.state === 'closed') {
+    dec = new VideoDecoder({ output: f => { if (frame) frame.close(); frame = f; }, error: e => { lastError = e; } });
+    lastConfig = null;
+  }
+  const key = codecString(config) + ':' + config.join(',');
+  if (key !== lastConfig) {
     dec.configure({ codec: codecString(config), description: config, colorSpace: COLOR,
                     hardwareAcceleration: 'prefer-hardware' });
-    dec.decode(new EncodedVideoChunk({ type: 'key', timestamp: 0, data }));
-    dec.flush().then(() => {
-      dec.close();
-      frame ? resolve(frame) : reject(new Error('コマが出てこない'));
-    }, reject);
-  });
+    lastConfig = key;
+  }
+  frame = null; lastError = null;
+  dec.decode(new EncodedVideoChunk({ type: 'key', timestamp: 0, data }));
+  return dec.flush().then(() => {
+    const f = frame;
+    frame = null;
+    if (!f) throw lastError || new Error('コマが出てこない');
+    return f;
+  }, e => { throw lastError || e; });
 }
+let dec = null, frame = null, lastConfig = null, lastError = null;
 
 // 展開したコマ（NV12 か I420）を、すき間なく詰めた Y と UV（交互）の面にする
 async function planes(frame) {
@@ -60,15 +72,23 @@ async function planes(frame) {
 
 // このスレッドの中では 1 つずつ順に展開する（並べるときは earth.js がスレッドを増やす）
 let queue = Promise.resolve();
-onmessage = ({ data: { id, images } }) => {
+onmessage = ({ data: { id, images, gpu } }) => {
   queue = queue.then(async () => {
     try {
-      const out = [];
+      const out = [], ms = { decode: 0, copy: 0, n: images.length };   // かかった時間（調べる用）
       for (const im of images) {
+        let t = performance.now();
         const frame = await decode(im.config, im.data);
-        try { out.push(await planes(frame)); } finally { frame.close(); }
+        ms.decode += performance.now() - t;
+        t = performance.now();
+        try {
+          // gpu なら CPU に読み戻さず、GPU にあるままの RGB の画像で返す（earth.js の gpuPlanes で Y と UV にする）
+          if (gpu) out.push({ bitmap: await createImageBitmap(frame), w: frame.visibleRect.width, h: frame.visibleRect.height });
+          else out.push(await planes(frame));
+        } finally { frame.close(); }
+        ms.copy += performance.now() - t;
       }
-      postMessage({ id, out }, out.flatMap(p => [p.y.buffer, p.uv.buffer]));
+      postMessage({ id, out, ms }, out.flatMap(p => p.bitmap ? [p.bitmap] : [p.y.buffer, p.uv.buffer]));
     } catch (e) {
       postMessage({ id, error: String(e) });
     }

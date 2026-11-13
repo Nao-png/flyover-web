@@ -644,11 +644,11 @@ async function load(t, offscreen) {
     const t1 = performance.now();
     await makeModel(t, buf, useHevc);
     loadLog.push({ z: t.z, x: t.x, y: t.y, off: offscreen, at: t0, bytes: buf.length, fetch: t1 - t0, model: performance.now() - t1,
-      server: r.headers.get('Server-Timing') });
+      hevc: t.hevcMs, hevcWork: t.hevcWork, cesium: t.cesiumMs, server: r.headers.get('Server-Timing') });
     if (loadLog.length > 500) loadLog.shift();
   } catch (e) {
     if (e.name === 'AbortError') { t.state = 'none'; }
-    else if (e.retry) { t.state = 'none'; console.warn('HEVC を展開できないので、JPEG にする', e); }
+    else if (e.retry) { t.state = 'none'; console.warn(e.retry, e); }
     else { t.state = 'failed'; t.failedAt = performance.now(); console.warn('Flyover', t.z, t.x, t.y, e); }
   } finally {
     active--; t.abort = null;
@@ -659,13 +659,15 @@ async function load(t, offscreen) {
 // 展開は作業用のスレッド HEVC_WORKERS 本に 1 タイルずつ渡し、渡す順はそのときに選ぶ（届いた順に
 // 渡すと、先に届いた画面の外のタイルや小さく見えるタイルの後ろで、見えているタイルが待たされる）。
 // 今見えているものを先に、画面で大きく見えるもの（Tile#pri が小さいもの）から。梅田（HEVC）で、見えて
-// いる範囲が出るまでが 1 本では 18 秒、2 本で 14 秒、3 本で 12 秒（6 本でも 12 秒）
+// いる範囲が出るまでが 1 本では 18 秒、2 本で 14 秒、3 本で 12 秒（6 本でも 12 秒。どれもコマを CPU に読み戻して
+// いたころの数字）
 const HEVC_WORKERS = 3;
 const hevcWorkers = hevc ? Array.from({ length: HEVC_WORKERS }, () => ({ worker: new Worker('hevc.js'), job: null })) : [];
 const hevcPending = [];
 for (const w of hevcWorkers) w.worker.onmessage = ({ data }) => {
   const job = w.job;
   w.job = null;
+  job.t.hevcWork = data.ms;
   data.error ? job.reject(new Error(data.error)) : job.resolve(data.out);
   hevcNext();
 };
@@ -681,9 +683,13 @@ function hevcNext() {
     let best = 0;
     for (let i = 1; i < hevcPending.length; i++) if (rank(hevcPending[i]) < rank(hevcPending[best])) best = i;
     w.job = hevcPending.splice(best, 1)[0];
-    w.worker.postMessage({ id: 0, images: w.job.images });
+    w.worker.postMessage({ id: 0, images: w.job.images, gpu: gpuTex && !seasonGlsl });
   }
 }
+// 展開したコマを CPU に読み戻さず、GPU の中でテクスチャにする（gpuPlanes）。季節の色では、写真の色を
+// CPU で読むので読み戻す。?gpu=0 で、いつも読み戻す（比べる用）
+// GPU の中で変換できなければ（gpuPlanes が失敗したら）、以後は読み戻す
+let gpuTex = new URLSearchParams(location.search).get('gpu') !== '0';
 const hevcDecode = (t, images) => new Promise((resolve, reject) => {
   hevcPending.push({ t, images, resolve, reject });
   hevcNext();
@@ -700,6 +706,44 @@ function glbHevc(buf) {
   return g.materials.map(m => m.extras && m.extras.hevc).filter(Boolean).sort((a, b) => a.slab - b.slab)
     .map(h => ({ config: part(h.config), data: part(h.data) }));
 }
+
+// ?light=morning（朝）・evening（夕方）・cloudy（曇り）・night（夜）で、光の当たり方を変える。新しい Flyover の写真には
+// 撮ったときの日なたと日かげが写っている。タイルには日の当たり方の画像（日なたが白、日かげが黒。glb の
+// occlusionTexture）と、スプラットごとの日の当たり方（不透明度の下位 6 ビット）が入っているので（flyover/glb.py）、
+// 日かげを明るくして影を取り除いた色（反射率）を求め、別の空の光と太陽で描き直す。面の向きは画面上の位置の変化から
+// 求める。建物が落とす影は新しくは作らない（元の影を消すだけ）。日の当たり方のない所（パリなど）は日なたとみなす
+const LIGHTS = {
+  // sun: 太陽の方位（北から時計回り）と高さ [°]、sunColor: 太陽の光、sky: 空の光（上を向いた面に当たる量）
+  morning: { sun: [100, 18], sunColor: [1.25, 1.05, 0.8], sky: [0.42, 0.5, 0.66] },
+  evening: { sun: [255, 9], sunColor: [1.5, 0.78, 0.4], sky: [0.34, 0.3, 0.45] },
+  cloudy: { sun: null, sky: [0.92, 0.95, 1.0] },
+  night: { sun: null, sky: [0.07, 0.09, 0.17] },
+  check: { check: true, sun: null, sky: [1, 1, 1] },   // 撮ったときの日なた（白）・日かげ（黒）をそのまま見る（確かめ用）
+};
+const light = cfg.r3d ? LIGHTS[new URLSearchParams(location.search).get('light')] : undefined;
+const glslVec = v => `vec3(${v.map(x => x.toFixed(4)).join(', ')})`;
+const lightGlsl = !light ? '' : (() => {
+  const sun = light.sun && light.sun.map(d => d * Math.PI / 180);
+  const sunENU = sun ? [Math.sin(sun[0]) * Math.cos(sun[1]), Math.cos(sun[0]) * Math.cos(sun[1]), Math.sin(sun[1])] : [0, 0, 1];
+  return `
+// color: 頂点の色（メッシュには頂点の色がなく、Cesium が白を入れる）
+void lightApply(inout czm_modelMaterial material, vec3 pe, vec3 pw, vec4 color) {
+  // 撮ったときの日なた（1）・日かげ（0）。メッシュは日の当たり方の画像、スプラットは不透明度の下位 6 ビット
+  float lit = color == vec4(1.0) ? material.occlusion : mod(floor(color.a * 65535.0 + 0.5), 64.0) / 63.0;
+  // 影を取り除いた色。日かげは日なたの R 0.10・G 0.15・B 0.17 倍ほど（線形の値。青い空の光だけが当たる）に写っている
+  // （新しい Flyover の 67 枚の写真の、日の当たり方の画像が白い所と黒い所の中央値の比）
+  vec3 albedo = material.diffuse / mix(vec3(0.10, 0.15, 0.17), vec3(1.0), clamp(lit, 0.0, 1.0));
+  ${light.check ? 'material.diffuse = vec3(lit); return;' : ''}
+  vec3 n = normalize(cross(dFdx(pe), dFdy(pe)));
+  if (dot(n, pe) > 0.0) n = -n;                       // 見ている側を向ける（目の位置が原点）
+  vec3 up = normalize(pw), east = normalize(cross(vec3(0.0, 0.0, 1.0), up)), north = cross(up, east);
+  vec3 upE = normalize(czm_viewRotation * up);
+  vec3 sunE = normalize(czm_viewRotation * (east * ${sunENU[0].toFixed(5)} + north * ${sunENU[1].toFixed(5)} + up * ${sunENU[2].toFixed(5)}));
+  float sky = 0.65 + 0.35 * dot(n, upE);              // 上を向いた面ほど空の光が多い
+  vec3 L = ${glslVec(light.sky)} * sky${light.sun ? ` + ${glslVec(light.sunColor)} * max(dot(n, sunE), 0.0)` : ''};
+  material.diffuse = albedo * L;
+}`;
+})();
 
 // ?season=sakura（桜）か ?season=momiji（紅葉）で、木（緑のスプラット）の色を変える。芝生などはメッシュの写真
 // なので、スプラットだけを変えれば、おもに木が変わる（新宿御苑で、緑のスプラットのうち地面から 3 m 未満は 4%）。
@@ -978,36 +1022,93 @@ async function markTreeSplats(buf, planes, fine) {
   }
 }
 
-// 季節の色だけのシェーダー（HEVC でない glb）。頂点の色があるのはスプラットだけで、メッシュには Cesium が白を
-// 入れるので、写真（パリのような JPEG のテクスチャも）は変わらない
-function seasonShader() {
-  return new C.CustomShader({ fragmentShaderText: `${seasonGlsl}
+// 季節の色と光の当たり方を、材質の色が決まったあとに加える（スプラットと、HEVC でないメッシュ）
+const tweakGlsl = seasonGlsl + lightGlsl;
+const tweakCall = (seasonGlsl ? 'seasonTint(material, fsInput.attributes.positionWC, fsInput.attributes.color_0);' : '')
+  + (lightGlsl ? 'lightApply(material, fsInput.attributes.positionEC, fsInput.attributes.positionWC, fsInput.attributes.color_0);' : '');
+
+// 季節の色と光の当たり方だけのシェーダー（HEVC でない glb）。頂点の色があるのはスプラットだけで、メッシュには
+// Cesium が白を入れるので、季節の色では写真（パリのような JPEG のテクスチャも）は変わらない
+function tweakShader() {
+  return new C.CustomShader({ fragmentShaderText: `${tweakGlsl}
 void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
-  seasonTint(material, fsInput.attributes.positionWC, fsInput.attributes.color_0);
+  ${tweakCall}
 }` });
 }
 
-// HEVC を展開した Y と UV の面を貼るシェーダー。どの面かは頂点の属性 _SLAB（slab）で選ぶ（HEVC でない
-// 材質（スプラットなど）は 255 で、そのまま）。テクスチャは元の大きさのまま（WebGL2 では、配列から作る
-// テクスチャは 2 のべき乗に広げられない）
-function hevcShader(planes) {
-  const tex = (typedArray, width, height, pixelFormat) => ({
-    type: C.UniformType.SAMPLER_2D,
-    value: new C.TextureUniform({ typedArray, width, height, pixelFormat, repeat: false,
-      minificationFilter: C.TextureMinificationFilter.LINEAR_MIPMAP_LINEAR,
-      magnificationFilter: C.TextureMagnificationFilter.LINEAR }),
+// GPU の中で、ブラウザが RGB にしたコマ（ImageBitmap）を、CPU で詰めたときと同じ Y（LUMINANCE）と、縦横半分の
+// UV（LUMINANCE_ALPHA）のテクスチャに戻す。コマを CPU に読み戻す（VideoFrame#copyTo）と 1 枚 100 ms ほど
+// かかるが、これは GPU の中だけで済み、GPU のメモリも CPU で詰めたときと同じ。RGBA のテクスチャに BT.601
+// フルレンジで変換して描き（UV は RGB の 2 x 2 画素の真ん中を線形補間で引いて平均する）、それを写して
+// ミップマップを作る（1 チャンネルの R8 に描いてミップマップを作ると、この PC では 1 枚に数秒かかった）。
+// ブラウザの RGB は、hevc.js で色の決め方を渡しているので BT.601 フルレンジで変換されている
+let computeEngine = null;
+const TO_YUV = ['vec4(y, y, y, 1.0)', 'vec4((c.b - y) / 1.772 + 0.5, 0.0, 0.0, (c.r - y) / 1.402 + 0.5)'].map(v => `
+uniform sampler2D u_rgb;
+in vec2 v_textureCoordinates;
+void main() {
+  vec3 c = texture(u_rgb, v_textureCoordinates).rgb;
+  float y = dot(c, vec3(0.299, 0.587, 0.114));
+  out_FragColor = ${v};
+}`);
+function gpuPlanes({ bitmap, w, h }) {
+  const context = scene.context, clamp = C.TextureWrap.CLAMP_TO_EDGE, U8 = C.PixelDatatype.UNSIGNED_BYTE;
+  const filter = (min) => new C.Sampler({ wrapS: clamp, wrapT: clamp, minificationFilter: min,
+    magnificationFilter: C.TextureMagnificationFilter.LINEAR });
+  computeEngine = computeEngine || new C.ComputeEngine(context);
+  const rgb = new C.Texture({ context, source: bitmap, sampler: filter(C.TextureMinificationFilter.LINEAR) });
+  bitmap.close();
+  const out = [[w, h, C.PixelFormat.LUMINANCE], [(w + 1) >> 1, (h + 1) >> 1, C.PixelFormat.LUMINANCE_ALPHA]].map(([width, height, pixelFormat], i) => {
+    const tmp = new C.Texture({ context, width, height, pixelFormat: C.PixelFormat.RGBA, pixelDatatype: U8 });
+    // persists: シェーダーは Cesium の控えにあるものを使い回す（毎回作り直さない）
+    computeEngine.execute(new C.ComputeCommand({ fragmentShaderSource: new C.ShaderSource({ sources: [TO_YUV[i]] }),
+      outputTexture: tmp, uniformMap: { u_rgb: () => rgb }, persists: true }));
+    const tex = new C.Texture({ context, width, height, pixelFormat, pixelDatatype: U8,
+      sampler: filter(C.TextureMinificationFilter.LINEAR_MIPMAP_LINEAR) });
+    const fb = new C.Framebuffer({ context, colorTextures: [tmp], destroyAttachments: false });
+    fb._bind();
+    tex.copyFromFramebuffer(0, 0, 0, 0, width, height);
+    fb._unBind();
+    fb.destroy();
+    tmp.destroy();
+    tex.generateMipmap();
+    return tex;
   });
+  rgb.destroy();
+  return out;
+}
+
+// HEVC を展開した面を貼るシェーダー。どの面かは頂点の属性 _SLAB（slab）で選ぶ（HEVC でない材質（スプラット
+// など）は 255 で、そのまま）。面は、CPU で詰めた Y と UV の配列（季節の色のとき）か、GPU のコマ（gpuPlanes で
+// Y と UV のテクスチャにする）。テクスチャは元の大きさのまま（WebGL2 では、配列から作るテクスチャは 2 の
+// べき乗に広げられない）
+function hevcShader(planes) {
+  const filters = { repeat: false, minificationFilter: C.TextureMinificationFilter.LINEAR_MIPMAP_LINEAR,
+    magnificationFilter: C.TextureMagnificationFilter.LINEAR };
+  const tex = (typedArray, width, height, pixelFormat) => ({
+    type: C.UniformType.SAMPLER_2D, value: new C.TextureUniform({ typedArray, width, height, pixelFormat, ...filters }),
+  });
+  // GPU で作ったテクスチャは、シェーダーを作ったあとでテクスチャの控えに入れる（読み込み元は何も返さない）。
+  // 控えのテクスチャは、シェーダーを捨てるときに一緒に捨てられる
+  const made = {}, never = { fetchImage: () => new Promise(() => {}) };
+  const ready = () => ({ type: C.UniformType.SAMPLER_2D, value: new C.TextureUniform({ url: never, ...filters }) });
   const uniforms = {};
   let pick = '';
   planes.forEach((p, i) => {
-    uniforms['u_y' + i] = tex(p.y, p.w, p.h, C.PixelFormat.LUMINANCE);
-    uniforms['u_uv' + i] = tex(p.uv, (p.w + 1) >> 1, (p.h + 1) >> 1, C.PixelFormat.LUMINANCE_ALPHA);
+    if (p.bitmap) {
+      [made['u_y' + i], made['u_uv' + i]] = gpuPlanes(p);
+      uniforms['u_y' + i] = ready();
+      uniforms['u_uv' + i] = ready();
+    } else {
+      uniforms['u_y' + i] = tex(p.y, p.w, p.h, C.PixelFormat.LUMINANCE);
+      uniforms['u_uv' + i] = tex(p.uv, (p.w + 1) >> 1, (p.h + 1) >> 1, C.PixelFormat.LUMINANCE_ALPHA);
+    }
     pick += `${i ? 'else ' : ''}if (s == ${i}) { y = textureGrad(u_y${i}, st, dx, dy).r; c = textureGrad(u_uv${i}, st, dx, dy).ra; }\n`;
   });
-  return new C.CustomShader({ uniforms, fragmentShaderText: `${seasonGlsl}
+  const shader = new C.CustomShader({ uniforms, fragmentShaderText: `${tweakGlsl}
 void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
   int s = int(fsInput.attributes.slab + 0.5);
-  ${seasonGlsl ? 'if (s == 255) { seasonTint(material, fsInput.attributes.positionWC, fsInput.attributes.color_0); return; }' : ''}
+  ${tweakGlsl ? `if (s == 255) { ${tweakCall} return; }` : ''}
   if (s >= ${planes.length}) return;
   vec2 st = fsInput.attributes.texCoord_0, dx = dFdx(st), dy = dFdy(st);
   float y = 0.0;
@@ -1017,7 +1118,10 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
   // BT.601 のフルレンジ（hevc.js を見よ）。Cesium の材質の色は線形の値
   vec3 rgb = clamp(vec3(y + 1.402 * c.y, y - 0.344136 * c.x - 0.714136 * c.y, y + 1.772 * c.x), 0.0, 1.0);
   material.diffuse = czm_srgbToLinear(rgb);
+  ${lightGlsl ? 'lightApply(material, fsInput.attributes.positionEC, fsInput.attributes.positionWC, vec4(1.0));' : ''}
 }` });
+  Object.assign(shader._textureManager._textures, made);
+  return shader;
 }
 
 // テクスチャを作り終えたら、元の Y と UV の配列を手放す（JS のメモリに残さない）
@@ -1035,11 +1139,13 @@ async function makeModel(t, buf, useHevc) {
     const images = glbHevc(buf);
     if (images.length) {
       try {
+        const th = performance.now();
         planes = await hevcDecode(t, images);
+        t.hevcMs = performance.now() - th;
       } catch (e) {
         if (e.name === 'AbortError') throw e;
         hevc = false;           // 以後は JPEG で受け取る
-        e.retry = true;
+        e.retry = 'HEVC を展開できないので、JPEG にする';
         throw e;
       }
     }
@@ -1051,9 +1157,19 @@ async function makeModel(t, buf, useHevc) {
       console.warn('季節の色の印', t.z, t.x, t.y, e);
     }
   }
-  if (planes) shader = hevcShader(planes);
-  else if (seasonGlsl) shader = useHevc ? hevcShader([]) : seasonShader();   // スプラットだけのタイルなど
+  if (planes) {
+    try {
+      shader = hevcShader(planes);
+    } catch (e) {
+      if (!planes.some(p => p.bitmap)) throw e;
+      gpuTex = false;
+      e.retry = 'GPU の中でテクスチャにできないので、CPU に読み戻す';
+      throw e;
+    }
+  }
+  else if (tweakGlsl) shader = useHevc ? hevcShader([]) : tweakShader();   // スプラットだけのタイルなど
   let model;
+  const tm = performance.now();
   try {
     model = await C.Model.fromGltfAsync({
       // basePath はタイルごとに変える。Cesium は glb の中身（バッファや画像）を basePath を鍵に
@@ -1074,6 +1190,7 @@ async function makeModel(t, buf, useHevc) {
     if (shader) shader.destroy();      // モデルはシェーダーを捨てない
     throw e;
   }
+  t.cesiumMs = performance.now() - tm;
   t.model = model; t.shader = shader; t.planesFreed = !shader; t.clip = 0; t.state = 'ready';
 }
 

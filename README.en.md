@@ -30,7 +30,7 @@ python scripts/earth.py
 
 Open http://localhost:8000/ in your browser. To use another port, pass it like `python scripts/earth.py 8080`.
 
-To view the new Flyover of iOS 27 (style 98), start with `python scripts/earth.py --r3d`. Wherever the new Flyover exists it is used at every zoom; only tiles without it are shown with the old one ([how it works](docs/how-it-works.en.md#the-new-flyover-style-98)). Add `?season=sakura` to the URL to turn the trees into cherry blossoms, or `?season=momiji` for autumn leaves (only the green of the tree splats is recolored; trees that are partly mesh (shapes with a photo) are left entirely green when seen up close, and in regions that repackage the old Flyover, such as Paris, the trees are part of the photo and do not change).
+To view the new Flyover of iOS 27 (style 98), start with `python scripts/earth.py --r3d`. Wherever the new Flyover exists it is used at every zoom; only tiles without it are shown with the old one ([how it works](docs/how-it-works.en.md#the-new-flyover-style-98)). Add `?season=sakura` to the URL to turn the trees into cherry blossoms, or `?season=momiji` for autumn leaves (only the green of the tree splats is recolored; trees that are partly mesh (shapes with a photo) are left entirely green when seen up close, and in regions that repackage the old Flyover, such as Paris, the trees are part of the photo and do not change). `?light=morning`, `evening`, `cloudy` or `night` removes the shadows from the photos and changes the lighting (using the new Flyover's sun maps).
 
 ## Globe viewer
 

@@ -48,6 +48,21 @@ def _jpeg_pot(material, quality):
     return out.getvalue()
 
 
+def _shade_jpeg(shade, quality=85):
+    """日の当たり方の画像（HEIF の灰色）を、縦横を 1 つ下の 2 のべき乗に縮めた灰色の JPEG に。"""
+    from PIL import Image
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+    img = Image.open(io.BytesIO(shade)).convert("L")
+    size = tuple(max(1, 1 << (n.bit_length() - 1)) for n in img.size)
+    if size != img.size:
+        img = img.resize(size, Image.BICUBIC)
+    out = io.BytesIO()
+    img.save(out, "JPEG", quality=quality)
+    return out.getvalue()
+
+
 def _box(b, a, z, name):
     """b[a:z] の箱の並びから name の箱を探し、(中身の始まり, 箱の終わり) を返す。"""
     while a + 8 <= z:
@@ -92,9 +107,14 @@ def tile_glb(c3ms, quality=85, hevc=False):
     hevc なら、新しい Flyover の画像（HEIC）は JPEG にせず、HEVC のままビューアに渡す（ビューアが
     GPU の専用回路で展開して、Y と UV の面のままテクスチャにする）。その材質には画像を付けず、
     extras.hevc に設定（config）とコマ（data）の bufferView、大きさ、番号（slab）を入れる。
-    どの材質の画像かは、頂点の属性 _SLAB（位置の 4 つ目の int16。HEVC でない材質は 255）で分ける。"""
+    どの材質の画像かは、頂点の属性 _SLAB（位置の 4 つ目の int16。HEVC でない材質は 255）で分ける。
+
+    R3D の日の当たり方の画像（Material.shade）は、灰色の JPEG にして材質の occlusionTexture に入れる。
+    スプラットの日の当たり方（Splats.params の 4 番目、0〜63 の 0.05 刻み）は、不透明度（16 ビット）の
+    下位 6 ビットに入れる（不透明度は 65535 分の 63 しか変わらない）。どちらもビューアが光の当たり方を
+    変えるときに使う（flyover/earth/earth.js の ?light=）。"""
     parts = []   # (ECEF の頂点, UV, 三角形, (C3M の番号, 材質の番号))
-    splats = []  # (ECEF の頂点 (3N, 3), RGBA (N, 4))
+    splats = []  # (ECEF の頂点 (3N, 3), RGBA (N, 4), 日の当たり方 (N,) 0〜63)
     for ci, c in enumerate(c3ms):
         for m in c.meshes:
             if m.kind != MAIN:          # 範囲の端の、平らな地図につなぐための帯や面は入れない
@@ -107,11 +127,12 @@ def tile_glb(c3ms, quality=85, hevc=False):
         if sp is not None:
             keep = sp.rgba[:, 3] > 0    # 見えないもの（不透明度 0）は入れない
             if keep.any():
-                splats.append((c.to_ecef(sp.vertices[keep].reshape(-1, 3)), sp.rgba[keep]))
+                sun = np.clip(np.round(sp.params[keep, 3] / 0.05), 0, 63).astype(np.int64)
+                splats.append((c.to_ecef(sp.vertices[keep].reshape(-1, 3)), sp.rgba[keep], sun))
     if not parts and not splats:
         return None
-    lo = np.min([X.min(0) for X, *_ in parts] + [X.min(0) for X, _ in splats], axis=0)
-    hi = np.max([X.max(0) for X, *_ in parts] + [X.max(0) for X, _ in splats], axis=0)
+    lo = np.min([X.min(0) for X, *_ in parts] + [X.min(0) for X, *_ in splats], axis=0)
+    hi = np.max([X.max(0) for X, *_ in parts] + [X.max(0) for X, *_ in splats], axis=0)
     center = (lo + hi) / 2
     step = max((hi - lo).max() / 2, 1e-3) / 32767     # int16 の 1 刻みの長さ [m]
 
@@ -154,20 +175,25 @@ def tile_glb(c3ms, quality=85, hevc=False):
             nh = sum(s != 255 for s in slabs.values())
             hv = (heif_hevc(m.image) if hevc and m.format == "heic" and not m.repeat and nh < HEVC_MAX
                   else None)              # くり返して貼る画像は JPEG にする（標本の取り方で wrap を指定する）
+            shade = None
+            if getattr(m, "shade", None) and not m.repeat:
+                images.append({"bufferView": view(_shade_jpeg(m.shade)), "mimeType": "image/jpeg"})
+                shade = {"occlusionTexture": {"index": len(images) - 1}}
             if hv:
                 config, data, w, h = hv
                 slabs[key] = nh
                 materials.append({"pbrMetallicRoughness": {"metallicFactor": 0, "roughnessFactor": 1},
                                   "doubleSided": True, "extensions": {"KHR_materials_unlit": {}},
                                   "extras": {"hevc": {"config": view(config), "data": view(data),
-                                                      "width": w, "height": h, "slab": slabs[key]}}})
+                                                      "width": w, "height": h, "slab": slabs[key]}},
+                                  **(shade or {})})
             else:
                 slabs[key] = 255
                 images.append({"bufferView": view(_jpeg_pot(m, quality)), "mimeType": "image/jpeg",
                                "repeat": m.repeat})
                 materials.append({"pbrMetallicRoughness": {"baseColorTexture": {"index": len(images) - 1},
                                                            "metallicFactor": 0, "roughnessFactor": 1},
-                                  "doubleSided": True, "extensions": {"KHR_materials_unlit": {}}})
+                                  "doubleSided": True, "extensions": {"KHR_materials_unlit": {}}, **(shade or {})})
             mat_index[key] = len(materials) - 1
         used, idx = np.unique(F, return_inverse=True)
         idx = idx.reshape(-1)          # numpy 2 は F と同じ形で返す
@@ -193,16 +219,17 @@ def tile_glb(c3ms, quality=85, hevc=False):
         # 1 つにまとめて、低いものから順に描く。半透明なので奥から描かないと手前の色が奥の色に塗られて濁る。
         # 視点はたいてい上なので、高さの順で奥からの順の代わりになる（Apple の画面との比べで、視点ごとに
         # 並べ直したのと同じ近さになった）
-        X = np.vstack([X for X, _ in splats]).reshape(-1, 3, 3)
-        rgba = np.vstack([rgba for _, rgba in splats])
+        X = np.vstack([X for X, _, _ in splats]).reshape(-1, 3, 3)
+        rgba = np.vstack([rgba for _, rgba, _ in splats])
+        sun = np.concatenate([sun for _, _, sun in splats])
         order = np.argsort(X.mean(1) @ (center / np.linalg.norm(center)), kind="stable")
-        splats = [(X[order].reshape(-1, 3), rgba[order])]
+        splats = [(X[order].reshape(-1, 3), rgba[order], sun[order])]
         images.append({"bufferView": view(_soft_triangle()), "mimeType": "image/png"})
         materials.append({"pbrMetallicRoughness": {"baseColorTexture": {"index": len(images) - 1},
                                                    "metallicFactor": 0, "roughnessFactor": 1},
                           "alphaMode": "BLEND", "doubleSided": True,
                           "extensions": {"KHR_materials_unlit": {}}})
-        for X, rgba in splats:
+        for X, rgba, sun in splats:
             q = np.round((X - center) / step).astype(np.int32)
             P = np.zeros((len(q), 4), "<i2")
             P[:, :3] = q
@@ -211,7 +238,9 @@ def tile_glb(c3ms, quality=85, hevc=False):
             # glTF の頂点の色は線形の値なので、sRGB の色を線形に直す（暗い色が潰れないよう 16 ビットで）
             c = rgba.astype(np.float64) / 255
             c[:, :3] = np.where(c[:, :3] <= 0.04045, c[:, :3] / 12.92, ((c[:, :3] + 0.055) / 1.055) ** 2.4)
-            col = accessor(np.repeat(np.round(c * 65535).astype("<u2"), 3, axis=0), UINT16, "VEC4",
+            c16 = np.round(c * 65535).astype(np.int64)
+            c16[:, 3] = (c16[:, 3] & ~63) | sun          # 不透明度の下位 6 ビットに日の当たり方
+            col = accessor(np.repeat(c16.astype("<u2"), 3, axis=0), UINT16, "VEC4",
                            ARRAY_BUFFER, normalized=True)
             # 三角形ごとに、画像の (0,0)・(1,0)・(0,1) の角を当てる（4 バイトの倍数にそろえて 2 バイト空ける）
             T = np.zeros((len(q), 4), np.uint8)
