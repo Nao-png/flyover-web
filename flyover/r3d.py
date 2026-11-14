@@ -1118,14 +1118,31 @@ def shade_image(data, sec, k):
     return None
 
 
+# 画像の項目 13 の値 -> メッシュの種類（c3m.Mesh.kind と同じ番号）
+EDGE_KINDS = {1: 4, 2: 3}
+
+
+def edge_kind(data, sec, k):
+    """k 枚目のテクスチャが、Flyover の範囲の端で平らな地図につなぐためのものなら、そのメッシュの種類
+    （旧 C3M と同じく 4 = 縁の帯、3 = 平らな面）。そうでなければ 0。画像の項目 13 で分かる:
+      1: 地形に沿った帯。粗い写真で、写真のない所は一様な灰色。項目 14 はその写真のある所の白黒の
+         マスク（256 px 角）、項目 15 はそれをぼかしたもの（地図になじませて描くためらしい）
+      2: 平らな面。真っ黒な 16 px 角の画像のことが多い（パリでは高さ 0 m 付近の面）
+    範囲の端（海沿いや、亀岡の西のような内陸の端）の z13〜17 のタイルにある。"""
+    for t, s, e in _image_items(data, sec, k):
+        if t == 13:
+            return EDGE_KINDS.get(data[s] if e > s else 0, 4)
+    return 0
+
+
 def repeat_texture(data, sec, k):
-    """k 枚目のテクスチャに画像の項目 13（1 か 2）があるか。あるものは水面などをくり返して貼る小さな画像
-    （16 px 角のこともある）で、UV は 0〜1 の外に出る。海沿いのタイルに多い。"""
-    return any(t == 13 for t, s, e in _image_items(data, sec, k))
+    """k 枚目のテクスチャを、くり返して貼るか（項目 13 があるもの。範囲の端の帯と面で、edge_kind を見よ）。"""
+    return edge_kind(data, sec, k) != 0
 
 
 def parse(data):
-    """R3D を読んで、c3m.parse と同じ形（テクスチャごとの材質、メッシュ 1 つ）で返す。"""
+    """R3D を読んで、c3m.parse と同じ形（テクスチャごとの材質と、メッシュ）で返す。メッシュは本体（種類 0）と、
+    あれば範囲の端の帯（4）と面（3）。"""
     sec = sections(data)
     a, _ = sec[(2, 1)]
     d = struct.unpack_from("<12d", data, a)
@@ -1154,12 +1171,19 @@ def parse(data):
     if (not np.isfinite(pos).all() or np.abs(pos).max() > 1e4 or not np.isfinite(uv).all()
             or len(clamp) and (uv[clamp].min() < -1 or uv[clamp].max() > 2)):
         raise ValueError("頂点か UV がタイルから大きく外れている（読み違え）")
-    groups = {k: fuv[tri_atlas == k].astype(np.int32) for k in range(len(heics)) if (tri_atlas == k).any()}
-    mesh = Mesh(pos[vert], uv, groups)    # v は c3m.Mesh と同じく上向き
+    # 範囲の端の帯と面（edge_kind）は、旧 C3M と同じく別のメッシュ（種類 4 と 3）にする（glb には入れない）
+    kinds = [edge_kind(data, sec, k) for k in range(len(heics))]
+    V = pos[vert]                        # v は c3m.Mesh と同じく上向き
+    meshes = []
+    for kind in [0] + sorted({k for k in kinds if k}, reverse=True):
+        groups = {k: fuv[tri_atlas == k].astype(np.int32) for k in range(len(heics))
+                  if kinds[k] == kind and (tri_atlas == k).any()}
+        if groups or kind == 0:
+            meshes.append(Mesh(V, uv, groups, kind))
     shades = [shade_image(data, sec, k) for k in range(len(heics))]
     return C3M(rot, trans, [Material(h, "jpeg" if h[:2] == b"\xff\xd8" else "heic", r, sh)
                             for h, r, sh in zip(heics, repeat, shades)],
-               [mesh], splats)
+               meshes, splats)
 
 
 def warm():

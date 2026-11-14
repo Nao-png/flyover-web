@@ -16,7 +16,7 @@ from . import edgebreaker, huffman
 class Material:
     image: bytes
     format: str          # "jpeg" か "heic"
-    repeat: bool = False  # 画像をくり返して貼る（R3D の水面などの塗りつぶし用。UV が 0〜1 の外に出る）
+    repeat: bool = False  # 画像をくり返して貼る（R3D の範囲の端の帯と面。r3d.edge_kind を見よ）
     shade: bytes = None   # R3D の日の当たり方の画像（HEIF の灰色、縦横半分。日なたが白、日かげが黒）
 
 
