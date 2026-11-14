@@ -1,5 +1,8 @@
 """Apple Maps のサーバーから Flyover のタイルを取る。
 
+このファイルのうち、マニフェストの読み取り（_varint、_fields、Manifest）と認証（TOKEN_P1、Client.auth）は
+retroplasma の pkg/mps を元にしているので、MIT ライセンス（LICENSE）の対象外（README の「ライセンス」を見よ）。
+
 流れ（retroplasma/flyover-reverse-engineering の pkg/mps、pkg/fly、cmd/export-obj と同じ）:
 
 1. リソースマニフェスト（protobuf）を取り、C3M の URL と認証の tokenP2 を得る

@@ -2,6 +2,7 @@
 
 edgebreaker.py の _traverse・process_clers と huffman.py の Table.decode を、そのまま書き写した
 もの。結果は純 Python 版とビット単位で同じ（Go 版と照合済みの版と、実データ 190 枚で比べてある）。
+このファイルは MIT ライセンス（LICENSE）の対象外（ライセンスのない移植元のコードを元にしているため。README の「ライセンス」を見よ）。
 展開は純 Python の 5 倍ほど速い。コンパイルした結果は __pycache__ に残るので、2 回目からは速く始まる。
 int16 の折り返しは ((x + 0x8000) & 0xFFFF) - 0x8000、Go の uint64 のシフトは範囲外なら 0。
 """

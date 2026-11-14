@@ -132,4 +132,13 @@ C3M reading has been checked to **match the original Go version bit for bit** on
 - Fetched data (`cache/`, `out/`) is Apple's copyrighted material. It is kept out of the repository (`.gitignore`). Do not publish or redistribute it
 - Apple's servers can change without notice, which may break this tool
 - The server only accepts connections from your own PC (127.0.0.1–127.0.0.17)
-- The original, retroplasma/flyover-reverse-engineering, has no license, so this repository has no license either
+
+## License
+
+The parts written for this project are under the [MIT License](LICENSE). The following parts are based on code from retroplasma/flyover-reverse-engineering, which has no license, and are not covered by the MIT License (this project has no right to grant one):
+
+- `flyover/c3m.py`, `flyover/edgebreaker.py`, `flyover/huffman.py` (ports of the Go code)
+- `flyover/_fast.py` (a copy of the heavy parts of the two above)
+- In `flyover/client.py`, reading the manifest (`_varint`, `_fields`, `Manifest`) and authentication (`TOKEN_P1`, `Client.auth`)
+
+Fetched data is Apple's copyrighted material and is not covered by this license.
