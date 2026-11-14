@@ -132,4 +132,13 @@ C3M の読み取りは、元の Go 版と**ビット単位で一致**するこ�
 - 取得したデータ（`cache/`、`out/`）は Apple の著作物です。リポジトリには入らないようにしてあります（`.gitignore`）。公開や再配布はしないでください
 - Apple のサーバーの仕様は予告なく変わります。変わると動かなくなることがあります
 - サーバーは自分の PC の中（127.0.0.1〜127.0.0.17）からの接続だけを受け付けます
-- 移植元の retroplasma/flyover-reverse-engineering にライセンスの表記がないため、このリポジトリにもライセンスを付けていません
+
+## ライセンス
+
+自分で書いた部分は [MIT ライセンス](LICENSE) です。ただし、ライセンスの表記がない retroplasma/flyover-reverse-engineering のコードを元にした次の部分は、MIT の対象外です（こちらに配布を許す権利がないため）。
+
+- `flyover/c3m.py`、`flyover/edgebreaker.py`、`flyover/huffman.py`（Go のコードの移植）
+- `flyover/_fast.py`（上の 2 つの重い部分を書き写したもの）
+- `flyover/client.py` のうち、マニフェストの読み取り（`_varint`、`_fields`、`Manifest`）と認証（`TOKEN_P1`、`Client.auth`）
+
+取得したデータは Apple の著作物で、このライセンスの対象ではありません。

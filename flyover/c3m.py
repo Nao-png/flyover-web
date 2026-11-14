@@ -3,6 +3,7 @@
 retroplasma/flyover-reverse-engineering の pkg/fly/c3m/c3m.go の移植。2026 年の
 サーバーが返すものは先頭が `C3M 03 07` で、5 バイト目が当時の 3 から 7 に上がって
 いるが、第 3 版の読み方でそのまま読める。画像は JPEG（形式 0）か HEIC（形式 13）。
+このファイルは MIT ライセンス（LICENSE）の対象外（ライセンスのない移植元のコードを元にしているため。README の「ライセンス」を見よ）。
 """
 import struct
 from dataclasses import dataclass, field

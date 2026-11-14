@@ -1,6 +1,7 @@
 """C3M のメッシュの展開（Apple 独自の Edgebreaker の変種）。
 
 retroplasma/flyover-reverse-engineering の pkg/fly/c3m/internal/edgebreaker.go の移植。
+このファイルは MIT ライセンス（LICENSE）の対象外（ライセンスのない移植元のコードを元にしているため。README の「ライセンス」を見よ）。
 変数名はあちらに合わせてある（逆コンパイル由来で意味の分からない名前が多い）。
 頂点と UV は int16 の差分で詰められていて、予測との和は int16 で折り返す。
 """

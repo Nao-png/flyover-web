@@ -1,6 +1,7 @@
 """C3M のメッシュの区画を展開するハフマン符号。
 
 retroplasma/flyover-reverse-engineering の pkg/fly/c3m/internal/huffman.go の移植。
+このファイルは MIT ライセンス（LICENSE）の対象外（ライセンスのない移植元のコードを元にしているため。README の「ライセンス」を見よ）。
 あちらは逆コンパイルした処理をそのまま書き起こしたもので、Go の整数の桁あふれ
 （int8・int16・int32 の折り返し、範囲外のシフトは 0）に頼っている。ここでも同じ
 結果になるよう、その振る舞いを関数で再現する。
