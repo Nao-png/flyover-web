@@ -37,6 +37,7 @@ iOS 27 の新しい Flyover（style 98）で見るときは `python scripts/eart
 地球全体から寄っていくと、Flyover のある所では 3D の街が読み込まれます。下地には Apple の衛星画像と地形を使います。
 
 - **検索**: 左上の欄に地名か「緯度, 経度」を入れます。3D のある場所には印が付きます
+- **大気**: 空の色と遠くのかすみを、Google Earth と同じ作者の方法（Bruneton の Precomputed Atmospheric Scattering）で描きます。開いてから 4 秒ほどで切り替わります。右の「A / G」ボタンか G キーで、色合いを Apple マップ本来の見え方（大気の処理をしない）と Google Earth 風（空とかすみが青い）で切り替えます。`?atmo=0` で切ります（[仕組み](docs/how-it-works.md#大気)）
 - **読み込みの速さ**: 最初の 3D は 2〜3 秒で出ます。初めての場所で全部が細かくなるまでは 10〜20 秒ほどかかります（回線の速さしだい）。一度見た場所は `cache/` に保存されるので、2 回目からは 7 秒ほどです
 - **視点の保存**: 今の視点は URL（`#緯度,経度,高度m,方位h,傾きt`）に入るので、ブックマークすればその視点から開けます
 
@@ -140,5 +141,7 @@ C3M の読み取りは、元の Go 版と**ビット単位で一致**するこ�
 - `flyover/c3m.py`、`flyover/edgebreaker.py`、`flyover/huffman.py`（Go のコードの移植）
 - `flyover/_fast.py`（上の 2 つの重い部分を書き写したもの）
 - `flyover/client.py` のうち、マニフェストの読み取り（`_varint`、`_fields`、`Manifest`）と認証（`TOKEN_P1`、`Client.auth`）
+
+`flyover/earth/atmosphere/` の `definitions.glsl`・`functions.glsl` は Eric Bruneton の [precomputed_atmospheric_scattering](https://github.com/ebruneton/precomputed_atmospheric_scattering) のもので、そのライセンス（BSD 3-Clause、[flyover/earth/atmosphere/LICENSE](flyover/earth/atmosphere/LICENSE)）に従います。`flyover/earth/atmosphere.js` はその `model.cc` などを WebGL2 に移したものなので、同じライセンスの表記も守ります。
 
 取得したデータは Apple の著作物で、このライセンスの対象ではありません。

@@ -357,6 +357,7 @@ addEventListener('keydown', e => {
     case 'u': resetView({ top: true }); break;
     case 'r': resetView({ north: true, top: true }); break;
     case 'o': set2D(!mode2D); break;
+    case 'g': if (ATMOSPHERE) setLook(atmoLook === 'apple' ? 'google' : 'apple'); break;
     case 'p': screenshot(e.shiftKey ? '4k' : 'screen'); break;
     case ' ': e.preventDefault(); stopAll(); held.clear(); break;
   }
@@ -540,11 +541,11 @@ const FLY = { min: cfg.minZoom, max: cfg.maxZoom };
 // 大きさは画面の実際の画素で決める（高精細な画面では細かいタイルを使う）。画像は 1 タイルに
 // 512 px 角が 2 枚ほどなので、520 px ほどまでなら 1 段粗いタイルでも見た目はほとんど変わらない
 const SHOW_PX = 175 / devicePixelRatio;     // ズーム 13 のタイルがこの幅（CSS px）より大きく見えたら出す
-const REFINE_PX = 520 / devicePixelRatio;   // タイルがこの幅より大きく見えたら 1 段細かいものにする
+// タイルがこの幅より大きく見えたら 1 段細かいものにする（?lodpx= で変えられる。調べる用）
+const REFINE_PX = (Number(new URLSearchParams(location.search).get('lodpx')) || 520) / devicePixelRatio;
 // 同時に読み込む数。Apple は 1 枚 1 秒ほどかかるので並べるほど速いが、48 本ほどで回線（手元では
 // 65 Mbps ほど）が埋まり、それ以上並べても 1 枚ごとの待ちが延びるだけ
 const MAX_ACTIVE = 48;
-const MAX_OFFSCREEN = 24;  // そのうち画面の外の先読みに使う数（見えているものの枠を空けておく）
 const MAX_MODELS = 240;    // これを超えたら、しばらく使っていないものから捨てる（GPU のメモリを食うので）
 const MAX_MODELS_SHOT = 600;   // スクリーンショットを写す間（4K では 240 では足りず、捨てては読み直す）
 // 新しい Flyover の画像は、HEVC のまま受け取って GPU の専用回路で展開し（hevc.js）、Y と UV の面の
@@ -558,7 +559,7 @@ const BOX_BUDGET = 4;      // 1 コマに地面の高さを調べてよいタイ
 let boxBudget = BOX_BUDGET;
 const flyover = scene.primitives.add(new C.PrimitiveCollection());
 const tiles = new Map();
-let frame = 0, active = 0, activeOff = 0;
+let frame = 0, active = 0;
 
 class Tile {
   constructor(z, x, y) {
@@ -615,24 +616,9 @@ function tileAt(z, x, y) {
 const roots = cfg.coverage.map(([x, y]) => tileAt(9, x, y));
 for (const r of roots) r.sphere = C.BoundingSphere.fromRectangle3D(r.rect, ellipsoid, 0);
 
-// 飛んでいく先の粗いタイル（ズーム 13 と 15 の 3 x 3 枚）を、飛んでいる間に読んでおく
-function prefetch(lat, lon, range) {
-  if (range > 20e3 || mode2D) return;
-  for (const z of [FLY.min, FLY.min + 2]) {
-    const n = 2 ** z, x0 = Math.floor((lon + 180) / 360 * n);
-    const y0 = Math.floor((1 - Math.asinh(Math.tan(C.Math.toRadians(lat))) / Math.PI) / 2 * n);
-    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-      const t = tileAt(z, x0 + dx, y0 + dy);
-      t.wantedAt = performance.now() + 3000;   // 着くまで（3 秒ほど）は、見えていなくても取りやめない
-      if (t.state === 'none') load(t);
-    }
-  }
-}
-
 const loadLog = [];     // 読み込みにかかった時間（調べる用）
-async function load(t, offscreen) {
+async function load(t) {
   t.state = 'loading'; active++;
-  if (offscreen) activeOff++;
   t.abort = new AbortController();
   const t0 = performance.now();
   try {
@@ -643,7 +629,7 @@ async function load(t, offscreen) {
     const buf = new Uint8Array(await r.arrayBuffer());
     const t1 = performance.now();
     await makeModel(t, buf, useHevc);
-    loadLog.push({ z: t.z, x: t.x, y: t.y, off: offscreen, at: t0, bytes: buf.length, fetch: t1 - t0, model: performance.now() - t1,
+    loadLog.push({ z: t.z, x: t.x, y: t.y, at: t0, bytes: buf.length, fetch: t1 - t0, model: performance.now() - t1,
       hevc: t.hevcMs, hevcWork: t.hevcWork, cesium: t.cesiumMs, server: r.headers.get('Server-Timing') });
     if (loadLog.length > 500) loadLog.shift();
   } catch (e) {
@@ -652,13 +638,12 @@ async function load(t, offscreen) {
     else { t.state = 'failed'; t.failedAt = performance.now(); console.warn('Flyover', t.z, t.x, t.y, e); }
   } finally {
     active--; t.abort = null;
-    if (offscreen) activeOff--;
     dirty = true;              // 選び直す
   }
 }
 // 展開は作業用のスレッド HEVC_WORKERS 本に 1 タイルずつ渡し、渡す順はそのときに選ぶ（届いた順に
 // 渡すと、先に届いた画面の外のタイルや小さく見えるタイルの後ろで、見えているタイルが待たされる）。
-// 今見えているものを先に、画面で大きく見えるもの（Tile#pri が小さいもの）から。梅田（HEVC）で、見えて
+// 今見えているものを先に、画面の中央に近いもの（Tile#pri が小さいもの）から。梅田（HEVC）で、見えて
 // いる範囲が出るまでが 1 本では 18 秒、2 本で 14 秒、3 本で 12 秒（6 本でも 12 秒。どれもコマを CPU に読み戻して
 // いたころの数字）
 const HEVC_WORKERS = 3;
@@ -744,6 +729,242 @@ void lightApply(inout czm_modelMaterial material, vec3 pe, vec3 pw, vec4 color) 
   material.diffuse = albedo * L;
 }`;
 })();
+
+// ---------------------------------------------------------------- 大気
+// 空の色と、遠くのかすみ（空気が散らす光と、遠いほど元の色が弱くなること）を、Eric Bruneton の Precomputed
+// Atmospheric Scattering（atmosphere/ と atmosphere.js。BSD ライセンス）で描く。テクスチャはワーカーが別の
+// WebGL で前もって計算し、できたら画面全体の後処理（PostProcessStage）を足す。それまでと、計算できないときは
+// Cesium の空のまま。?atmo=0 で使わない。そのほかの調整は下の atmo... の値
+//
+// 後処理では、奥行きから各点までの距離を求めて、写真の色にかすみをかける。写真の色 p は、空と同じ明るさの曲線
+// tone（ACES）で表した値とみなして光の量 L に戻し、L × 透けぐあい + 空気の光 にしてから曲線に戻す。近くでは
+// 写真の色のまま、遠くでは同じ向きの空の色に近づく。
+// 空は何も描かれていない所（不透明度 0）に下から敷く。スプラット（半透明で奥行きを書かない）やふちの
+// なめらかにした点が空に消されないように、奥行きではなく不透明度で重ねる
+const atmoParams = new URLSearchParams(location.search);
+const ATMOSPHERE = atmoParams.get('atmo') !== '0';
+// 明るさとちりの量は、富山で Google Earth と同じ場所の空と山の色を比べて決めた（元のデモは 10 と 1）
+const atmoExposure = Number(atmoParams.get('exposure')) || 6;
+const atmoHaze = Number(atmoParams.get('haze')) || 0.5;   // 空気中のちりの量の倍率（1 で元のデモの値）
+// 明るさの曲線。aces（既定）は映画で使われる ACES の近似（Narkowicz）で、元のデモの 1 - exp(-x)（?tone=exp）
+// より明暗の差と色が濃く出る
+const atmoAces = atmoParams.get('tone') !== 'exp';
+// 色合い。apple は Apple マップ本来の見え方で、大気の処理をしない（大気を入れる前と同じ。Cesium の空で、
+// 写真はそのまま）。google は大気で Google Earth に寄せた見え方（空とかすみが青く、近くからかすむ）。右のボタンか
+// G キーで切り替え、?look= でも選べる。選んだものはこのブラウザーに覚える。大気のテクスチャは apple のときも
+// 計算しておき、切り替えは後処理を入れたり外したりするだけ。google の値:
+// - balance: 空とかすみ（写真ではない部分）に掛ける色。物理の計算どおりの空は Google Earth の空より青が弱い（どの
+//   曲線でも赤と青の比が合わない）ので、青を少し強める。Google Earth に合わせた値（0.85, 0.88, 1.8）は
+//   青みが強すぎたので控えめにした（緑を下げすぎると地平線の近くが紫がかる）
+// - aerial: 写真（地面と街）に足す空気の光の倍率。距離 d で aerial × (1 + (aerialNear − 1) × exp(−d / aerialKm))。
+//   Google Earth は 2 km ほどの近さでも青いかすみが強く、遠くは物理の計算より弱い（富山で同じ建物の色を比べた）。
+//   それに合わせた 6 倍は青すぎたので、近くは 3 倍に控えた
+// - grey: 写真に足す空気の光を灰色に寄せる割合（青ではなく灰色っぽくかすませたいとき）
+// URL の ?balance=r,g,b・?aerial=・?aerialNear=・?aerialKm=・?grey= で上書きできる
+const ATMO_LOOKS = ['apple', 'google'];
+const atmoNum = (name, d) => (v => Number.isFinite(v) ? v : d)(Number(atmoParams.get(name) ?? NaN));
+const atmoGoogle = (() => {
+  const b = (atmoParams.get('balance') || '').split(',').map(Number);
+  return {
+    balance: b.length === 3 && b.every(Number.isFinite) ? b : [0.95, 0.97, 1.3],
+    aerial: atmoNum('aerial', 0.4), aerialNear: atmoNum('aerialNear', 3),
+    aerialKm: Math.max(atmoNum('aerialKm', 2), 0.01), grey: atmoNum('grey', 0),
+  };
+})();
+let atmoLook = (() => {
+  let saved = null;
+  try { saved = localStorage.getItem('look'); } catch (e) { /* 覚えられない環境 */ }
+  const name = atmoParams.get('look') || saved;
+  return ATMO_LOOKS.includes(name) ? name : 'google';
+})();
+let atmoApply = () => {};   // 大気の後処理ができたら、入れたり外したりする関数になる（startAtmosphere）
+const lookBtn = document.getElementById('look-btn');
+function setLook(name) {
+  atmoLook = name;
+  try { localStorage.setItem('look', name); } catch (e) { /* 覚えられない環境 */ }
+  lookBtn.textContent = name === 'apple' ? 'A' : 'G';
+  lookBtn.title = `色合い: ${name === 'apple' ? 'Apple マップ（大気なし）' : 'Google Earth 風'}（G で切り替え）`;
+  atmoApply();
+  scene.requestRender();
+}
+lookBtn.onclick = () => setLook(atmoLook === 'apple' ? 'google' : 'apple');
+lookBtn.hidden = !ATMOSPHERE;
+setLook(atmoLook);
+// 太陽の方位（北から時計回り）と高さ [°]。?light= に太陽があればそれ、夜は沈んだ太陽、ほかは昼の太陽
+const atmoSun = (() => {
+  const name = atmoParams.get('light');
+  if (LIGHTS[name] && LIGHTS[name].sun) return LIGHTS[name].sun;
+  return name === 'night' ? [0, -20] : [150, 45];
+})();
+const ATMO_BOTTOM_RADIUS = 6360;   // km（atmosphere.js の BOTTOM_RADIUS）
+
+const ATMO_FS = glsl => `
+${atmoAces ? '#define TONE_ACES' : ''}
+precision highp sampler3D;
+uniform sampler2D colorTexture;
+uniform sampler2D depthTexture;
+uniform highp sampler2D transmittance_texture;
+uniform highp sampler3D scattering_texture;
+uniform highp sampler2D irradiance_texture;
+uniform vec3 u_camera;     // 大気の座標（地球の中心が原点、km）でのカメラ
+uniform vec3 u_sun;        // 太陽の向き（地球の座標の軸）
+uniform float u_exposure;
+uniform vec3 u_balance;    // 空とかすみに掛ける色
+uniform vec3 u_aerial;     // 写真に足す空気の光の倍率（遠く、近くで何倍か、目安の距離 [km]）
+uniform float u_grey;      // 写真に足す空気の光を灰色に寄せる割合
+in vec2 v_textureCoordinates;
+${glsl}
+// 明るさの曲線（光の量 → 画面の線形の値）と、その逆
+#ifdef TONE_ACES
+// ACES の近似（Narkowicz）: y = (a x² + b x) / (c x² + d x + e)
+const float TONE_A = 2.51, TONE_B = 0.03, TONE_C = 2.43, TONE_D = 0.59, TONE_E = 0.14;
+vec3 tone(vec3 x) { return clamp((x * (TONE_A * x + TONE_B)) / (x * (TONE_C * x + TONE_D) + TONE_E), 0.0, 1.0); }
+vec3 untone(vec3 y) {
+  y = min(y, vec3(0.999));
+  // a x² + b x + c = 0 の正の解（a < 0、c ≥ 0）
+  vec3 a = y * TONE_C - TONE_A, b = y * TONE_D - TONE_B, c = y * TONE_E;
+  return (-b - sqrt(max(b * b - 4.0 * a * c, 0.0))) / (2.0 * a);
+}
+#else
+vec3 tone(vec3 x) { return 1.0 - exp(-x); }
+vec3 untone(vec3 y) { return -log(max(1.0 - y, vec3(1e-4))); }
+#endif
+void main() {
+  vec4 c = texture(colorTexture, v_textureCoordinates);
+  float depth = czm_unpackDepth(texture(depthTexture, v_textureCoordinates));
+  bool hit = depth < 1.0;
+  // 見ている向き（目の座標）。近い面の上の点から求める
+  vec4 nearPoint = czm_inverseProjection * vec4(v_textureCoordinates * 2.0 - 1.0, -1.0, 1.0);
+  vec3 dirEye = normalize(nearPoint.xyz / nearPoint.w);
+  vec3 dir = normalize(czm_inverseViewRotation * dirEye);
+  // 奥行きは対数で入っている（近い面からの距離 + 1 の log2）。czm_windowToEyeCoordinates は遠い面が 100 億 m
+  // と遠いので精度が足りず、距離がほぼ 0 になる。対数から直接戻す
+  float viewZ = exp2(depth * czm_log2FarDepthFromNearPlusOne) - 1.0 + czm_currentFrustum.x;
+  float distance = viewZ / -dirEye.z;
+  vec3 transmittance;
+  vec3 sky = vec3(0.0);
+  if (c.a < 1.0) {
+    vec3 L = GetSkyRadiance(ATMOSPHERE, transmittance_texture, scattering_texture, scattering_texture,
+        u_camera, dir, 0.0, u_sun, transmittance);
+    if (dot(dir, u_sun) > cos(ATMOSPHERE.sun_angular_radius))
+      L += transmittance * ATMOSPHERE.solar_irradiance /
+          (PI * ATMOSPHERE.sun_angular_radius * ATMOSPHERE.sun_angular_radius);
+    sky = tone(L * u_balance * u_exposure);
+  }
+  vec3 p = c.a > 0.0 ? pow(clamp(c.rgb / c.a, 0.0, 1.0), vec3(2.2)) : vec3(0.0);
+  if (hit && c.a > 0.0) {
+    vec3 point = u_camera + dir * (distance / 1000.0);
+    vec3 S = GetSkyRadianceToPoint(ATMOSPHERE, transmittance_texture, scattering_texture, scattering_texture,
+        u_camera, point, 0.0, u_sun, transmittance);
+    float aerial = u_aerial.x * (1.0 + (u_aerial.y - 1.0) * exp(-distance / 1000.0 / u_aerial.z));
+    S *= u_balance;
+    S = mix(S, vec3(dot(S, vec3(0.2126, 0.7152, 0.0722))), u_grey);
+    p = tone(untone(p) * transmittance + S * aerial * u_exposure);
+  }
+  out_FragColor = vec4(pow(p * c.a + sky * (1.0 - c.a), vec3(1.0 / 2.2)), 1.0);
+}`;
+
+async function startAtmosphere() {
+  const t0 = performance.now();
+  const worker = new Worker('atmosphere.js');
+  const data = await new Promise(resolve => {
+    worker.onmessage = e => resolve(e.data);
+    worker.onerror = e => resolve({ ok: false, error: e.message });
+    worker.postMessage({ haze: atmoHaze });
+  });
+  worker.terminate();
+  if (!data.ok) {
+    console.warn('大気を計算できないので、Cesium の空のままにする:', data.error);
+    return;
+  }
+  // Cesium の WebGL にテクスチャを作る。Cesium のサンプラーは _target と _texture だけを見てつなぐ
+  const gl = scene.context._gl;
+  const floatLinear = !!gl.getExtension('OES_texture_float_linear');
+  const texture = (target, internal, w, h, d, pixels) => {
+    const t = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(target, t);
+    gl.texParameteri(target, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(target, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(target, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(target, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    if (target === gl.TEXTURE_3D) {
+      gl.texParameteri(target, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+      gl.texImage3D(target, 0, internal, w, h, d, 0, gl.RGBA, gl.FLOAT, pixels);
+    } else {
+      gl.texImage2D(target, 0, internal, w, h, 0, gl.RGBA, gl.FLOAT, pixels);
+    }
+    gl.bindTexture(target, null);
+    return { _target: target, _texture: t, dimensions: new C.Cartesian2(w, h) };
+  };
+  const tex = {
+    transmittance: texture(gl.TEXTURE_2D, floatLinear ? gl.RGBA32F : gl.RGBA16F, 256, 64, 1, data.transmittance),
+    scattering: texture(gl.TEXTURE_3D, gl.RGBA16F, 256, 128, 32, data.scattering),
+    irradiance: texture(gl.TEXTURE_2D, gl.RGBA16F, 64, 16, 1, data.irradiance),
+  };
+
+  // カメラは、真下の楕円体からの高さで大気の球（半径 6360 km）の上に置く（地球の座標のまま km にすると、
+  // 楕円体と球の半径の差で地面が大気の底からずれる）。各点はカメラからの向きと距離で決めるので、同じ球の上に乗る
+  const camera0 = new C.Cartesian3(), up = new C.Cartesian3(), sun = new C.Cartesian3();
+  const balance = C.Cartesian3.fromArray(atmoGoogle.balance);
+  const aerial = new C.Cartesian3(atmoGoogle.aerial, atmoGoogle.aerialNear, atmoGoogle.aerialKm);
+  const enu = new C.Matrix4();
+  const [az, el] = atmoSun.map(d => d * Math.PI / 180);
+  const sunENU = new C.Cartesian3(Math.sin(az) * Math.cos(el), Math.cos(az) * Math.cos(el), Math.sin(el));
+  let frame = -1;
+  const update = () => {
+    if (frame === scene.frameState.frameNumber) return;
+    frame = scene.frameState.frameNumber;
+    const p = camera.positionWC;
+    const carto = ellipsoid.cartesianToCartographic(p);
+    const h = carto ? carto.height : C.Cartesian3.magnitude(p) - 6378137;
+    ellipsoid.geodeticSurfaceNormal(p, up);
+    C.Cartesian3.multiplyByScalar(up, ATMO_BOTTOM_RADIUS + Math.max(h, 1) / 1000, camera0);    C.Transforms.eastNorthUpToFixedFrame(p, ellipsoid, enu);
+    C.Matrix4.multiplyByPointAsVector(enu, sunENU, sun);
+    C.Cartesian3.normalize(sun, sun);
+  };
+  const stage = new C.PostProcessStage({
+    name: 'atmosphere',
+    fragmentShader: ATMO_FS(data.glsl),
+    uniforms: {
+      transmittance_texture: () => tex.transmittance,
+      scattering_texture: () => tex.scattering,
+      irradiance_texture: () => tex.irradiance,
+      u_camera: () => (update(), camera0),
+      u_sun: () => (update(), sun),
+      u_exposure: () => atmoExposure,
+      u_balance: () => balance,
+      u_aerial: () => aerial,
+      u_grey: () => atmoGoogle.grey,
+    },
+  });
+  scene.postProcessStages.add(stage);
+  // 大気を使うときは、空を後処理で描くので、Cesium の空・星・太陽・月と、地面の大気、霧の色を消す（霧で遠くを
+  // 読まない働きは残す）。何も描かれていない所の不透明度を 0 にして、後処理で空を敷く場所にする。使わないとき
+  // （apple）は、もとの Cesium の設定に戻す
+  const cesium = {
+    sky: scene.skyAtmosphere.show, stars: scene.skyBox.show, sun: scene.sun.show, moon: scene.moon.show,
+    background: scene.backgroundColor.clone(), ground: globe.showGroundAtmosphere, fog: scene.fog.renderable,
+  };
+  atmoApply = () => {
+    const on = atmoLook !== 'apple';
+    stage.enabled = on;
+    scene.skyAtmosphere.show = on ? false : cesium.sky;
+    scene.skyBox.show = on ? false : cesium.stars;
+    scene.sun.show = on ? false : cesium.sun;
+    scene.moon.show = on ? false : cesium.moon;
+    scene.backgroundColor = on ? new C.Color(0, 0, 0, 0) : cesium.background.clone();
+    globe.showGroundAtmosphere = on ? false : cesium.ground;
+    scene.fog.renderable = on ? false : cesium.fog;
+  };
+  atmoApply();
+  scene.requestRender();
+  console.log(`大気: 計算 ${data.ms} ms、全体 ${Math.round(performance.now() - t0)} ms`);
+}
+if (ATMOSPHERE) startAtmosphere();
 
 // ?season=sakura（桜）か ?season=momiji（紅葉）で、木（緑のスプラット）の色を変える。芝生などはメッシュの写真
 // なので、スプラットだけを変えれば、おもに木が変わる（新宿御苑で、緑のスプラットのうち地面から 3 m 未満は 4%）。
@@ -1245,15 +1466,23 @@ function updateFlyover() {
     const cv = camera.frustum.computeCullingVolume(camPos, camera.directionWC, camera.upWC);
     const k = lodScale * canvas.clientHeight / (2 * Math.tan(camera.frustum.fovy / 2));   // 写すときは写す大きさの細かさ
     const now = performance.now();
-    // 回したときにすぐ出せるよう、カメラのまわりこの距離までは、画面の外（後ろ側）も先に読む
+    // 地域を外す距離の目安（ズーム 13 のタイルの先読みの範囲だったもの）
     const aroundR = C.Math.clamp(altitude() * 2.5, 1500, 20000);
     const dist = t => Math.max(1, Math.sqrt(t.flat().distanceSquaredTo(camPos)));
     const visible = t => cv.computeVisibility(t.box()) !== C.Intersect.OUTSIDE;
-    const want = (t, d, vis) => {
-      t.wanted = frame; t.wantedAt = now; t.pri = d / t.width;
+    // 画面の中央からの角度（タイルの広がりの分を引く。中央にかかっていれば 0）
+    const toTile = new C.Cartesian3();
+    const fromCenter = (t, d) => {
+      const c = t.flat().center;
+      C.Cartesian3.normalize(C.Cartesian3.subtract(c, camPos, toTile), toTile);
+      const ang = Math.acos(C.Math.clamp(C.Cartesian3.dot(toTile, camera.directionWC), -1, 1));
+      return Math.max(0, ang - Math.atan(t.width * 0.71 / d));
+    };
+    const want = (t, d) => {
+      t.wanted = frame; t.wantedAt = now; t.pri = fromCenter(t, d);
       if (t.state === 'failed' && now - t.failedAt > 15000) t.state = 'none';
-      // 画面で大きく見えるものから。画面の外のものは後回し
-      if (t.state === 'none') queue.push({ t, vis, pri: t.pri });
+      // 画面の中央に近いものから（Apple マップのように）
+      if (t.state === 'none') queue.push({ t, pri: t.pri });
     };
     // 読み込み済みの子孫（3 段下まで）で埋め尽くせるか。必要なタイルが届くまでの代わりに使う
     // （離れたときに、手持ちの細かいタイルを隠して穴にしない）
@@ -1263,26 +1492,27 @@ function updateFlyover() {
       return t.kids.every(c => { c.lvis = visible(c); return !c.lvis || loadedCover(c, depth - 1); });
     };
     // 1 回目: 見えるか・細かくするかを決めて読むものを選び、子孫で埋め尽くせるか（cov）を返す
-    const visit = (t, parentLoads) => {
+    const visit = t => {
       t.vis = visible(t);
       t.refine = false;
       const d = dist(t);
-      // 粗いズーム 13 のタイル（遠景）は数が少ないので、もっと遠くまで先に読んでおく
-      if (!t.vis && (shooting || d > (t.z <= FLY.min ? aroundR * 4 : aroundR))) return true;   // 写す間は画面の外を読まない
-      t.touched = frame;                 // 見ている所か、そのまわり（捨てるときの順番に使う）
+      // 画面に写っている範囲だけを読む（画面の外は先読みしない）
+      if (!t.vis) return true;
+      t.touched = frame;                 // 見ている所（捨てるときの順番に使う）
       if (t.z < FLY.min) {
         t.refine = t.width / 2 ** (FLY.min - t.z) * k / d >= SHOW_PX;
-        if (t.refine) for (const c of t.children()) visit(c, false);
+        if (t.refine) for (const c of t.children()) visit(c);
         return true;
       }
       const px = t.width * k / d;
       if (t.z === FLY.min && px < SHOW_PX) { t.vis = false; return true; }
       const settledEmpty = t.state === 'empty' || t.state === 'failed';
       t.refine = t.z < FLY.max && px > REFINE_PX && !settledEmpty;
-      if (!t.refine || t.z === FLY.min || !parentLoads) want(t, d, t.vis);
-      const loads = t.wanted === frame || t.state === 'ready' || t.state === 'loading';
+      // 途中の階層は読まず、目的のズーム（これ以上細かくしないタイル）だけを読む。届くまでは手元にある
+      // タイル（前に読んだ細かいものか粗いもの）で埋める
+      if (!t.refine) want(t, d);
       let kidsCov = true;
-      if (t.refine) for (const c of t.children()) kidsCov = visit(c, loads) && kidsCov;
+      if (t.refine) for (const c of t.children()) kidsCov = visit(c) && kidsCov;
       t.kidsCov = kidsCov;
       t.descCov = !t.refine && t.vis && t.state !== 'ready' && loadedCover(t, 3);
       t.cov = !t.vis || (t.refine && kidsCov) || t.state === 'ready' || t.descCov;
@@ -1314,7 +1544,7 @@ function updateFlyover() {
     const far = Math.max(aroundR * 4, 6000 * k / SHOW_PX);
     const near = new Set(roots.filter(r => C.Cartesian3.distance(r.sphere.center, camPos) - r.sphere.radius < far));
     for (const r of roots) if (!near.has(r)) { r.vis = false; r.refine = false; }
-    for (const r of near) visit(r, false);
+    for (const r of near) visit(r);
     for (const r of near) draw(r);
   }
   // 表示の切り替え
@@ -1333,17 +1563,13 @@ function updateFlyover() {
     // 戻ってきたときに初めからになる）
     if (t.state === 'loading' && now - t.wantedAt > 4000 && t.abort) t.abort.abort();
   }
-  // 読み込み
-  // 画面に見えているものを先に、画面で大きく見えるものから。画面の外の先読みは、見えているものが
-  // 全部届いてから（同時に読むと、ブラウザがモデルを作る手間を取り合って遅くなる）、MAX_OFFSCREEN 本まで
-  queue.sort((a, b) => b.vis - a.vis || a.pri - b.pri);
-  const visWaiting = active > activeOff || queue.some(q => q.vis);
-  for (const { t, vis } of queue) {
+  // 読み込み: 画面に写っているものだけを、画面の中央に近いものから
+  queue.sort((a, b) => a.pri - b.pri);
+  for (const { t } of queue) {
     if (active >= MAX_ACTIVE) break;
-    if (!vis && (visWaiting || activeOff >= MAX_OFFSCREEN)) break;
-    load(t, !vis);
+    load(t);
   }
-  // 捨てる: 見ている所とそのまわりで最近たどっていないものから（親は子で置き換わって表示して
+  // 捨てる: 見ている所で最近たどっていないものから（親は子で置き換わって表示して
   // いなくても、穴を埋める役なので残す）
   const maxModels = shooting ? MAX_MODELS_SHOT : MAX_MODELS;
   if (n > maxModels) {              // 毎コマにならないよう、20 個ぶん余裕を作る
@@ -1518,7 +1744,6 @@ function flyToPlace({ lat, lon, bbox }) {
     const size = Math.max(C.Cartesian3.distance(C.Cartesian3.fromDegrees(w, s), C.Cartesian3.fromDegrees(e, n)), 300);
     range = C.Math.clamp(size * 1.1, 800, 3e6);
   }
-  prefetch(lat, lon, range);
   const ground = geoid(lat, lon);
   const tilt = range < 50e3 ? -40 : -90;
   camera.flyToBoundingSphere(new C.BoundingSphere(C.Cartesian3.fromDegrees(lon, lat, ground), 0), {
