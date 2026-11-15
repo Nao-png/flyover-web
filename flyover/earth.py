@@ -184,7 +184,7 @@ class Earth:
         if region is None:
             return None
         hevc = hevc and self.r3d
-        kind = ("glb98_19h" if hevc else "glb98_19") if self.r3d else "glb4"    # 作り方を変えたら番号を上げる
+        kind = ("glb98_20h" if hevc else "glb98_20") if self.r3d else "glb4"    # 作り方を変えたら番号を上げる
         d = os.path.join(self.cache_dir, kind, f"{region['region']}_{region['version']}", str(z))
         path = os.path.join(d, f"{x}_{y}.glb")
         t0 = time.perf_counter()
@@ -214,6 +214,21 @@ class Earth:
             os.replace(tmp, path)
             return out
 
+    def captured(self, z, x, y):
+        """新しい Flyover の写真を撮った時刻（Unix 時刻）。なければ None。時刻はズーム 20 のタイルにしか
+        入っていないので、ビューアは粗いズームで見ているときも、画面の中央のズーム 20 のタイルを聞く。
+        区分の 1 つだけを取る（取ったものは cache/r3d/ に残る）。"""
+        if not self.r3d or z != MAX_ZOOM:
+            return None
+        region = self.client.region_of_tile(x, y, z, strict=True)
+        if region is None:
+            return None
+        for h in self.client.r3d_heights(x, y, z) or [0]:
+            b = self.client.r3d_tile_cached(region, x, y, z, h)
+            if b:
+                return r3d.captured_time(b)
+        return None
+
     def satellite(self, z, x, y):
         with self._lock(("sat", z, x, y)):
             return self.client.satellite(x, y, z)
@@ -231,6 +246,7 @@ ROUTES = [
     (re.compile(r"/api/flyover/(\d+)/(\d+)/(\d+)\.glb"), "flyover"),
     (re.compile(r"/api/sat/(\d+)/(\d+)/(\d+)\.jpg"), "sat"),
     (re.compile(r"/api/terrain/(\d+)/(\d+)/(\d+)\.bin"), "terrain"),
+    (re.compile(r"/api/captured/(\d+)/(\d+)/(\d+)"), "captured"),
 ]
 
 
@@ -288,6 +304,8 @@ def handler(earth):
                     out = earth.flyover(a, b, c, timing, query.get("hevc") == ["1"])
                     # ブラウザには覚えさせない（作り方を変えたときに古いものが残らないよう）。cache/ にはある
                     return self.send(200 if out else 204, out or b"", "model/gltf-binary", cache=False, timing=timing)
+                if kind == "captured":
+                    return self.send(200, json.dumps(earth.captured(a, b, c)).encode(), "application/json", cache=False)
                 if kind == "sat":
                     out = earth.satellite(a, b, c)
                     return self.send(200, out, "image/jpeg") if out else self.send(404)

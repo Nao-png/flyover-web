@@ -628,6 +628,8 @@ async function load(t) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const buf = new Uint8Array(await r.arrayBuffer());
     const t1 = performance.now();
+    const asset = glbJson(buf).asset;
+    t.captured = asset.extras && asset.extras.captured;     // 写真を撮った時刻（新しい Flyover だけ）
     await makeModel(t, buf, useHevc);
     loadLog.push({ z: t.z, x: t.x, y: t.y, at: t0, bytes: buf.length, fetch: t1 - t0, model: performance.now() - t1,
       hevc: t.hevcMs, hevcWork: t.hevcWork, cesium: t.cesiumMs, server: r.headers.get('Server-Timing') });
@@ -680,10 +682,15 @@ const hevcDecode = (t, images) => new Promise((resolve, reject) => {
   hevcNext();
 });
 
+// glb の JSON の部分
+function glbJson(buf) {
+  const jl = new DataView(buf.buffer, buf.byteOffset).getUint32(12, true);
+  return JSON.parse(new TextDecoder().decode(buf.subarray(20, 20 + jl)));
+}
 // glb の材質の extras.hevc（flyover/glb.py の tile_glb を見よ）から、HEVC の設定とコマを番号順に取り出す
 function glbHevc(buf) {
   const jl = new DataView(buf.buffer, buf.byteOffset).getUint32(12, true);
-  const g = JSON.parse(new TextDecoder().decode(buf.subarray(20, 20 + jl)));
+  const g = glbJson(buf);
   const part = i => {
     const v = g.bufferViews[i], o = 28 + jl + (v.byteOffset || 0);
     return buf.slice(o, o + v.byteLength);
@@ -1629,6 +1636,32 @@ canvas.addEventListener('pointermove', e => { mouse = new C.Cartesian2(e.offsetX
 canvas.addEventListener('pointerleave', () => { mouse = null; $('cursor').textContent = ''; });
 scene.postRender.addEventListener(() => { rendered++; });
 
+// 画面の中央の、新しい Flyover の写真を撮った日（その場所の太陽時の日付）。時刻はズーム 20 のタイルにしか
+// 入っていないので、中央の地面にかかるズーム 20 のタイルの時刻を使う。読み込んであればその時刻、なければ
+// サーバーに聞く（/api/captured。聞いた結果は覚えておく）。中央が空や旧 C3M の所なら空
+const capturedAsked = new Map();       // 'x/y' -> 時刻、null（ない）、undefined（聞いている）
+function capturedAtCenter() {
+  if (!cfg.r3d || mode2D) return '';
+  const r = pick(new C.Cartesian2(canvas.clientWidth / 2, canvas.clientHeight / 2), true);
+  const at = r && ellipsoid.cartesianToCartographic(r.p);
+  if (!at) return '';
+  const n = 2 ** FLY.max, lat = at.latitude;
+  const x = Math.floor((C.Math.toDegrees(at.longitude) + 180) / 360 * n);
+  const y = Math.floor((1 - Math.asinh(Math.tan(lat)) / Math.PI) / 2 * n);
+  const key = x + '/' + y, t = tiles.get(FLY.max + '/' + key);
+  let ts = t && t.state === 'ready' ? t.captured : capturedAsked.get(key);
+  if (!(t && t.state === 'ready') && !capturedAsked.has(key)) {
+    capturedAsked.set(key, undefined);
+    fetch(`/api/captured/${FLY.max}/${key}`).then(r => r.ok ? r.json() : null).catch(() => null).then(v => {
+      capturedAsked.set(key, v);
+      scene.requestRender(); mouseMoved = true;           // 帯を書き直す
+    });
+  }
+  if (!ts) return '';
+  const d = new Date((ts + C.Math.toDegrees(at.longitude) / 15 * 3600) * 1000);
+  return `撮影 ${d.getUTCFullYear()}/${d.getUTCMonth() + 1}/${d.getUTCDate()}`;
+}
+
 const needle = document.getElementById('needle');
 const shownView = new C.Matrix4();
 let cursorAt = 0;
@@ -1650,6 +1683,8 @@ setInterval(() => {
   // カメラの高度（海抜）
   const c = ellipsoid.cartesianToCartographic(camera.positionWC);
   if (c) $('camera').textContent = 'カメラ ' + fmtDist(c.height - geoid(C.Math.toDegrees(c.latitude), C.Math.toDegrees(c.longitude)));
+  // 画面の中央に写っている新しい Flyover の写真を撮った日（Google Earth の画像の日付のように）
+  if (refresh) $('date').textContent = capturedAtCenter();
   // カーソルの位置と標高
   if (mouse && refresh) {
     const r = pick(mouse);
