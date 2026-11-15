@@ -37,6 +37,7 @@ To view the new Flyover of iOS 27 (style 98), start with `python scripts/earth.p
 Zoom in from the whole Earth, and wherever Flyover exists the 3D city loads. Apple's satellite imagery and terrain are used underneath.
 
 - **Search**: Type a place name or "latitude, longitude" in the box at the top left. Places with 3D are marked
+- **Atmosphere**: The sky color and the haze in the distance are drawn with the same method as Google Earth, by the same author (Bruneton's Precomputed Atmospheric Scattering). It switches on about 4 seconds after opening. The "A / G" button on the right or the G key switches the look between Apple Maps' own (no atmosphere processing) and Google Earth style (blue sky and haze). `?atmo=0` turns it off ([how it works](docs/how-it-works.en.md#atmosphere))
 - **Loading speed**: The first 3D appears in 2–3 seconds. In a place you haven't visited, it takes about 10–20 seconds until everything is at full detail (depending on your connection). Places you have seen are saved in `cache/`, so the second time takes about 7 seconds
 - **Saving a view**: The current view is kept in the URL (`#lat,lon,altitude m,heading h,tilt t`), so a bookmark opens that same view
 
@@ -140,5 +141,7 @@ The parts written for this project are under the [MIT License](LICENSE). The fol
 - `flyover/c3m.py`, `flyover/edgebreaker.py`, `flyover/huffman.py` (ports of the Go code)
 - `flyover/_fast.py` (a copy of the heavy parts of the two above)
 - In `flyover/client.py`, reading the manifest (`_varint`, `_fields`, `Manifest`) and authentication (`TOKEN_P1`, `Client.auth`)
+
+`definitions.glsl` and `functions.glsl` in `flyover/earth/atmosphere/` come from Eric Bruneton's [precomputed_atmospheric_scattering](https://github.com/ebruneton/precomputed_atmospheric_scattering) and are under its license (BSD 3-Clause, [flyover/earth/atmosphere/LICENSE](flyover/earth/atmosphere/LICENSE)). `flyover/earth/atmosphere.js` is a WebGL2 port of its `model.cc` and related code, so it also keeps that license's notice.
 
 Fetched data is Apple's copyrighted material and is not covered by this license.
