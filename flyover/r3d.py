@@ -19,7 +19,7 @@ docs/how-it-works.md の「新しい Flyover（style 98）」を見よ）。テ�
     区画（三角形の数・頂点の数など）、位置の BYET ブロック、余分なブロックの数とそのブロック
     （海沿いの低いズームで 1 つ。頂点ごとの 1 ビットの印で、海や湖の縁から約 67 m 下へ垂らした帯の下側の頂点）、
     数 2 つ（UV の数を同じ式にしたもの。2 つ目はまれに少し大きい）、
-    UV の継ぎ目のブロック、チャートの数、チャートごとの番号のブロック（ふつうは空。意味は分からない）、
+    UV の継ぎ目のブロック、チャートの数、チャートごとのテクスチャの番号のブロック（テクスチャが 1 枚なら空）、
     UV の BYET ブロック、法線（ここでは読まない）。
 BYET ブロックは 80 4A 00 のあとに J（使うレーンのビット、レーンごとの 2 ビットの種類、レーンの長さ）と
 レーンの中身。レーンの中身は値の数とハフマン符号の封筒 2 つ（ビットマップとリテラル）で、ビットマップの
@@ -1140,6 +1140,16 @@ def repeat_texture(data, sec, k):
     return edge_kind(data, sec, k) != 0
 
 
+def captured_time(data, sec=None):
+    """写真を撮った時刻（Unix 時刻）。なければ None。part 2 の最初の項目（152 バイト）の終わりの 8 バイトが
+    double の時刻で、ふつうは 0。入っているのはズーム 20 のタイルだけ（手元ではズーム 20 の 98%）。時刻と
+    場所から計算した太陽の向きの影が、日の当たり方の画像と合う。"""
+    sec = sec or sections(data)
+    a, z = sec[(2, 1)]
+    t = struct.unpack_from("<d", data, z - 8)[0] if z - a == 152 else 0.0
+    return t if 1e9 < t < 4e9 else None
+
+
 def parse(data):
     """R3D を読んで、c3m.parse と同じ形（テクスチャごとの材質と、メッシュ）で返す。メッシュは本体（種類 0）と、
     あれば範囲の端の帯（4）と面（3）。"""
@@ -1147,6 +1157,7 @@ def parse(data):
     a, _ = sec[(2, 1)]
     d = struct.unpack_from("<12d", data, a)
     rot, trans = np.array(d[:9]).reshape(3, 3), np.array(d[9:12])
+    captured = captured_time(data, sec)
     splats = None
     if (1, 3) in sec:
         # スプラットを読み違えたとき（今のところ手元のタイルでは起きない）に備える。
@@ -1159,7 +1170,7 @@ def parse(data):
         except (ValueError, IndexError, KeyError, struct.error, EOFError):
             splats = None
     if (2, 3) not in sec:                # 画像がない（高い区分にある、メッシュの空なもの）
-        return C3M(rot, trans, [], [], splats)
+        return C3M(rot, trans, [], [], splats, captured)
     heics = [texture(data, sec, k) for k in range(len(sec["atlases"]))]
     a, z = sec[(2, 2)]
     pos, fc, uv, fuv, tri_atlas = decode_mesh(data[a:z], [_image_size(h) for h in heics])
@@ -1183,7 +1194,7 @@ def parse(data):
     shades = [shade_image(data, sec, k) for k in range(len(heics))]
     return C3M(rot, trans, [Material(h, "jpeg" if h[:2] == b"\xff\xd8" else "heic", r, sh)
                             for h, r, sh in zip(heics, repeat, shades)],
-               meshes, splats)
+               meshes, splats, captured)
 
 
 def warm():

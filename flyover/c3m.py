@@ -38,6 +38,7 @@ class C3M:
     materials: list
     meshes: list
     splats: object = None                    # 新しい Flyover（r3d.py）の三角形のスプラット（r3d.Splats）
+    captured: float = None                   # 新しい Flyover の写真を撮った時刻（Unix 時刻。入っていなければ None）
 
     def to_ecef(self, v):
         return np.asarray(v, np.float64) @ self.rotation.T + self.translation

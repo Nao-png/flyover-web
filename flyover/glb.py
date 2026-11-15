@@ -268,6 +268,9 @@ def tile_glb(c3ms, quality=85, hevc=False):
                      "samplers": [{"magFilter": 9729, "minFilter": 9987, "wrapS": 33071, "wrapT": 33071},
                                   {"magFilter": 9729, "minFilter": 9987, "wrapS": 10497, "wrapT": 10497}],
                      "images": images})
+    captured = [c.captured for c in c3ms if getattr(c, "captured", None)]
+    if captured:                        # 写真を撮った時刻（ビューアが日付を出す）。区分で違えば新しいほう
+        gltf["asset"]["extras"] = {"captured": max(captured)}
     js = json.dumps(gltf, separators=(",", ":")).encode()
     js += b" " * (-len(js) % 4)
     return b"".join([struct.pack("<4sII", b"glTF", 2, 12 + 8 + len(js) + 8 + len(bin_)),
