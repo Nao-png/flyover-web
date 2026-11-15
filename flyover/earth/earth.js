@@ -722,13 +722,21 @@ const lightGlsl = !light ? '' : (() => {
 void lightApply(inout czm_modelMaterial material, vec3 pe, vec3 pw, vec4 color) {
   // 撮ったときの日なた（1）・日かげ（0）。メッシュは日の当たり方の画像、スプラットは不透明度の下位 6 ビット
   float lit = color == vec4(1.0) ? material.occlusion : mod(floor(color.a * 65535.0 + 0.5), 64.0) / 63.0;
-  // 影を取り除いた色。日かげは日なたの R 0.10・G 0.15・B 0.17 倍ほど（線形の値。青い空の光だけが当たる）に写っている
-  // （新しい Flyover の 67 枚の写真の、日の当たり方の画像が白い所と黒い所の中央値の比）
-  vec3 albedo = material.diffuse / mix(vec3(0.10, 0.15, 0.17), vec3(1.0), clamp(lit, 0.0, 1.0));
   ${light.check ? 'material.diffuse = vec3(lit); return;' : ''}
   vec3 n = normalize(cross(dFdx(pe), dFdy(pe)));
   if (dot(n, pe) > 0.0) n = -n;                       // 見ている側を向ける（目の位置が原点）
   vec3 up = normalize(pw), east = normalize(cross(vec3(0.0, 0.0, 1.0), up)), north = cross(up, east);
+  // 撮ったときの太陽（u_sun0。東・北・上の向き。撮影時刻と場所から計算する。分からなければ z が 0）に対する
+  // 面の向き。日なたの明るさは、水平な面を 1 として、太陽に向いた壁ほど明るく、斜めに当たる面ほど暗く写っている。
+  // 面の向きの誤りで極端にならないよう、0.25〜2 倍に抑える
+  float k = 1.0;
+  if (u_sun0.z > 0.0) {
+    vec3 s0 = normalize(czm_viewRotation * (east * u_sun0.x + north * u_sun0.y + up * u_sun0.z));
+    k = clamp(dot(n, s0) / u_sun0.z, 0.25, 2.0);
+  }
+  // 影を取り除いた色。日かげは日なたの R 0.10・G 0.15・B 0.17 倍ほど（線形の値。青い空の光だけが当たる）に写っている
+  // （新しい Flyover の 67 枚の写真の、日の当たり方の画像が白い所と黒い所の中央値の比）
+  vec3 albedo = material.diffuse / mix(vec3(0.10, 0.15, 0.17), vec3(1.0), clamp(lit, 0.0, 1.0) * k);
   vec3 upE = normalize(czm_viewRotation * up);
   vec3 sunE = normalize(czm_viewRotation * (east * ${sunENU[0].toFixed(5)} + north * ${sunENU[1].toFixed(5)} + up * ${sunENU[2].toFixed(5)}));
   float sky = 0.65 + 0.35 * dot(n, upE);              // 上を向いた面ほど空の光が多い
@@ -1257,8 +1265,9 @@ const tweakCall = (seasonGlsl ? 'seasonTint(material, fsInput.attributes.positio
 
 // 季節の色と光の当たり方だけのシェーダー（HEVC でない glb）。頂点の色があるのはスプラットだけで、メッシュには
 // Cesium が白を入れるので、季節の色では写真（パリのような JPEG のテクスチャも）は変わらない
+const sun0Uniform = () => ({ u_sun0: { type: C.UniformType.VEC3, value: new C.Cartesian3(0, 0, 0) } });
 function tweakShader() {
-  return new C.CustomShader({ fragmentShaderText: `${tweakGlsl}
+  return new C.CustomShader({ uniforms: lightGlsl ? sun0Uniform() : {}, fragmentShaderText: `${tweakGlsl}
 void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
   ${tweakCall}
 }` });
@@ -1320,7 +1329,7 @@ function hevcShader(planes) {
   // 控えのテクスチャは、シェーダーを捨てるときに一緒に捨てられる
   const made = {}, never = { fetchImage: () => new Promise(() => {}) };
   const ready = () => ({ type: C.UniformType.SAMPLER_2D, value: new C.TextureUniform({ url: never, ...filters }) });
-  const uniforms = {};
+  const uniforms = lightGlsl ? sun0Uniform() : {};
   let pick = '';
   planes.forEach((p, i) => {
     if (p.bitmap) {
@@ -1355,8 +1364,9 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
 // テクスチャを作り終えたら、元の Y と UV の配列を手放す（JS のメモリに残さない）
 function releasePlanes(t) {
   const tm = t.shader._textureManager, u = t.shader.uniforms;
-  if (!tm || !Object.keys(u).every(k => tm._textures[k])) return;
-  for (const k in u) u[k].value.typedArray = undefined;
+  const planes = Object.keys(u).filter(k => k !== 'u_sun0');
+  if (!tm || !planes.every(k => tm._textures[k])) return;
+  for (const k of planes) u[k].value.typedArray = undefined;
   t.planesFreed = true;
 }
 
@@ -1420,6 +1430,8 @@ async function makeModel(t, buf, useHevc) {
   }
   t.cesiumMs = performance.now() - tm;
   t.model = model; t.shader = shader; t.planesFreed = !shader; t.clip = 0; t.state = 'ready';
+  if (t.z === FLY.max && t.captured !== undefined) capturedKnown.set(t.x + '/' + t.y, t.captured || null);
+  if (lightGlsl && shader) setSun0(t, shader);
 }
 
 // 親のタイルを、子の 4 分の 1（北西・北東・南西・南東 = ビット 0〜3）のうち mask のものだけ
@@ -1636,27 +1648,63 @@ canvas.addEventListener('pointermove', e => { mouse = new C.Cartesian2(e.offsetX
 canvas.addEventListener('pointerleave', () => { mouse = null; $('cursor').textContent = ''; });
 scene.postRender.addEventListener(() => { rendered++; });
 
-// 画面の中央の、新しい Flyover の写真を撮った日（その場所の太陽時の日付）。時刻はズーム 20 のタイルにしか
-// 入っていないので、中央の地面にかかるズーム 20 のタイルの時刻を使う。読み込んであればその時刻、なければ
-// サーバーに聞く（/api/captured。聞いた結果は覚えておく）。中央が空や旧 C3M の所なら空
-const capturedAsked = new Map();       // 'x/y' -> 時刻、null（ない）、undefined（聞いている）
+// 写真を撮った時刻（Unix 時刻）。時刻はズーム 20 のタイルにしか入っていないので、ほかの所はその地点にかかる
+// ズーム 20 のタイルの時刻を使う。読み込んであればその時刻、なければサーバーに聞く（/api/captured。結果は覚えておく）
+const capturedKnown = new Map();       // 'x/y'（ズーム 20）-> 時刻か null（ない）
+const capturedWait = new Map();        // 'x/y' -> 聞いている Promise
+function z20Key(lat, lon) {            // ラジアン
+  const n = 2 ** FLY.max;
+  return Math.floor((C.Math.toDegrees(lon) + 180) / 360 * n) + '/' + Math.floor((1 - Math.asinh(Math.tan(lat)) / Math.PI) / 2 * n);
+}
+function capturedOf(key) {
+  if (capturedKnown.has(key)) return Promise.resolve(capturedKnown.get(key));
+  if (!capturedWait.has(key)) capturedWait.set(key, fetch(`/api/captured/${FLY.max}/${key}`)
+    .then(r => r.ok ? r.json() : null).catch(() => null)
+    .then(v => { capturedKnown.set(key, v); capturedWait.delete(key); return v; }));
+  return capturedWait.get(key);
+}
+
+// 太陽の方位（北から時計回り）と高さ [°]。NOAA の近似式（0.1° ほどの精度）
+function sunAt(ts, lat, lon) {
+  const rad = Math.PI / 180, jd = ts / 86400 + 2440587.5, T = (jd - 2451545) / 36525;
+  const L0 = (280.46646 + T * (36000.76983 + T * 0.0003032)) % 360;
+  const M = (357.52911 + T * (35999.05029 - 0.0001537 * T)) * rad, e = 0.016708634 - T * (0.000042037 + 0.0000001267 * T);
+  const Cc = Math.sin(M) * (1.914602 - T * (0.004817 + 0.000014 * T)) + Math.sin(2 * M) * (0.019993 - 0.000101 * T) + Math.sin(3 * M) * 0.000289;
+  const om = (125.04 - 1934.136 * T) * rad;
+  const lam = (L0 + Cc - 0.00569 - 0.00478 * Math.sin(om)) * rad;
+  const eps = (23 + (26 + (21.448 - T * (46.815 + T * (0.00059 - T * 0.001813))) / 60) / 60 + 0.00256 * Math.cos(om)) * rad;
+  const dec = Math.asin(Math.sin(eps) * Math.sin(lam)), y = Math.tan(eps / 2) ** 2, l0 = L0 * rad;
+  const eqt = 4 / rad * (y * Math.sin(2 * l0) - 2 * e * Math.sin(M) + 4 * e * y * Math.sin(M) * Math.cos(2 * l0)
+    - 0.5 * y * y * Math.sin(4 * l0) - 1.25 * e * e * Math.sin(2 * M));
+  const tst = (((ts % 86400) / 60 + eqt + 4 * lon) % 1440 + 1440) % 1440;
+  const ha = (tst / 4 - 180) * rad, la = lat * rad;
+  const el = Math.asin(C.Math.clamp(Math.sin(la) * Math.sin(dec) + Math.cos(la) * Math.cos(dec) * Math.cos(ha), -1, 1));
+  const az = Math.atan2(Math.sin(ha), Math.cos(ha) * Math.sin(la) - Math.tan(dec) * Math.cos(la)) / rad + 180;
+  return [(az + 360) % 360, el / rad];
+}
+
+// ?light= で、タイルの写真を撮ったときの太陽の向き（タイルの中心の時刻から）をシェーダーに渡す（lightApply の u_sun0）
+function setSun0(t, shader) {
+  const c = C.Rectangle.center(t.rect);
+  const use = ts => {
+    if (!ts || t.shader !== shader) return;
+    const [az, el] = sunAt(ts, C.Math.toDegrees(c.latitude), C.Math.toDegrees(c.longitude)).map(d => d * Math.PI / 180);
+    if (el <= 0.05) return;
+    shader.setUniform('u_sun0', new C.Cartesian3(Math.sin(az) * Math.cos(el), Math.cos(az) * Math.cos(el), Math.sin(el)));
+    scene.requestRender();
+  };
+  if (t.captured) use(t.captured); else capturedOf(z20Key(c.latitude, c.longitude)).then(use);
+}
+
+// 画面の中央の、新しい Flyover の写真を撮った日（その場所の太陽時の日付）。中央が空や旧 C3M の所なら空
 function capturedAtCenter() {
   if (!cfg.r3d || mode2D) return '';
   const r = pick(new C.Cartesian2(canvas.clientWidth / 2, canvas.clientHeight / 2), true);
   const at = r && ellipsoid.cartesianToCartographic(r.p);
   if (!at) return '';
-  const n = 2 ** FLY.max, lat = at.latitude;
-  const x = Math.floor((C.Math.toDegrees(at.longitude) + 180) / 360 * n);
-  const y = Math.floor((1 - Math.asinh(Math.tan(lat)) / Math.PI) / 2 * n);
-  const key = x + '/' + y, t = tiles.get(FLY.max + '/' + key);
-  let ts = t && t.state === 'ready' ? t.captured : capturedAsked.get(key);
-  if (!(t && t.state === 'ready') && !capturedAsked.has(key)) {
-    capturedAsked.set(key, undefined);
-    fetch(`/api/captured/${FLY.max}/${key}`).then(r => r.ok ? r.json() : null).catch(() => null).then(v => {
-      capturedAsked.set(key, v);
-      scene.requestRender(); mouseMoved = true;           // 帯を書き直す
-    });
-  }
+  const key = z20Key(at.latitude, at.longitude);
+  if (!capturedKnown.has(key)) capturedOf(key).then(() => { scene.requestRender(); mouseMoved = true; });   // 帯を書き直す
+  const ts = capturedKnown.get(key);
   if (!ts) return '';
   const d = new Date((ts + C.Math.toDegrees(at.longitude) / 15 * 3600) * 1000);
   return `撮影 ${d.getUTCFullYear()}/${d.getUTCMonth() + 1}/${d.getUTCDate()}`;
