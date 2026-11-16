@@ -266,14 +266,44 @@ fn normalOf(rel: vec3f) -> vec3f {
   let rgb = clamp(vec3f(y + 1.402 * c.y, y - 0.344136 * c.x - 0.714136 * c.y, y + 1.772 * c.x), vec3f(0.0), vec3f(1.0));
   return vec4f(atmoApply(lightRgb(rgb, lit, n), i.at, i.as_), 1.0);
 }
-// スプラット: 頂点の色は線形の値。不透明度の下位 6 ビットが撮ったときの日の当たり方
-@fragment fn fsSplat(i: V) -> @location(0) vec4f {
+// スプラット: 頂点の色は線形の値。不透明度の下位 6 ビットが撮ったときの日の当たり方。
+// 今のビューア（Cesium）と同じ重ね方（Weighted Blended OIT。McGuire と Bavoil 2013）: 色 x 不透明度 x 重みの合計と
+// 透ける割合（1 - 不透明度 の積）を 0 番に、不透明度 x 重みの合計を 1 番にためて、最後に平均の色を重ねる。
+// 重みは Cesium（Apache-2.0）の czm_alphaWeight と同じ式。z は -1〜1 なので深さの項はほぼ 300 で、
+// ほぼ不透明度で重みをつけた平均になる。半精度でためるので 300 で割っておく（比なので結果は同じ）
+struct OitOut { @location(0) accum: vec4f, @location(1) reveal: f32 };
+fn oitWeight(a: f32, fz: f32) -> f32 {
+  let z = fz * 2.0 - 1.0;
+  return (pow(a + 0.01, 4.0) + max(1e-2, min(3.0 * 1e3, 0.003 / (1e-5 + pow(abs(z) / 200.0, 4.0))))) / 300.0;
+}
+@fragment fn fsSplat(i: V) -> OitOut {
   let n = normalOf(i.rel);
   let t = textureSample(tex, samp, i.uv);
   if (clipped(i.local)) { discard; }
   let lin = seasonLin(i.color.rgb, i.color, i.world);
   let lit = f32(u32(i.color.a * 65535.0 + 0.5) % 64u) / 63.0;
-  return vec4f(atmoApply(lightRgb(linearToSrgb(lin), lit, n), i.at, i.as_), i.color.a * t.a);
+  let rgb = atmoApply(lightRgb(linearToSrgb(lin), lit, n), i.at, i.as_);
+  let a = i.color.a * t.a;
+  let w = oitWeight(a, i.pos.z);
+  var o: OitOut;
+  o.accum = vec4f(rgb * a * w, a);
+  o.reveal = a * w;
+  return o;
+}`;
+// 木（スプラット）をためたものを、不透明な絵の上に重ねる（Cesium の CompositeOITFS と同じ計算）
+const OIT_WGSL = /* wgsl */`
+@group(0) @binding(0) var accumT: texture_2d<f32>;
+@group(0) @binding(1) var revealT: texture_2d<f32>;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+  return vec4f(p * 2.0 - 1.0, 0.0, 1.0);
+}
+@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+  let c = vec2i(p.xy);
+  let acc = textureLoad(accumT, c, 0);
+  if (acc.a >= 1.0) { discard; }           // 木がない
+  let r = textureLoad(revealT, c, 0).r;
+  return vec4f(acc.rgb / clamp(r, 1e-4 / 300.0, 5e4 / 300.0), 1.0 - acc.a);
 }`;
 const MIP_WGSL = /* wgsl */`
 @group(0) @binding(0) var samp: sampler;
@@ -362,13 +392,19 @@ async function makePipes(samples) {
         { arrayStride: 8, attributes: [{ shaderLocation: 0, offset: 0, format: 'sint16x4' }] },
         { arrayStride: 8, attributes: [{ shaderLocation: 1, offset: 0, format: 'unorm16x4' }] },
         { arrayStride: 4, attributes: [{ shaderLocation: 2, offset: 0, format: 'unorm8x2' }] }] },
-      fragment: { module: flyModule, entryPoint: 'fsSplat', targets: [{ format, blend: {
-        color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' } } }] },
+      fragment: { module: flyModule, entryPoint: 'fsSplat', targets: [
+        { format: 'rgba16float', blend: { color: { srcFactor: 'one', dstFactor: 'one' }, alpha: { srcFactor: 'zero', dstFactor: 'one-minus-src-alpha' } } },
+        { format: 'r16float', blend: { color: { srcFactor: 'one', dstFactor: 'one' }, alpha: { srcFactor: 'one', dstFactor: 'one' } } }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' }, depthStencil: depth(false, 'greater'), multisample: ms }),
   ]);
   return { sky, ground, groundFb, meshU16, meshF32, yuvU16, yuvF32, splat };
 }
-const [pipesMain, pipes1] = await Promise.all([makePipes(SAMPLES), SAMPLES === 1 ? null : makePipes(1)]);
+const oitModule = device.createShaderModule({ code: OIT_WGSL });
+const [pipesMain, pipes1, oitPipe] = await Promise.all([makePipes(SAMPLES), SAMPLES === 1 ? null : makePipes(1),
+  device.createRenderPipelineAsync({ layout: 'auto', vertex: { module: oitModule, entryPoint: 'vs' },
+    fragment: { module: oitModule, entryPoint: 'fs', targets: [{ format, blend: {
+      color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' }, alpha: { srcFactor: 'zero', dstFactor: 'one' } } }] },
+    primitive: { topology: 'triangle-list' } })]);
 const pipesOne = pipes1 || pipesMain;
 
 const linear = device.createSampler({ magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
@@ -1302,13 +1338,13 @@ function prepare(W, H, cssH, force = false) {
     uniformData.set([md.step, mask, 0, 0, ...t.east, 0, ...t.north, 0, ...md.off, 0, ...o, 0, ...t.sun0], b + 16);
   }
   if (n + nf) device.queue.writeBuffer(uniformBuffer, 0, uniformData, 0, (n + nf) * U_STRIDE / 4);
-  // pass に描く。pipes: パイプラインの組、group: 画面ごとの値、splats: スプラットも描くか
-  const encode = (pass, pipes, group, splats = true) => {
+  // pass に描く。pipes: パイプラインの組、group: 画面ごとの値、sky: 空、opaque: 地面と建物、splats: 木（重みつきでためる）
+  const encode = (pass, pipes, group, { sky = true, opaque = true, splats = false } = {}) => {
     pass.setBindGroup(0, emptyGroup);
     pass.setBindGroup(1, group);
-    if (splats) { pass.setPipeline(pipes.sky); pass.draw(3); }
+    if (sky) { pass.setPipeline(pipes.sky); pass.draw(3); }
     pass.setStencilReference(1);
-    for (const fb of [false, true]) {
+    for (const fb of opaque ? [false, true] : []) {
       pass.setPipeline(fb ? pipes.groundFb : pipes.ground);
       for (let i = 0; i < n; i++) {
         const e = list[i];
@@ -1319,7 +1355,7 @@ function prepare(W, H, cssH, force = false) {
         else { pass.setIndexBuffer(indexBuffer, 'uint16'); pass.drawIndexed(indices.length); }
       }
     }
-    for (const splat of splats ? [false, true] : [false]) {
+    for (const splat of [...(opaque ? [false] : []), ...(splats ? [true] : [])]) {
       for (let j = 0; j < nf; j++) {
         const md = fly[j].t.model;
         for (const p of md.prims) {
@@ -1344,7 +1380,12 @@ function prepare(W, H, cssH, force = false) {
 }
 
 // 画面の描画用のテクスチャ
-let msaaTex = null, depthTex = null, W = 0, H = 0;
+// 動かしている間は MSAA を使わず 1 倍で描く（GPU の時間が 2〜4 ms 減る）。カメラが止まって STILL_MS たったら、
+// 4 倍で描き直す（止まった画面は今までどおり）
+const STILL_MS = 150;
+let msaaTex = null, depthTex = null, depth1Tex = null, W = 0, H = 0;
+let oitMain = null;        // 木をためるテクスチャ（resize で作る）
+let lastCam = '', movedAt = -Infinity, stillTimer = 0;
 function resize() {
   const dpr = devicePixelRatio || 1;
   const w = Math.max(1, Math.round(canvas.clientWidth * dpr)), h = Math.max(1, Math.round(canvas.clientHeight * dpr));
@@ -1352,9 +1393,52 @@ function resize() {
   W = canvas.width = w; H = canvas.height = h;
   if (msaaTex) msaaTex.destroy();
   if (depthTex) depthTex.destroy();
+  if (depth1Tex) depth1Tex.destroy();
+  depth1Tex = SAMPLES > 1 ? device.createTexture({ size: [W, H], format: DEPTH, usage: GPUTextureUsage.RENDER_ATTACHMENT }) : null;
   msaaTex = SAMPLES > 1 ? device.createTexture({ size: [W, H], format, sampleCount: SAMPLES, usage: GPUTextureUsage.RENDER_ATTACHMENT }) : null;
   depthTex = device.createTexture({ size: [W, H], format: DEPTH, sampleCount: SAMPLES, usage: GPUTextureUsage.RENDER_ATTACHMENT });
+  if (oitMain) oitMain.destroy();
+  oitMain = oitTextures(W, H, SAMPLES);
   dirty = true;
+}
+// 木をためるテクスチャ: 1 倍のもの（重ねるときに読む）と、MSAA のもの（samples > 1 のとき。1 倍に解決する）
+function oitTextures(w, h, samples) {
+  const mk = (fmt, n) => device.createTexture({ size: [w, h], format: fmt, sampleCount: n,
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | (n === 1 ? GPUTextureUsage.TEXTURE_BINDING : 0) });
+  const o = { accum: mk('rgba16float', 1), reveal: mk('r16float', 1) };
+  if (samples > 1) { o.accumMS = mk('rgba16float', samples); o.revealMS = mk('r16float', samples); }
+  o.bind = device.createBindGroup({ layout: oitPipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: o.accum.createView() }, { binding: 1, resource: o.reveal.createView() }] });
+  o.destroy = () => [o.accum, o.reveal, o.accumMS, o.revealMS].forEach(t => t && t.destroy());
+  return o;
+}
+// 1 回分を描く: 空・地面・建物 → 木を重みつきでためる → 木を重ねる。
+// t: { pipes, color, resolve（MSAA のとき画面）, depth, oit, ms（MSAA で描くか）, out（できあがりを書く所） }
+function drawScene(enc, frame, t, timestamps) {
+  const p1 = enc.beginRenderPass({
+    colorAttachments: [{ view: t.color, resolveTarget: t.resolve, loadOp: 'clear', storeOp: t.resolve ? 'discard' : 'store',
+      clearValue: [0, 0, 0, 1] }],
+    depthStencilAttachment: { view: t.depth, depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 0,
+      stencilLoadOp: 'clear', stencilStoreOp: 'store', stencilClearValue: 0 },
+    timestampWrites: timestamps ? { querySet: timestamps, beginningOfPassWriteIndex: 0 } : undefined,
+  });
+  frame.encode(p1, t.pipes, groupMain);
+  p1.end();
+  const o = t.oit, ms = t.ms;
+  const p2 = enc.beginRenderPass({
+    colorAttachments: [
+      { view: (ms ? o.accumMS : o.accum).createView(), resolveTarget: ms ? o.accum.createView() : undefined,
+        loadOp: 'clear', storeOp: ms ? 'discard' : 'store', clearValue: [0, 0, 0, 1] },
+      { view: (ms ? o.revealMS : o.reveal).createView(), resolveTarget: ms ? o.reveal.createView() : undefined,
+        loadOp: 'clear', storeOp: ms ? 'discard' : 'store', clearValue: [0, 0, 0, 0] }],
+    depthStencilAttachment: { view: t.depth, depthReadOnly: true, stencilReadOnly: true },
+  });
+  frame.encode(p2, t.pipes, groupMain, { sky: false, opaque: false, splats: true });
+  p2.end();
+  const p3 = enc.beginRenderPass({ colorAttachments: [{ view: t.out, loadOp: 'load', storeOp: 'store' }],
+    timestampWrites: timestamps ? { querySet: timestamps, endOfPassWriteIndex: 1 } : undefined });
+  p3.setPipeline(oitPipe); p3.setBindGroup(0, o.bind); p3.draw(3);
+  p3.end();
 }
 
 // GPU の描画時間（timestamp-query）
@@ -1403,7 +1487,7 @@ function encodePick(enc, frame) {
     depthStencilAttachment: { view: pickDepth.createView(), depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 0,
       stencilLoadOp: 'clear', stencilStoreOp: 'discard', stencilClearValue: 0 },
   });
-  frame.encode(pass, pipesOne, groupPick, false);
+  frame.encode(pass, pipesOne, groupPick, { sky: false });
   pass.end();
   enc.copyTextureToBuffer({ texture: pickDepth, aspect: 'depth-only' }, { buffer: pickBuf, bytesPerRow: 256 }, [1, 1]);
 }
@@ -1446,17 +1530,15 @@ function render() {
   resize();
   const frame = prepare(W, H, canvas.clientHeight);
   device.queue.writeBuffer(frameMain, 0, frameData(frame.vp));
+  const now = performance.now(), key = cam.pos.join() + cam.dir.join() + cam.up.join();
+  if (key !== lastCam) { lastCam = key; movedAt = now; }
+  const fast = SAMPLES > 1 && now - movedAt < STILL_MS;
+  if (fast) { clearTimeout(stillTimer); stillTimer = setTimeout(() => { dirty = true; }, STILL_MS + 10); }
+  const ms = fast ? null : msaaTex;
   const enc = device.createCommandEncoder();
   const target = ctx.getCurrentTexture().createView();
-  const pass = enc.beginRenderPass({
-    colorAttachments: [{ view: msaaTex ? msaaTex.createView() : target, resolveTarget: msaaTex ? target : undefined,
-      loadOp: 'clear', storeOp: msaaTex ? 'discard' : 'store', clearValue: [0, 0, 0, 1] }],
-    depthStencilAttachment: { view: depthTex.createView(), depthLoadOp: 'clear', depthStoreOp: 'discard', depthClearValue: 0,
-      stencilLoadOp: 'clear', stencilStoreOp: 'discard', stencilClearValue: 0 },
-    timestampWrites: query ? { querySet: query.set, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } : undefined,
-  });
-  frame.encode(pass, pipesMain, groupMain);
-  pass.end();
+  drawScene(enc, frame, { pipes: fast ? pipesOne : pipesMain, color: ms ? ms.createView() : target, resolve: ms ? target : undefined,
+    depth: (fast ? depth1Tex : depthTex).createView(), oit: oitMain, ms: !!ms, out: target }, query && query.set);
   const picking = pickReq && !pickBusy && canPick;
   if (picking) encodePick(enc, frame);
   let rb = null;
@@ -1475,7 +1557,7 @@ function render() {
       rb.buf.unmap(); rb.busy = false;
     }, () => { rb.busy = false; });
   }
-  stats = { draw: frame.n, fly: frame.nf, selMs, selCount, selGround: selSplit[0], selFly: selSplit[1], upMs };
+  stats = { msaa: fast ? 1 : SAMPLES, draw: frame.n, fly: frame.nf, selMs, selCount, selGround: selSplit[0], selFly: selSplit[1], upMs };
   cpuMs = performance.now() - t0;
   rendered++;
 }
@@ -1489,6 +1571,7 @@ async function shot(SW, SH) {
   const color = device.createTexture({ size: [SW, SH], format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
   const depth = device.createTexture({ size: [SW, SH], format: DEPTH, usage: GPUTextureUsage.RENDER_ATTACHMENT });
   const dpr = devicePixelRatio || 1;
+  let oit = null;
   shooting = { SW, SH, cssH: SH / dpr };
   try {
     const t0 = performance.now();
@@ -1502,13 +1585,9 @@ async function shot(SW, SH) {
     const frame = prepare(SW, SH, SH / dpr, true);
     device.queue.writeBuffer(frameMain, 0, frameData(frame.vp));
     const enc = device.createCommandEncoder();
-    const pass = enc.beginRenderPass({
-      colorAttachments: [{ view: color.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }],
-      depthStencilAttachment: { view: depth.createView(), depthLoadOp: 'clear', depthStoreOp: 'discard', depthClearValue: 0,
-        stencilLoadOp: 'clear', stencilStoreOp: 'discard', stencilClearValue: 0 },
-    });
-    frame.encode(pass, pipesOne, groupMain);
-    pass.end();
+    oit = oitTextures(SW, SH, 1);
+    const view = color.createView();
+    drawScene(enc, frame, { pipes: pipesOne, color: view, depth: depth.createView(), oit, ms: false, out: view });
     const bpr = Math.ceil(SW * 4 / 256) * 256;
     const buf = device.createBuffer({ size: bpr * SH, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     enc.copyTextureToBuffer({ texture: color }, { buffer: buf, bytesPerRow: bpr }, [SW, SH]);
@@ -1527,7 +1606,7 @@ async function shot(SW, SH) {
     c.getContext('2d').putImageData(img, 0, 0);
     return c;
   } finally {
-    color.destroy(); depth.destroy();
+    color.destroy(); depth.destroy(); if (oit) oit.destroy();
     shooting = null; sel = null; dirty = true;
   }
 }
