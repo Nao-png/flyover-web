@@ -4,7 +4,10 @@
 // 受け取るもの: { id, images: [{ config: hvcC の中身, data: コマ（長さ付きの NAL の並び） }], gpu }
 // 返すもの: { id, out: [{ w, h, y: Uint8Array(w*h), uv: Uint8Array(ceil(w/2)*ceil(h/2)*2) }], ms }
 //           か、展開できなかったとき { id, error }。gpu なら out は [{ w, h, bitmap }]（GPU にある RGB の
-//           ImageBitmap。CPU に読み戻すと 1 枚 100 ms ほどかかるので、earth.js が GPU の中で Y と UV に戻す）
+//           ImageBitmap。CPU に読み戻すと 1 枚 100 ms ほどかかるので、earth.js が GPU の中で Y と UV に戻す）。
+//           gpu が 'frame' なら、展開したコマ（VideoFrame）を RGB にせず、1 枚ずつすぐに { id, part, frame } で送り
+//           （gpu-render.js が WebGPU で直接読む。専用回路のコマを抱えたまま次を展開すると詰まることがある）、
+//           最後に out を [{ w, h, part }] で返す
 
 // HEIC には色の決め方が入っていない。HEIF の決まり（libheif も同じ）どおり BT.601 のフルレンジ
 // として扱う（Chrome は何も言わないと BT.709 のリミテッドレンジとみなし、平均 8 段階ほどずれる）。
@@ -81,6 +84,12 @@ onmessage = ({ data: { id, images, gpu } }) => {
         const frame = await decode(im.config, im.data);
         ms.decode += performance.now() - t;
         t = performance.now();
+        if (gpu === 'frame') {
+          const w = frame.visibleRect.width, h = frame.visibleRect.height, part = out.length;
+          postMessage({ id, part, frame }, [frame]);      // 送ると、このスレッドのコマは閉じる
+          out.push({ w, h, part });
+          continue;
+        }
         try {
           // gpu なら CPU に読み戻さず、GPU にあるままの RGB の画像で返す（earth.js の gpuPlanes で Y と UV にする）
           if (gpu) out.push({ bitmap: await createImageBitmap(frame), w: frame.visibleRect.width, h: frame.visibleRect.height });
@@ -88,7 +97,7 @@ onmessage = ({ data: { id, images, gpu } }) => {
         } finally { frame.close(); }
         ms.copy += performance.now() - t;
       }
-      postMessage({ id, out, ms }, out.flatMap(p => p.bitmap ? [p.bitmap] : [p.y.buffer, p.uv.buffer]));
+      postMessage({ id, out, ms }, out.flatMap(p => p.bitmap ? [p.bitmap] : p.y ? [p.y.buffer, p.uv.buffer] : []));
     } catch (e) {
       postMessage({ id, error: String(e) });
     }

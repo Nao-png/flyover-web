@@ -19,8 +19,11 @@ if (!adapter) { fail('WebGPU の GPU が見つかりません'); return; }
 const timing = adapter.features.has('timestamp-query');
 const floatFilter = adapter.features.has('float32-filterable');     // 大気の表（float32）を補間して読む
 const stencil32 = adapter.features.has('depth32float-stencil8');
+// 写真を GPU 用の圧縮形式（BC4 と BC5）にする（?bc=0 でしない）
+const BC = adapter.features.has('texture-compression-bc') && params.get('bc') !== '0';
 const device = await adapter.requestDevice({ requiredFeatures: [...(timing ? ['timestamp-query'] : []),
-  ...(floatFilter ? ['float32-filterable'] : []), ...(stencil32 ? ['depth32float-stencil8'] : [])] });
+  ...(floatFilter ? ['float32-filterable'] : []), ...(stencil32 ? ['depth32float-stencil8'] : []),
+  ...(BC ? ['texture-compression-bc'] : [])] });
 // 深度はステンシル付き（地面の代わりの親を、届いたタイルの描いていない画素にだけ描く）。depth32float-stencil8 なら
 // 深度をバッファに写せる（カーソルの下の建物を探すのに使う）
 const DEPTH = stencil32 ? 'depth32float-stencil8' : 'depth24plus-stencil8';
@@ -63,6 +66,7 @@ function setView(lat, lon, h, heading, tilt) {
   dirty = true;
 }
 let dirty = true;
+let selStale = true;     // 選んだあとにタイルが届いた（選び直すと描けるものが増える）
 
 // ---------------------------------------------------------------- 見た目の設定
 
@@ -119,7 +123,7 @@ struct V { @builtin(position) pos: vec4f, @location(0) uv: vec2f, @location(1) a
   return o;
 }
 fn yuv(y: f32, c0: vec2f) -> vec3f {
-  let c = c0 - 0.5;
+  let c = c0 - 128.0 / 255.0;      // BT.601 のフルレンジ: 色の真ん中は 128
   return clamp(vec3f(y + 1.402 * c.y, y - 0.344136 * c.x - 0.714136 * c.y, y + 1.772 * c.x), vec3f(0.0), vec3f(1.0));
 }
 @fragment fn fs(i: V) -> @location(0) vec4f {
@@ -256,7 +260,7 @@ fn normalOf(rel: vec3f) -> vec3f {
 @fragment fn fsMeshYuv(i: V) -> @location(0) vec4f {
   let n = normalOf(i.rel);
   let y = textureSample(tex, samp, i.uv).r;
-  let c = textureSample(uvTex, samp, i.uv).rg - 0.5;
+  let c = textureSample(uvTex, samp, i.uv).rg - 128.0 / 255.0;
   let lit = textureSample(shadeTex, samp, i.uv).r;
   if (clipped(i.local)) { discard; }
   let rgb = clamp(vec3f(y + 1.402 * c.y, y - 0.344136 * c.x - 0.714136 * c.y, y + 1.772 * c.x), vec3f(0.0), vec3f(1.0));
@@ -290,8 +294,12 @@ struct V { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
 @fragment fn fsUV(i: V) -> @location(0) vec4f {
   let c = textureSample(tex, samp, i.uv).rgb;
   let y = dot(c, vec3f(0.299, 0.587, 0.114));
-  return vec4f((c.b - y) / 1.772 + 0.5, (c.r - y) / 1.402 + 0.5, 0.0, 1.0);
+  return vec4f((c.b - y) / 1.772 + 128.0 / 255.0, (c.r - y) / 1.402 + 128.0 / 255.0, 0.0, 1.0);
 }`;
+// 展開したコマ（VideoFrame）を直接読む版。RGB はブラウザがコマの色の決め方（hevc.js の COLOR）で変換したもの
+const EXT_WGSL = MIP_WGSL.replace('var tex: texture_2d<f32>', 'var tex: texture_external')
+  .replace(/textureSample\(tex, samp, i\.uv\)/g, 'textureSampleBaseClampToEdge(tex, samp, i.uv)')
+  .replace(/@fragment fn fs\(i: V\)[^\n]*\n/, '');
 
 // ---------------------------------------------------------------- パイプライン
 
@@ -319,6 +327,7 @@ const emptyGroup = device.createBindGroup({ layout: emptyLayout, entries: [] });
 const globeModule = device.createShaderModule({ code: GLOBE_WGSL });
 const flyModule = device.createShaderModule({ code: FLY_WGSL });
 const mipModule = device.createShaderModule({ code: MIP_WGSL });
+const extModule = device.createShaderModule({ code: EXT_WGSL });
 
 // 描くもののパイプラインの組。アンチエイリアスの倍率ごとに作る（画面は SAMPLES、カーソルの下の点とスクリーンショットは 1）
 const stencilOn = fb => fb ? { compare: 'not-equal' } : { compare: 'always', passOp: 'replace' };
@@ -372,7 +381,7 @@ const mipSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linea
 
 // 写真のテクスチャの GPU のメモリ（ミップマップの 3 分の 1 を含む。調べる用）
 const mem = { fly: 0, ground: 0 };
-const BYTES = { rgba8unorm: 4, r8unorm: 1, rg8unorm: 2 };
+const BYTES = { rgba8unorm: 4, r8unorm: 1, rg8unorm: 2, 'bc4-r-unorm': 0.5, 'bc5-rg-unorm': 1 };
 function photoTexture(w, h, fmt, acc) {
   const levels = Math.floor(Math.log2(Math.max(w, h))) + 1;
   const tex = device.createTexture({ size: [w, h], format: fmt, mipLevelCount: levels,
@@ -389,6 +398,18 @@ const pipeFor = (fmt, entry) => {
     fragment: { module: mipModule, entryPoint: entry, targets: [{ format: fmt }] }, primitive: { topology: 'triangle-list' } }));
   return mipPipes.get(k);
 };
+// 写真を GPU に載せるときに使うパイプラインは、起動のときに先に作っておく（使うときに作ると、そのコマが重くなる）
+const extPipes = new Map();
+await Promise.all([
+  ...[['rgba8unorm', 'fs'], ['r8unorm', 'fs'], ['rg8unorm', 'fs'], ['r8unorm', 'fsY'], ['rg8unorm', 'fsUV']].map(([fmt, entry]) =>
+    device.createRenderPipelineAsync({ layout: 'auto', vertex: { module: mipModule, entryPoint: 'vs' },
+      fragment: { module: mipModule, entryPoint: entry, targets: [{ format: fmt }] }, primitive: { topology: 'triangle-list' } })
+      .then(p => mipPipes.set(fmt + entry, p))),
+  ...[['r8unorm', 'fsY'], ['rg8unorm', 'fsUV']].map(([fmt, entry]) =>
+    device.createRenderPipelineAsync({ layout: 'auto', vertex: { module: extModule, entryPoint: 'vs' },
+      fragment: { module: extModule, entryPoint: entry, targets: [{ format: fmt }] }, primitive: { topology: 'triangle-list' } })
+      .then(p => extPipes.set(entry, p))),
+]);
 function blit(enc, pipe, src, dst) {
   const bind = device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
     { binding: 0, resource: mipSampler }, { binding: 1, resource: src }] });
@@ -411,6 +432,96 @@ function bitmapTexture(bitmap, acc, fmt = 'rgba8unorm') {
   device.queue.submit([enc.finish()]);
   return tex;
 }
+// 写真の圧縮: 明るさ（r8）を BC4、色（rg8）を BC5 にする。4 x 4 画素ごとに、いちばん明るい値と暗い値と、その間の
+// 8 段階のどれかで表す（1 画素 4 ビット。メモリと GPU が読む量が半分になる）。ミップマップを作ったあとの各段を、
+// GPU の計算シェーダーで 1 ブロックずつ詰めてバッファに書き、テクスチャに写す。大きさが 4 の倍数でなければしない
+const BC_WGSL = /* wgsl */`
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<u32>;
+struct P { blocksX: u32, blocksY: u32, rowWords: u32, chans: u32 };
+@group(0) @binding(2) var<uniform> p: P;
+// 16 画素（0〜255）を BC4 の 1 ブロック（8 バイト）に。1 バイト目が明るいほう、2 バイト目が暗いほう（明るいほうが
+// 大きいと 8 段階）、続いて画素ごとに 3 ビットの番号（0: 明るいほう、1: 暗いほう、2〜7: 明るいほうから順に間の 6 段）
+fn bc4(v: ptr<function, array<u32, 16>>) -> vec2u {
+  var hi = 0u;
+  var lo = 255u;
+  for (var i = 0u; i < 16u; i++) { hi = max(hi, (*v)[i]); lo = min(lo, (*v)[i]); }
+  var a = hi | (lo << 8u);
+  var b = 0u;
+  if (hi > lo) {
+    let d = f32(hi - lo);
+    for (var i = 0u; i < 16u; i++) {
+      let t = u32(round(f32(hi - (*v)[i]) * 7.0 / d));
+      let idx = select(select(t + 1u, 1u, t == 7u), 0u, t == 0u);
+      let bit = 16u + 3u * i;
+      if (bit < 32u) {
+        a |= idx << bit;
+        if (bit > 29u) { b |= idx >> (32u - bit); }
+      } else { b |= idx << (bit - 32u); }
+    }
+  }
+  return vec2u(a, b);
+}
+@compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) g: vec3u) {
+  if (g.x >= p.blocksX || g.y >= p.blocksY) { return; }
+  let size = vec2i(textureDimensions(src));
+  var r: array<u32, 16>;
+  var c: array<u32, 16>;
+  for (var i = 0u; i < 16u; i++) {
+    let at = min(vec2i(i32(g.x * 4u + (i & 3u)), i32(g.y * 4u + (i >> 2u))), size - 1);
+    let s = textureLoad(src, at, 0);
+    r[i] = u32(round(s.r * 255.0));
+    c[i] = u32(round(s.g * 255.0));
+  }
+  let o = g.y * p.rowWords + g.x * 2u * p.chans;
+  let x = bc4(&r);
+  out[o] = x.x; out[o + 1u] = x.y;
+  if (p.chans == 2u) { let y = bc4(&c); out[o + 2u] = y.x; out[o + 3u] = y.y; }
+}`;
+const bcPipe = BC ? await device.createComputePipelineAsync({ layout: 'auto',
+  compute: { module: device.createShaderModule({ code: BC_WGSL }), entryPoint: 'main' } }) : null;
+const align = (n, a) => Math.ceil(n / a) * a;
+function bcTexture(src, chans) {
+  const w = src.width, h = src.height, levels = src.mipLevelCount, fmt = chans === 1 ? 'bc4-r-unorm' : 'bc5-rg-unorm';
+  const blockBytes = 8 * chans;
+  const lv = [];
+  let size = 0;
+  for (let l = 0; l < levels; l++) {
+    const bx = Math.ceil(Math.max(1, w >> l) / 4), by = Math.ceil(Math.max(1, h >> l) / 4), row = align(bx * blockBytes, 256);
+    lv.push({ bx, by, row, offset: size });
+    size += align(row * by, 256);
+  }
+  const buf = device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const ubuf = device.createBuffer({ size: 256 * levels, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const u = new Uint32Array(64 * levels);
+  lv.forEach((v, l) => u.set([v.bx, v.by, v.row / 4, chans], l * 64));
+  device.queue.writeBuffer(ubuf, 0, u);
+  const tex = device.createTexture({ size: [w, h], format: fmt, mipLevelCount: levels,
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+  tex.bytes = Math.round(w * h * BYTES[fmt] * 4 / 3); tex.acc = src.acc;
+  if (tex.acc) mem[tex.acc] += tex.bytes;
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(bcPipe);
+  lv.forEach((v, l) => {
+    pass.setBindGroup(0, device.createBindGroup({ layout: bcPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: src.createView({ baseMipLevel: l, mipLevelCount: 1 }) },
+      { binding: 1, resource: { buffer: buf, offset: v.offset, size: v.row * v.by } },
+      { binding: 2, resource: { buffer: ubuf, offset: l * 256, size: 16 } }] }));
+    pass.dispatchWorkgroups(Math.ceil(v.bx / 8), Math.ceil(v.by / 8));
+  });
+  pass.end();
+  lv.forEach((v, l) => enc.copyBufferToTexture({ buffer: buf, offset: v.offset, bytesPerRow: v.row, rowsPerImage: v.by },
+    { texture: tex, mipLevel: l }, [v.bx * 4, v.by * 4]));
+  device.queue.submit([enc.finish()]);
+  buf.destroy(); ubuf.destroy(); dropTexture(src);
+  return tex;
+}
+// Y と UV を圧縮したものに取りかえる（できないときはそのまま）
+function bcYuv(t) {
+  if (!BC || t.y.width % 4 || t.y.height % 4 || t.uv.width % 4 || t.uv.height % 4) return t;
+  return { y: bcTexture(t.y, 1), uv: bcTexture(t.uv, 2) };
+}
 // 写真（ImageBitmap）を GPU の中で明るさ（Y、r8）と縦横半分の色（UV、rg8）のテクスチャに（今のビューアの gpuPlanes と
 // 同じ。UV は RGB の 2 x 2 画素の真ん中を線形補間で引いて平均する）
 function yuvTextures(bitmap, acc) {
@@ -427,7 +538,30 @@ function yuvTextures(bitmap, acc) {
   makeMips(enc, uv.tex, uv.levels);
   device.queue.submit([enc.finish()]);
   rgb.destroy();
-  return { y: y.tex, uv: uv.tex };
+  return bcYuv({ y: y.tex, uv: uv.tex });
+}
+// 展開したコマ（VideoFrame）から、RGB の画像を作らずに直接 Y と UV のテクスチャに。コマはすぐ閉じる（専用回路の
+// コマを抱えていると、次の展開が詰まる）
+function frameTextures(frame, acc) {
+  try {
+    const w = frame.visibleRect.width, h = frame.visibleRect.height;
+    const ext = device.importExternalTexture({ source: frame });
+    const y = photoTexture(w, h, 'r8unorm', acc), uv = photoTexture((w + 1) >> 1, (h + 1) >> 1, 'rg8unorm', acc);
+    const enc = device.createCommandEncoder();
+    for (const [t, entry] of [[y, 'fsY'], [uv, 'fsUV']]) blit(enc, extPipes.get(entry), ext, t.tex.createView({ baseMipLevel: 0, mipLevelCount: 1 }));
+    makeMips(enc, y.tex, y.levels);
+    makeMips(enc, uv.tex, uv.levels);
+    device.queue.submit([enc.finish()]);
+    return { ...bcYuv({ y: y.tex, uv: uv.tex }), ready: true };
+  } finally { frame.close(); }
+}
+// 展開したもの（frameTextures の結果、ImageBitmap、CPU の Y と UV）を手放す
+function dropFrames(frames) {
+  for (const f of frames || []) {
+    if (!f) continue;
+    if (f.ready) { dropTexture(f.y); dropTexture(f.uv); }
+    else if (f.bitmap) f.bitmap.close();
+  }
 }
 // CPU にある Y と UV（hevc.js が読み戻したもの。季節の色のとき）から
 function planeTextures(p, acc) {
@@ -439,7 +573,7 @@ function planeTextures(p, acc) {
   makeMips(enc, y.tex, y.levels);
   makeMips(enc, uv.tex, uv.levels);
   device.queue.submit([enc.finish()]);
-  return { y: y.tex, uv: uv.tex };
+  return bcYuv({ y: y.tex, uv: uv.tex });
 }
 const tex1 = (fmt, data) => {
   const t = device.createTexture({ size: [1, 1], format: fmt, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
@@ -546,6 +680,7 @@ const uniformBuffer = device.createBuffer({ size: MAX_DRAW * U_STRIDE, usage: GP
 const uniformData = new Float32Array(MAX_DRAW * U_STRIDE / 4);
 
 const heightRange = new Map();          // タイル -> 読んだときの楕円体高の範囲（捨てても覚えておく）
+let rangeGen = 0;                         // heightRange が増えるたびに 1 増やす（増えていなければ bounds() は探し直さない）
 const UNKNOWN_RANGE = [-100, 9000];
 class Tile {
   constructor(z, x, y, parent) {
@@ -565,6 +700,8 @@ class Tile {
   // 見えるかどうかと細かくするかどうかに使う球。高さの範囲は、このタイルか、いちばん近い親の読んだときの範囲。
   // 覚えた範囲は捨てても戻らないので、読んだ・捨てたで判断が行ったり来たりしない
   bounds() {
+    if (this._gen === rangeGen) return;
+    this._gen = rangeGen;
     let t = this, r;
     while (t && !(r = heightRange.get(t.key))) t = t.parent;
     r = r || UNKNOWN_RANGE;
@@ -622,6 +759,7 @@ async function load(t) {
       const hs = P.map(p => geodetic(p)[2]);
       heightRange.set(t.key, [Math.min(...hs) - 50, Math.max(...hs) + 50]);
     } else heightRange.set(t.key, UNKNOWN_RANGE);
+    rangeGen++;
     const skirt = t.width * 0.02 + 30;
     const put = (k, p, uv) => { const d = sub(p, center); verts.set([d[0], d[1], d[2], uv[0], uv[1]], k * 5); };
     P.forEach((p, k) => put(k, p, UV[k]));
@@ -639,7 +777,7 @@ async function load(t) {
   } catch (e) {
     t.state = e.name === 'AbortError' ? 'none' : 'failed';
   } finally {
-    active--; t.abort = null; dirty = true;
+    active--; t.abort = null; dirty = true; selStale = true;
   }
 }
 function unload(t) {
@@ -670,7 +808,7 @@ const caps = [1, -1].map(sgn => {
   device.queue.writeBuffer(ibuf, 0, ia);
   const c = [0x0b, 0x1a, 0x2e].map(v => v / 255), Y = c[0] * 0.299 + c[1] * 0.587 + c[2] * 0.114;
   const yT = tex1('r8unorm', [Math.round(Y * 255), 0, 0, 0]);
-  const uvT = tex1('rg8unorm', [Math.round(((c[2] - Y) / 1.772 + 0.5) * 255), Math.round(((c[0] - Y) / 1.402 + 0.5) * 255), 0, 0]);
+  const uvT = tex1('rg8unorm', [Math.round((c[2] - Y) / 1.772 * 255 + 128), Math.round((c[0] - Y) / 1.402 * 255 + 128), 0, 0]);
   const bind = device.createBindGroup({ layout: groundLayout, entries: [
     { binding: 0, resource: { buffer: uniformBuffer, size: 96 } },
     { binding: 1, resource: linear }, { binding: 2, resource: yT.createView() }, { binding: 3, resource: uvT.createView() }] });
@@ -695,14 +833,18 @@ function selectGround(vp, H, aspect) {
   const draw = [], wantLoad = [], parents = new Set(), now = performance.now();
   const camPos = cam.pos, k = H / (2 * Math.tan(fovy(aspect) / 2));
   const planes = frustumPlanes(vp), camR = len(camPos);
-  const visible = t => {
+  const hz = Math.sqrt(Math.max(camR * camR - A * A, 0));
+  const isVisible = t => {
     t.bounds();
     if (sphereOut(planes, sub(t.center, camPos), t.radius)) return false;
     if (t.z >= 4) {         // 地平線の向こう
-      const hz = Math.sqrt(Math.max(camR * camR - A * A, 0));
       if (!t.corners.some(p => len(sub(p, camPos)) < hz + t.radius * 0.5 + 2000 || dot(norm(p), sub(camPos, p)) > 0)) return false;
     }
     return true;
+  };
+  const visible = t => {    // 1 回の選び方で同じタイルを何度も聞くので、覚えておく
+    if (t.visFrame !== frame) { t.visFrame = frame; t.gvis = isVisible(t); }
+    return t.gvis;
   };
   const px = t => t.width * k / Math.max(1, len(sub(t.center, camPos)) - t.width * 0.71);
   const FULL = [0, 0, 1, 1];
@@ -713,6 +855,7 @@ function selectGround(vp, H, aspect) {
   };
   const want = t => { t.used = frame; t.wantedAt = now; if (t.state === 'none') wantLoad.push(t); };
   const visit = t => {
+    t.seen = frame;
     if (!visible(t)) return;
     if (t.z < MAX_Z && px(t) > REFINE_PX) { for (const c of t.children()) visit(c); return; }
     want(t);
@@ -745,7 +888,8 @@ function selectGround(vp, H, aspect) {
       if (c.state === 'ready' && c.used !== frame) unload(c);
       else if (c.state === 'loading' && c.abort && now - c.wantedAt > 4000) c.abort.abort();
     }
-    if (t.kids.every(c => c.state === 'none' && !c.kids)) t.kids = null;
+    // 子がどれも空なら子を消す。ただしこのコマで見たタイルの子は残す（次のコマですぐ作り直すことになる）
+    if (t.seen !== frame && t.kids.every(c => c.state === 'none' && !c.kids)) t.kids = null;
   };
   for (const r of roots) prune(r);
   return draw;
@@ -764,9 +908,18 @@ let hevc = cfg.r3d && typeof VideoDecoder !== 'undefined' && params.get('hevc') 
 const HEVC_WORKERS = 3;
 const hevcWorkers = hevc ? Array.from({ length: HEVC_WORKERS }, () => ({ worker: new Worker('hevc.js'), job: null })) : [];
 const hevcPending = [];
+// コマをそのまま受け取るか（?hevcframe=0 で前と同じく RGB の画像で受け取る）
+const HEVC_FRAME = params.get('hevcframe') !== '0';
 for (const w of hevcWorkers) w.worker.onmessage = ({ data }) => {
-  const job = w.job; w.job = null;
-  data.error ? job.reject(new Error(data.error)) : job.resolve(data.out);
+  const job = w.job;
+  if (data.frame) {             // 1 枚ずつ届くコマは、すぐ GPU で Y と UV にする
+    try { job.parts[data.part] = frameTextures(data.frame, 'fly'); } catch (e) { job.partError = e; }
+    return;
+  }
+  w.job = null;
+  const err = data.error ? new Error(data.error) : job.partError;
+  if (err) { dropFrames(job.parts); job.reject(err); }
+  else job.resolve(data.out.map(o => o.part !== undefined ? job.parts[o.part] : o));
   hevcNext();
 };
 function hevcNext() {
@@ -780,8 +933,9 @@ function hevcNext() {
     let best = 0;
     for (let i = 1; i < hevcPending.length; i++) if (rank(hevcPending[i]) < rank(hevcPending[best])) best = i;
     w.job = hevcPending.splice(best, 1)[0];
+    w.job.parts = [];
     // 季節の色では、写真の色を CPU で見る（gpu-season.js）ので、Y と UV を読み戻す
-    w.worker.postMessage({ id: 0, images: w.job.images, gpu: season === undefined });
+    w.worker.postMessage({ id: 0, images: w.job.images, gpu: season !== undefined ? false : HEVC_FRAME ? 'frame' : true });
   }
 }
 const hevcDecode = (t, images) => new Promise((resolve, reject) => { hevcPending.push({ t, images, resolve, reject }); hevcNext(); });
@@ -870,6 +1024,7 @@ async function flyLoad(t) {
   t.state = 'loading'; flyActive++; flyLoading.add(t);
   const ac = t.abort = new AbortController();
   const useHevc = hevc;
+  let frames = [], queued = false;
   try {
     const r = await fetch(`${hostBase(t.x + t.y + 1)}/api/flyover/${t.z}/${t.x}/${t.y}.glb${useHevc ? '?hevc=1' : ''}`, { signal: ac.signal });
     if (r.status === 204) { t.state = 'empty'; return; }
@@ -881,7 +1036,6 @@ async function flyLoad(t) {
     if (t.z === FLY.max && t.captured !== undefined) capturedKnown.set(t.x + '/' + t.y, t.captured || null);
     // 画像: HEVC は展開する（展開できなければ、以後は JPEG で受け取る）。ほかは JPEG・PNG のまま
     const hv = g.materials.map(m => m.extras && m.extras.hevc).filter(Boolean).sort((a, b) => a.slab - b.slab);
-    let frames = [];
     if (hv.length) {
       try {
         frames = await hevcDecode(t, hv.map(h => ({ config: view(h.config).slice(), data: view(h.data).slice() })));
@@ -905,11 +1059,13 @@ async function flyLoad(t) {
     const images = await Promise.all((g.images || []).map((im, i) => need.has(i)
       ? createImageBitmap(new Blob([view(im.bufferView)], { type: im.mimeType })) : null));
     uploads.push({ t, g, bin, frames, images });
+    queued = true;
     if (light) setSun0(t);
   } catch (e) {
     if (e.name === 'AbortError') t.state = 'none';
     else { t.state = 'failed'; t.failedAt = performance.now(); console.warn('Flyover', t.key, e); }
   } finally {
+    if (!queued) dropFrames(frames);
     flyActive--; flyLoading.delete(t); t.abort = null; dirty = true;
   }
 }
@@ -931,7 +1087,11 @@ function upload({ t, g, bin, frames, images }) {
   gbuf.unmap();
   const at = a => { const ac = g.accessors[a]; return { offset: offs.get(ac.bufferView) + (ac.byteOffset || 0), count: ac.count, ac }; };
   const texs = [];
-  const hevcTex = frames.map(f => { const tx = f.bitmap ? yuvTextures(f.bitmap, 'fly') : planeTextures(f, 'fly'); texs.push(tx.y, tx.uv); return tx; });
+  const hevcTex = frames.map(f => {
+    const tx = f.ready ? f : f.bitmap ? yuvTextures(f.bitmap, 'fly') : planeTextures(f, 'fly');
+    texs.push(tx.y, tx.uv);
+    return tx;
+  });
   const imgTex = images.map((b, i) => {
     if (!b) return null;
     const shadeOnly = g.materials.every(m => !(m.pbrMetallicRoughness && m.pbrMetallicRoughness.baseColorTexture
@@ -1046,18 +1206,6 @@ function selectFlyover(planes, cssH, aspect) {
   for (const t of queue) { if (flyActive >= FLY_ACTIVE) break; flyLoad(t); }
   // 読みかけは、しばらく（4 秒）要らなかったら取りやめる（回している間に取りやめると、戻ったときに初めからになる）
   for (const t of flyLoading) if (now - t.wantedAt > 4000 && t.abort) t.abort.abort();
-  // GPU に載せる（1 コマに UPLOADS_PER_FRAME まで。見えているもの・中央に近いものから）。しばらく要らなかったものは捨てる
-  for (let i = uploads.length - 1; i >= 0; i--) {
-    const u = uploads[i];
-    if (now - u.t.wantedAt > 4000) {
-      uploads.splice(i, 1);
-      u.frames.forEach(f => f.bitmap && f.bitmap.close()); u.images.forEach(b => b && b.close());
-      u.t.state = 'none';
-    }
-  }
-  uploads.sort((a, b) => ((a.t.wanted === fframe ? 0 : 1e9) + a.t.pri) - ((b.t.wanted === fframe ? 0 : 1e9) + b.t.pri));
-  for (const u of uploads.splice(0, UPLOADS_PER_FRAME)) upload(u);
-  if (uploads.length) dirty = true;
   // 捨てる: 描かなくなって KEEP_MS たったものと、MAX_MODELS を超えた分。止まっていると描かないので、残したものは
   // KEEP_MS たったら選び直して捨てる
   const idle = [];
@@ -1065,15 +1213,33 @@ function selectFlyover(planes, cssH, aspect) {
   flyRoots.forEach(walk);
   idle.sort((a, b) => a.usedAt - b.usedAt);
   idle.forEach((t, i) => { if (now - t.usedAt >= KEEP_MS || flyModels - i > MAX_MODELS) flyUnload(t); });
-  if (flyModels > out.length && !evictTimer) evictTimer = setTimeout(() => { evictTimer = 0; dirty = true; }, KEEP_MS + 50);
+  if (flyModels > out.length && !evictTimer) evictTimer = setTimeout(() => { evictTimer = 0; selStale = dirty = true; }, KEEP_MS + 50);
   return out;
+}
+// GPU に載せる（1 コマに UPLOADS_PER_FRAME まで。見えているもの・中央に近いものから）。しばらく要らなかったものは捨てる。
+// 選び直さないコマでも、描くたびに進める
+function flyUploads() {
+  const now = performance.now();
+  for (let i = uploads.length - 1; i >= 0; i--) {
+    const u = uploads[i];
+    if (now - u.t.wantedAt > 4000) {
+      uploads.splice(i, 1);
+      dropFrames(u.frames); u.images.forEach(b => b && b.close());
+      u.t.state = 'none';
+    }
+  }
+  if (!uploads.length) return;
+  uploads.sort((a, b) => ((a.t.wanted === fframe ? 0 : 1e9) + a.t.pri) - ((b.t.wanted === fframe ? 0 : 1e9) + b.t.pri));
+  for (const u of uploads.splice(0, UPLOADS_PER_FRAME)) upload(u);
+  selStale = true;
+  if (uploads.length) dirty = true;
 }
 
 // ---------------------------------------------------------------- 描く
 
 // 目に見える範囲。W, H は描く画素、cssH は CSS の高さ（Flyover の細かさは CSS px で決める）
-function viewProj(W, H) {
-  const aspect = W / H, f = 1 / Math.tan(fovy(aspect) / 2);
+function viewProj(W, H, wide = 1) {
+  const aspect = W / H, f = 1 / Math.tan(fovy(aspect) / 2) / wide;
   const near = clamp(geodetic(cam.pos)[2] * 0.001, 0.5, 1000);
   // reversed-Z の無限遠の透視投影（深度は手前 1、無限遠 0）
   const P = new Float64Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, 0, -1, 0, 0, near, 0]);
@@ -1082,10 +1248,47 @@ function viewProj(W, H) {
   return { vp: mat4mul(P, V), near };
 }
 // 選んで、1 回分の描く中身（uniform を書き、描く関数を返す）
-function prepare(W, H, cssH) {
+// タイル選びは毎コマやらない。視野を SEL_WIDE 倍に広げて選んでおき、カメラがその余白の中で動いている間は前の結果を
+// 使う。選び直すのは、余白を出たとき、地面までの距離が SEL_DIST より変わったとき（細かさが変わる）、画面の大きさや
+// 2D/3D が変わったとき、タイルが届いて SEL_SOFT_MS たったとき、前に選んでから SEL_MAX_MS たったとき（読みかけの
+// 取りやめと、使わなくなったものを捨てるのを進める）。?reuse=0 で毎コマ選ぶ
+const SEL_WIDE = 1.2, SEL_DIST = 0.05, SEL_SOFT_MS = 100, SEL_MAX_MS = 500, REUSE = params.get('reuse') !== '0';
+let sel = null, selCount = 0, selMs = 0, selSplit = [0, 0], upMs = 0;
+const angle = (a, b) => Math.acos(clamp(dot(a, b), -1, 1));
+function groundDist() {
+  const [lat, lon, h] = geodetic(cam.pos), g = heightAt(lat / RAD, lon / RAD);
+  return Math.max(10, h - (g === undefined ? 0 : g));
+}
+function mustSelect(W, H, cssH, now) {
+  if (!REUSE || !sel || sel.W !== W || sel.H !== H || sel.cssH !== cssH || sel.mode2D !== GE.mode2D) return true;
+  const age = now - sel.at;
+  if (age >= SEL_MAX_MS || (selStale && age >= SEL_SOFT_MS)) return true;
+  const d = groundDist();
+  if (Math.abs(d / sel.dist - 1) > SEL_DIST) return true;
+  // 向きの変わり（見る向き + 傾き）と、動いた距離を地面までの距離で割ったもの（近くのものが見える向きの変わり）
+  return angle(sel.dir, cam.dir) + angle(sel.up, cam.up) + len(sub(cam.pos, sel.pos)) / Math.min(d, sel.dist) > sel.margin;
+}
+function prepare(W, H, cssH, force = false) {
   const { vp, near } = viewProj(W, H);
-  const list = selectGround(vp, H, W / H);
-  const fly = selectFlyover(frustumPlanes(vp), cssH, W / H);
+  const t0 = performance.now();
+  if (force || mustSelect(W, H, cssH, t0)) {
+    const aspect = W / H, h = Math.tan(fovy(aspect) / 2);
+    const wvp = viewProj(W, H, SEL_WIDE).vp;
+    const list = selectGround(wvp, H, aspect);
+    const t1 = performance.now();
+    const fly = selectFlyover(frustumPlanes(wvp), cssH, aspect);
+    selSplit = [t1 - t0, performance.now() - t1];
+    // 余白の角度（縦と横の狭いほう）
+    const margin = Math.min(Math.atan(h * SEL_WIDE) - Math.atan(h), Math.atan(h * aspect * SEL_WIDE) - Math.atan(h * aspect));
+    sel = { list, fly, W, H, cssH, mode2D: GE.mode2D, at: t0, pos: cam.pos.slice(), dir: cam.dir.slice(), up: cam.up.slice(),
+      dist: groundDist(), margin };
+    selStale = false; selCount++;
+    selMs = performance.now() - t0;
+  }
+  const t2 = performance.now();
+  flyUploads();
+  upMs = performance.now() - t2;
+  const { list, fly } = sel;
   const n = Math.min(list.length, MAX_DRAW), nf = Math.min(fly.length, MAX_DRAW - n);
   const putMvp = (i, o) => {
     const b = i * U_STRIDE / 4, m = uniformData.subarray(b, b + 16);
@@ -1272,7 +1475,7 @@ function render() {
       rb.buf.unmap(); rb.busy = false;
     }, () => { rb.busy = false; });
   }
-  stats = { draw: frame.n, fly: frame.nf };
+  stats = { draw: frame.n, fly: frame.nf, selMs, selCount, selGround: selSplit[0], selFly: selSplit[1], upMs };
   cpuMs = performance.now() - t0;
   rendered++;
 }
@@ -1291,12 +1494,12 @@ async function shot(SW, SH) {
     const t0 = performance.now();
     let calm = 0;
     while (performance.now() - t0 < 90000) {
-      prepare(SW, SH, SH / dpr);       // 選んで読む（描かない）
+      prepare(SW, SH, SH / dpr, true);       // 選んで読む（描かない）
       calm = active === 0 && flyActive === 0 && uploads.length === 0 ? calm + 1 : 0;
       if (calm >= 10 && performance.now() - t0 > 500) break;
       await new Promise(r => setTimeout(r, 100));
     }
-    const frame = prepare(SW, SH, SH / dpr);
+    const frame = prepare(SW, SH, SH / dpr, true);
     device.queue.writeBuffer(frameMain, 0, frameData(frame.vp));
     const enc = device.createCommandEncoder();
     const pass = enc.beginRenderPass({
@@ -1325,7 +1528,7 @@ async function shot(SW, SH) {
     return c;
   } finally {
     color.destroy(); depth.destroy();
-    shooting = null; dirty = true;
+    shooting = null; sel = null; dirty = true;
   }
 }
 
@@ -1355,7 +1558,7 @@ Object.assign(GE, {
   atmosphere: ATMOSPHERE, mode2D: false,
   pending: () => active + flyActive + uploads.length, shooting: () => !!shooting,
   stats: () => ({ gpuMs, cpuMs, ...stats, groundTiles: loadedCount, flyModels, flyActive, uploads: uploads.length, active,
-    memMB: { ground: mem.ground / 1048576, fly: mem.fly / 1048576 }, hevc }),
+    memMB: { ground: mem.ground / 1048576, fly: mem.fly / 1048576 }, hevc, bc: BC }),
 });
 requestAnimationFrame(tick);
 return GE;
