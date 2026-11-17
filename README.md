@@ -5,41 +5,51 @@
 Apple マップの Flyover（街の 3D 航空写真）を、Windows のブラウザで見るためのツールです。
 Python だけで動き、Mac も Apple のアプリも要りません。
 
-- **地球儀ビューア** — Google Earth のように地球全体から寄っていくと、Flyover のある街が 3D で表示されます。操作も Google Earth と同じです
-- **書き出し** — 指定した地点のまわりを、ブラウザで見られる一式や OBJ・glb（Blender などで開ける 3D の形式）に書き出します
+![大阪・梅田の 3D](docs/images/umeda.jpg)
+
+| | |
+|---|---|
+| ![宇宙から見た日本](docs/images/globe.jpg) | ![桜にした大阪城公園](docs/images/osaka-castle-sakura.jpg) |
+| 地球全体から寄っていける（Google Earth 風の色合い） | `?season=sakura` で木を桜に |
+| ![夕方の光の中之島](docs/images/nakanoshima-evening.jpg) | |
+| `?light=evening` で夕方の光に | |
+
+<sub>画面写真の航空写真・衛星画像・3D は Apple マップのもの（© Apple）です。このツールで表示した例として載せています。</sub>
 
 > [!WARNING]
 > このツールは、Apple が一般には公開していない仕組みを使って Apple マップのデータを取得します。Apple の利用規約に反する可能性があります。使うのは自己責任で、取得したデータを再配布しないでください。このプロジェクトは Apple とは関係ありません。
 
-## 必要なもの
+## できること
 
-- Python 3（3.13 で動作確認）
-- WebGL が使えるブラウザ（Chrome か Edge で確認）
-- インターネット接続（データは見るたびに Apple から取得します）
-
-Windows 11 で動作を確認しています。
+- **地球儀ビューア**: 地球全体から寄っていくと、Flyover のある街が 3D で表示されます。操作は Google Earth と同じです
+- **iOS 27 の新しい Flyover**: 新しいデータ（木が 1 本ずつ描かれる）で見られます。木を桜や紅葉にしたり、朝・夕方・曇り・夜の光にしたりもできます
+- **書き出し**: 指定した地点のまわりを、ブラウザで見られる一式や OBJ・glb（Blender などで開ける 3D の形式）に書き出します
 
 ## はじめかた
+
+Python 3（3.13 で確認）と、Chrome か Edge が要ります。Windows 11 で動作を確認しています。
 
 ```bash
 git clone https://github.com/Nao-png/flyover-web
 cd flyover-web
 pip install -r requirements.txt
-python scripts/earth.py
+python scripts/earth.py --r3d
 ```
 
-ブラウザで http://localhost:8000/ を開きます。ポートを変えるときは `python scripts/earth.py 8080` のように指定します。
+ブラウザで開きます。
 
-iOS 27 の新しい Flyover（style 98）で見るときは `python scripts/earth.py --r3d` で起動します。新しい Flyover のあるところはすべてのズームでそれを使い、ないタイルだけ今までのもので表示します（[仕組み](docs/how-it-works.md#新しい-flyoverstyle-98)）。URL に `?season=sakura` を付けると木が桜に、`?season=momiji` で紅葉になります（木のスプラットの緑だけを塗り替える。木の一部がメッシュ（写真を貼った形）でできている所では、近くで見るとその木は丸ごと緑のままにし、古い Flyover を入れ直した地域（パリなど）の木は写真なので変わりません）。`?light=morning`（朝）・`evening`（夕方）・`cloudy`（曇り）・`night`（夜）で、写真の影を取り除いて光の当たり方を変えます（新しい Flyover の日の当たり方の画像を使う）。
+| URL | ビューア |
+|---|---|
+| http://localhost:8000/gpu.html | **WebGPU 版**（おすすめ）。軽く、新しい Flyover の HEVC の写真を GPU の専用回路で展開します |
+| http://localhost:8000/ | CesiumJS 版（WebGL）。WebGPU が使えないブラウザ向け |
+
+- `--r3d` を付けると、新しい Flyover のある所はそれを使い、ない所だけ今までのもので表示します。付けなければ今までの Flyover だけです
+- ポートを変えるときは `python scripts/earth.py 8080 --r3d` のように指定します
+- データは見るたびに Apple から取得します。一度見た場所は `cache/` に保存されるので、2 回目からは速くなります
 
 ## 地球儀ビューア
 
-地球全体から寄っていくと、Flyover のある所では 3D の街が読み込まれます。下地には Apple の衛星画像と地形を使います。
-
-- **検索**: 左上の欄に地名か「緯度, 経度」を入れます。3D のある場所には印が付きます
-- **大気**: 空の色と遠くのかすみを、Google Earth と同じ作者の方法（Bruneton の Precomputed Atmospheric Scattering）で描きます。開いてから 4 秒ほどで切り替わります。右の「A / G」ボタンか G キーで、色合いを Apple マップ本来の見え方（大気の処理をしない。初めて開いたときはこちら）と Google Earth 風（空とかすみが青い）で切り替えます。`?atmo=0` で切ります（[仕組み](docs/how-it-works.md#大気)）
-- **読み込みの速さ**: 最初の 3D は 2〜3 秒で出ます。初めての場所で全部が細かくなるまでは 10〜20 秒ほどかかります（回線の速さしだい）。一度見た場所は `cache/` に保存されるので、2 回目からは 7 秒ほどです
-- **視点の保存**: 今の視点は URL（`#緯度,経度,高度m,方位h,傾きt`）に入るので、ブックマークすればその視点から開けます
+左上の欄に地名か「緯度, 経度」を入れると、その場所へ飛びます。今の視点は URL（`#緯度,経度,高度,方位,傾き`）に入るので、ブックマークすればその視点から開けます。
 
 ### 操作
 
@@ -48,69 +58,40 @@ iOS 27 の新しい Flyover（style 98）で見るときは `python scripts/eart
 | 操作 | マウス | キーボード |
 |---|---|---|
 | 移動 | ドラッグ | 矢印 |
-| 拡大・縮小 | ホイール（カーソルの方へ）、右ドラッグ | PageUp / PageDown、+ / - |
-| 回転 | Shift + 左右にドラッグ、中ボタンでドラッグ | Shift + ← → |
-| 傾き | Shift + 上下にドラッグ、Shift + ホイール | Shift + ↑ ↓ |
+| 拡大・縮小 | ホイール、右ドラッグ | PageUp / PageDown、+ / - |
+| 回転・傾き | Shift + ドラッグ、中ボタンでドラッグ | Shift + 矢印 |
 | 見回す | Ctrl + ドラッグ | |
-| 寄る・離れる | ダブルクリック・右ダブルクリック | |
-| 高度を上げる・下げる | | Shift + PageUp / PageDown |
 | 北を上に・真上から・両方 | 方位磁針をクリック | N・U・R |
-| 2D と 3D の切り替え | 右下のボタン | O |
-| 止める・検索・操作一覧 | | Space・/・? |
+| 色合いの切り替え（Apple マップ / Google Earth 風） | 右の「A / G」ボタン | G |
+| 2D と 3D の切り替え | 右の「3D」ボタン | O |
+| スクリーンショット | 右のカメラのボタン | P（4K は Shift + P） |
 
 Alt キーを押しながら動かすと、ゆっくり動きます。
 
+### URL に付けるもの
+
+| 付けるもの | 変わること |
+|---|---|
+| `?season=sakura`、`?season=momiji` | 木が桜・紅葉になる（`--r3d` のとき） |
+| `?light=morning`、`evening`、`cloudy`、`night` | 写真の影を取り除き、朝・夕方・曇り・夜の光にする（`--r3d` のとき） |
+| `?look=apple`、`?look=google` | 色合い（G キーと同じ） |
+
 ## 書き出し
 
-指定した地点のまわりのタイルを取得して、ブラウザで見られる一式（three.js）に書き出します。
-
 ```bash
-python scripts/export.py 36.5722 136.6680 --out out/higashi-chaya   # 金沢・ひがし茶屋街
-python scripts/export.py --bbox 34.6418 135.3729 34.6601 135.4045 --r3d --quality 100 --block 15 --out out/yumeshima   # 夢洲全体を区画に分けて
+python scripts/export.py 36.5722 136.6680 --out out/higashi-chaya   # 金沢・ひがし茶屋街のまわり
 python scripts/serve.py out                                          # http://localhost:8000/higashi-chaya/
 ```
 
-ひがし茶屋街のまわり 9×9 タイル（約 280 m 四方、88 タイル・15 万三角形）で、取得から書き出しまで約 10 秒です。
-
-| 引数 | 既定 | 意味 |
-|---|---|---|
-| `--out` | （必須） | 書き出すフォルダ |
-| `--zoom` | 20 | タイルの細かさ（20 で 1 タイル約 30 m 四方） |
-| `--radius` | 4 | 中心のタイルから前後左右に何タイル取るか（4 で 9×9 タイル） |
-| `--bbox` | なし | 中心と `--radius` の代わりに、南・西・北・東の緯度経度で範囲を指定 |
-| `--r3d` | なし | 新しい Flyover（iOS 27）を使う。ないか読めないタイルだけ古い Flyover にする |
-| `--block` | なし | N×N タイルずつ別のフォルダに書き出し、一覧のページを置く（広い範囲を 1 ページにすると画像が GPU に載りきらない） |
-| `--jobs` | 8 | 同時に取得するタイルの数 |
-| `--obj` | なし | OBJ にも書き出す（ファイル名を指定。例: `--obj out/kanazawa.obj`）。`--r3d` なら、木などのスプラットは頂点に色の付いた三角形（`splats`）になる。OBJ には透明度がないので、ふちのぼかしはなくなる |
-| `--glb` | なし | glb（glTF）にも書き出す（ファイル名を指定。例: `--glb out/yumeshima.glb`）。`--r3d` のスプラットも、ビューアと同じく頂点の色と縁のぼかしの付いた半透明の三角形で入る。Blender、three.js、Windows の 3D ビューアーなどで開ける |
-| `--quality` | 90 | 画像の JPEG の画質（95 以上なら色を間引かない） |
-| `--hevc` | なし | 新しい Flyover の画像を JPEG にせず HEVC のまま書く（ブラウザが GPU で展開する。画像のファイルは 1/5 ほどになり、写真を圧縮し直さないので画質も落ちない。HEVC を GPU で展開できるブラウザでしか見られない） |
-| `--cache` | `cache` | 取得したデータの保存先 |
+`--r3d` で新しい Flyover を使い、`--obj` や `--glb` で OBJ・glb にも書き出せます。引数の一覧は [docs/how-it-works.md](docs/how-it-works.md#書き出しの引数) にあります。
 
 ## 仕組み
 
 1. Apple マップのアプリと同じように、設定ファイル（リソースマニフェスト）からタイルの URL と認証に使う値を得ます
-2. タイルを位置（`x, y, z`）と高さの区分（`h`）で要求します
-3. 届いた 3D モデル（C3M 形式）を展開します。形は Apple 独自の方式で圧縮され、画像は HEIC 形式です
-4. ブラウザで扱える形（glb と JPEG）に変換して表示します
+2. タイルを位置と高さの区分で要求し、届いた 3D モデル（今までの C3M 形式と、新しい R3D 形式）を展開します
+3. ブラウザで扱える形（glb と JPEG・HEVC）に変換して表示します
 
-詳しい仕組みと、読み込みを速くするための工夫は [docs/how-it-works.md](docs/how-it-works.md) にまとめています。
-
-## ファイル構成
-
-| ファイル | 中身 |
-|---|---|
-| `scripts/earth.py` | 地球儀ビューアを起動 |
-| `scripts/export.py` | 取得から書き出しまで |
-| `scripts/serve.py` | 書き出した一式を手元で配るだけのサーバー |
-| `scripts/compare_go.py` | Go 版との照合 |
-| `flyover/client.py` | Apple への要求（設定ファイル、地域の選択、認証、タイルの取得） |
-| `flyover/c3m.py`、`edgebreaker.py`、`huffman.py`、`_fast.py` | C3M の読み取りと展開（`_fast.py` は numba で速くした版） |
-| `flyover/r3d.py` | 新しい Flyover（style 98、R3D）のメッシュとスプラットの読み取り |
-| `flyover/c3mm.py` | 新しい Flyover の目録（style 100）の読み取り。どのタイルのどの高さ区分にデータがあるか |
-| `flyover/glb.py`、`terrain.py`、`earth.py`、`earth/` | 地球儀ビューアのサーバーと画面 |
-| `flyover/web.py` | 書き出し（ブラウザ用と OBJ と glb） |
-| `tools/retroplasma-2026.patch` | Go 版を今の Apple のサーバーで動かすための修正（照合用） |
+データの取り方、ビューアの作り、読み込みを速くする工夫、ファイル構成は [docs/how-it-works.md](docs/how-it-works.md) にまとめています。
 
 ## テスト
 
@@ -120,13 +101,13 @@ Apple のデータなしで確かめられる部分のテストです。
 python -m pytest tests -q
 ```
 
-C3M の読み取りは、元の Go 版と**ビット単位で一致**することを、本物のタイル 209 枚（金沢 88 枚・渋谷 121 枚）で確かめています。確かめ直す手順は [docs/how-it-works.md](docs/how-it-works.md#go-版との照合) にあります。
+C3M の読み取りは、元の Go 版と**ビット単位で一致**することを、本物のタイル 209 枚で確かめています（[手順](docs/how-it-works.md#go-版との照合)）。
 
 ## 元になったもの
 
-- [retroplasma/flyover-reverse-engineering](https://github.com/retroplasma/flyover-reverse-engineering)（Go、2021 年にアーカイブ）の解析と実装を Python に移しました。C3M の展開は、Go の整数の桁あふれの振る舞いまで含めて書き写しています。2026 年の Apple のサーバーでは当時から変わった所があり、それに合わせて直しています
+- [retroplasma/flyover-reverse-engineering](https://github.com/retroplasma/flyover-reverse-engineering)（Go、2021 年にアーカイブ）の解析と実装を Python に移し、2026 年の Apple のサーバーに合わせて直しました
 - 認証の手順は [sk-zk/streetlevel](https://github.com/sk-zk/streetlevel)（Look Around 用）の実装を参考にしました
-- 地球儀の表示には [CesiumJS](https://cesium.com/platform/cesiumjs/) を、地名の検索には [OpenStreetMap の Nominatim](https://nominatim.openstreetmap.org/) を使っています
+- CesiumJS 版の表示には [CesiumJS](https://cesium.com/platform/cesiumjs/) を、地名の検索には [OpenStreetMap の Nominatim](https://nominatim.openstreetmap.org/) を使っています
 
 ## 注意
 
@@ -144,4 +125,4 @@ C3M の読み取りは、元の Go 版と**ビット単位で一致**するこ�
 
 `flyover/earth/atmosphere/` の `definitions.glsl`・`functions.glsl` は Eric Bruneton の [precomputed_atmospheric_scattering](https://github.com/ebruneton/precomputed_atmospheric_scattering) のもので、そのライセンス（BSD 3-Clause、[flyover/earth/atmosphere/LICENSE](flyover/earth/atmosphere/LICENSE)）に従います。`flyover/earth/atmosphere.js` はその `model.cc` などを WebGL2 に移したものなので、同じライセンスの表記も守ります。
 
-取得したデータは Apple の著作物で、このライセンスの対象ではありません。
+取得したデータと画面写真の Apple マップの画像は Apple の著作物で、このライセンスの対象ではありません。

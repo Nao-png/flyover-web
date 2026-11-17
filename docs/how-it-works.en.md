@@ -82,6 +82,17 @@ Satellite imagery is style 7, and terrain is style 17 (zoom 7 and 11 worldwide, 
 - To get around the browser's limit on concurrent connections (6 per host), Flyover, satellite and terrain tiles are spread across different loopback addresses (127.0.0.2–127.0.0.17)
 - Place search is relayed to OpenStreetMap's Nominatim
 
+## The WebGPU viewer
+
+`gpu.html` draws directly with WebGPU instead of CesiumJS. It chooses tiles and draws the atmosphere the same way as the CesiumJS version, and is made lighter in these ways (`flyover/earth/gpu-*.js`):
+
+- **Choosing tiles**: Not every frame. It chooses a slightly wider area than the screen (1.2 times) and chooses again only when the camera leaves that margin, when the distance to the ground changes by 5%, when a tile arrives (after 0.1 s), or after 0.5 s
+- **Photos**: The new Flyover's HEVC is decoded by the GPU's video hardware, and the decoded frames are read directly with `importExternalTexture` into brightness (Y) and color (UV) textures. JPEG and PNG are opened with `ImageDecoder` and copied to the GPU from a buffer created mapped (ground JPEGs stay as Y, U and V). In both cases mipmaps are made on the GPU and compressed to BC4 and BC5 (about half the photo memory)
+- **Stutter while loading**: GPU commands for photos are sent once per frame, and up to 8 ground tiles and 4 Flyover models are put on the GPU per frame. HEVC is decoded one at a time (decoding several at once clogged the GPU side and froze the screen for around 100 ms). `queue.writeBuffer`, `writeTexture` and `copyExternalImageToTexture` can wait for tens of ms to over 100 ms per call while drawing, so they are not used for large data
+- **Drawing**: MSAA is 1x while the camera moves, and the view is redrawn at 4x 0.15 s after it stops. Tree splats are blended with Weighted Blended OIT (McGuire and Bavoil 2013), as in the CesiumJS version
+
+URL options to compare with the earlier ways: `?reuse=0` (choose every frame), `?hevcframe=0` (receive HEVC as ImageBitmap), `?bc=0` (no compression), `?imgdec=0` (copy JPEG through ImageBitmap), `?batch=0` (send commands one texture at a time), `?hevcw=3` (decode 3 HEVC at once), `?msaa=1`, `?lodpx=520` (size at which tiles are refined).
+
 ## What had changed on the servers by 2026
 
 Since the original, retroplasma/flyover-reverse-engineering (archived in 2021), the following had changed. This project is adapted to them.
@@ -155,6 +166,50 @@ The manifest requested as iOS 27 lists the new Flyover tiles (style 98). Start w
 - **Height map (style 99)**: The iOS 27 manifest also lists style 99, requested with zoom 14 tiles (`?style=99&v=<version>&x&y&z`; it responds only where the new Flyover exists and is empty elsewhere). It is a 512 px square 16-bit grey PNG holding the surface height of buildings and ground in 1 m steps (one pixel is about 4 m in Tokyo). The value is the height above the lowest point of that tile. Its difference from the mesh's ellipsoidal height is constant within a tile regardless of height (median 23.0 m in the Tokyo Station tile, median deviation 0.9 m) and differs per tile (Nagoya 32.7 m, New York −37.4 m, Denver 1,567 m). The base height is in 12 bytes appended after the end of the PNG (IEND): an f32 base height (ellipsoidal; Tokyo Station 22.06 m, Nagoya 31.73 m, New York −38.28 m, Denver 1,566.50 m), an f32 of 1.0 (height per unit value), `10 01` (16 bits, 1 channel) and a u16 of 12 (the length of this trailer). Height = base + value, which is 0.5–1 m below the mesh height (in all 6 tiles checked). What it is used for is unknown (the view does not use it)
 - **Capture time (first item of part 2)**: The last 8 bytes of the 152-byte item are usually 0. In about a quarter of the tiles (here only zoom 20 tiles in Toyama, Takaoka, Kanazawa, Tokyo Station, Fukuoka, Sapporo, Cupertino and a few others) they hold a double Unix time (2025-01 to 2026-03), which appears to be when the aerial photos were taken (98% of zoom 20 tiles have it, zoom 13–19 tiles never do). Like Google Earth's imagery date, the viewer shows the capture date of the zoom 20 tile at the screen centre in the bottom bar (if that tile is not loaded it asks the server via `/api/captured/20/x/y`, which fetches just one height slab of it). All of them fall between 8.9 and 14.7 h local solar time, and neighbouring tiles differ by seconds to minutes (the flight order). Casting shadows with the sun direction computed from that time and place matches item 6 (the sunlit map) with a median correlation of 0.55, almost the same as the best direction found by searching (0.56; 38 tiles in 8 regions, median angle between the two 7°). Shifting the time by 3 hours drops it to 0.34, and the true time is better in 35 to 37 of 37 tiles. The 3 f32 before the time are usually 0.5 each; in tiles with a time they are bluish per-tile values (e.g. 0.013, 0.018, 0.029; blue about 1.4 × red). They follow the sun height somewhat (correlation 0.55) but the photo's shadow-to-sunlit ratio only weakly (0.33), so their meaning is unknown
 - **What is unknown**: The true meaning of splat value 1 and the item 8 image, and how Apple uses value 4 (the sun value) when drawing (with the 3 Apple screenshots at hand, not using it matches best; the view uses none of the 4 values now; checking further needs screenshots at different times of day). What the mark on the lower vertices of the water band is used for
+
+## Export options
+
+```bash
+python scripts/export.py 36.5722 136.6680 --out out/higashi-chaya   # Higashi Chaya District, Kanazawa
+python scripts/export.py --bbox 34.6418 135.3729 34.6601 135.4045 --r3d --quality 100 --block 15 --out out/yumeshima   # all of Yumeshima, in blocks
+python scripts/serve.py out                                          # http://localhost:8000/higashi-chaya/
+```
+
+For the 9×9 tiles around Higashi Chaya (about 280 m square, 88 tiles, 150,000 triangles), fetching and exporting takes about 10 seconds.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--out` | (required) | Output folder |
+| `--zoom` | 20 | Tile detail (at 20, one tile is about 30 m square) |
+| `--radius` | 4 | How many tiles to fetch in each direction from the center tile (4 gives 9×9 tiles) |
+| `--bbox` | none | Give the area as south, west, north, east latitude/longitude instead of a center and `--radius` |
+| `--r3d` | off | Use the new Flyover (iOS 27); only tiles without it, or that fail to parse, use the old Flyover |
+| `--block` | none | Write N×N tiles per folder, plus an index page (a large area on one page does not fit in GPU memory) |
+| `--jobs` | 8 | Number of tiles fetched at once |
+| `--obj` | none | Also export OBJ (give a file name, e.g. `--obj out/kanazawa.obj`). With `--r3d`, splats such as trees become triangles with vertex colors (`splats`). OBJ has no transparency, so their soft edges are lost |
+| `--glb` | none | Also export glb (glTF) (give a file name, e.g. `--glb out/yumeshima.glb`). With `--r3d`, splats are included as semi-transparent triangles with vertex colors and soft edges, as in the viewer. Opens in Blender, three.js, Windows 3D Viewer, and others |
+| `--quality` | 90 | JPEG quality of the images (95 or more keeps full color resolution) |
+| `--hevc` | none | Write new-Flyover images as HEVC instead of JPEG (the browser decodes them on the GPU; image files are about 1/5 the size, and photos are not recompressed, so no quality loss; only viewable in browsers that can decode HEVC on the GPU) |
+| `--cache` | `cache` | Where fetched data is saved |
+
+## Files
+
+| File | Contents |
+|---|---|
+| `scripts/earth.py` | Starts the globe viewer |
+| `scripts/export.py` | From fetching to export |
+| `scripts/serve.py` | A server that only serves exported files locally |
+| `scripts/compare_go.py` | Comparison against the Go version |
+| `flyover/client.py` | Requests to Apple (manifest, region selection, authentication, tile fetching) |
+| `flyover/c3m.py`, `edgebreaker.py`, `huffman.py`, `_fast.py` | Reading and decoding C3M (`_fast.py` is a faster version using numba) |
+| `flyover/r3d.py` | Reading the mesh and splats of the new Flyover (style 98, R3D) |
+| `flyover/c3mm.py` | Reads the index of the new Flyover (style 100): which height slabs of which tiles have data |
+| `flyover/glb.py`, `terrain.py`, `earth.py` | Server for the globe viewer |
+| `flyover/earth/index.html`, `earth.js` | The CesiumJS viewer |
+| `flyover/earth/gpu.html`, `gpu-*.js` | The WebGPU viewer |
+| `flyover/earth/hevc.js` | HEVC decoding (a worker used by both viewers) |
+| `flyover/web.py` | Export (for the browser, OBJ, and glb) |
+| `tools/retroplasma-2026.patch` | Fixes for running the Go version against today's Apple servers (for the comparison) |
 
 ## Comparison with the Go version
 
