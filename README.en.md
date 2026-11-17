@@ -5,112 +5,93 @@
 A tool for viewing Apple Maps Flyover (3D aerial imagery of cities) in a browser on Windows.
 It runs on Python alone; no Mac or Apple apps are needed.
 
-- **Globe viewer** — Zoom in from the whole Earth, like Google Earth, and cities with Flyover appear in 3D. The controls are the same as Google Earth
-- **Export** — Save the area around a given point as a set of files you can view in the browser, or as OBJ or glb (3D formats that Blender and similar tools can open)
+![Umeda, Osaka in 3D](docs/images/umeda.jpg)
+
+| | |
+|---|---|
+| ![Japan seen from space](docs/images/globe.jpg) | ![Osaka Castle Park with cherry blossoms](docs/images/osaka-castle-sakura.jpg) |
+| Zoom in from the whole Earth (Google Earth style look) | `?season=sakura` turns the trees into cherry blossoms |
+| ![Nakanoshima in evening light](docs/images/nakanoshima-evening.jpg) | |
+| `?light=evening` for evening light | |
+
+<sub>The aerial photos, satellite imagery and 3D in the screenshots are from Apple Maps (© Apple). They are shown as examples of what this tool displays.</sub>
 
 > [!WARNING]
 > This tool fetches Apple Maps data through interfaces that Apple does not offer to the public. This may violate Apple's terms of service. Use it at your own risk, and do not redistribute the data you fetch. This project is not affiliated with Apple.
 
-## Requirements
+## Features
 
-- Python 3 (tested with 3.13)
-- A browser with WebGL (tested with Chrome and Edge)
-- An internet connection (data is fetched from Apple as you view it)
-
-Tested on Windows 11.
+- **Globe viewer**: Zoom in from the whole Earth, and cities with Flyover appear in 3D. The controls are the same as Google Earth
+- **The new Flyover of iOS 27**: View the new data, where trees are drawn one by one. You can turn the trees into cherry blossoms or autumn leaves, and change the light to morning, evening, cloudy or night
+- **Export**: Save the area around a given point as a set of files you can view in the browser, or as OBJ or glb (3D formats that Blender and similar tools can open)
 
 ## Getting started
+
+You need Python 3 (tested with 3.13) and Chrome or Edge. Tested on Windows 11.
 
 ```bash
 git clone https://github.com/Nao-png/flyover-web
 cd flyover-web
 pip install -r requirements.txt
-python scripts/earth.py
+python scripts/earth.py --r3d
 ```
 
-Open http://localhost:8000/ in your browser. To use another port, pass it like `python scripts/earth.py 8080`.
+Then open one of these in the browser:
 
-To view the new Flyover of iOS 27 (style 98), start with `python scripts/earth.py --r3d`. Wherever the new Flyover exists it is used at every zoom; only tiles without it are shown with the old one ([how it works](docs/how-it-works.en.md#the-new-flyover-style-98)). Add `?season=sakura` to the URL to turn the trees into cherry blossoms, or `?season=momiji` for autumn leaves (only the green of the tree splats is recolored; trees that are partly mesh (shapes with a photo) are left entirely green when seen up close, and in regions that repackage the old Flyover, such as Paris, the trees are part of the photo and do not change). `?light=morning`, `evening`, `cloudy` or `night` removes the shadows from the photos and changes the lighting (using the new Flyover's sun maps).
+| URL | Viewer |
+|---|---|
+| http://localhost:8000/gpu.html | **WebGPU version** (recommended). Lighter, and decodes the new Flyover's HEVC photos with the GPU's video hardware |
+| http://localhost:8000/ | CesiumJS version (WebGL), for browsers without WebGPU |
+
+- With `--r3d`, the new Flyover is used wherever it exists, and the old one only where it does not. Without it, only the old Flyover is shown
+- To use another port, run e.g. `python scripts/earth.py 8080 --r3d`
+- Data is fetched from Apple as you view it. Places you have seen are saved in `cache/`, so they load faster the second time
 
 ## Globe viewer
 
-Zoom in from the whole Earth, and wherever Flyover exists the 3D city loads. Apple's satellite imagery and terrain are used underneath.
-
-- **Search**: Type a place name or "latitude, longitude" in the box at the top left. Places with 3D are marked
-- **Atmosphere**: The sky color and the haze in the distance are drawn with the same method as Google Earth, by the same author (Bruneton's Precomputed Atmospheric Scattering). It switches on about 4 seconds after opening. The "A / G" button on the right or the G key switches the look between Apple Maps' own (no atmosphere processing) and Google Earth style (blue sky and haze). `?atmo=0` turns it off ([how it works](docs/how-it-works.en.md#atmosphere))
-- **Loading speed**: The first 3D appears in 2–3 seconds. In a place you haven't visited, it takes about 10–20 seconds until everything is at full detail (depending on your connection). Places you have seen are saved in `cache/`, so the second time takes about 7 seconds
-- **Saving a view**: The current view is kept in the URL (`#lat,lon,altitude m,heading h,tilt t`), so a bookmark opens that same view
+Type a place name or "latitude, longitude" in the box at the top left to fly there. The current view is kept in the URL (`#latitude,longitude,altitude,heading,tilt`), so you can bookmark it and open that view later.
 
 ### Controls
 
-Press the `?` button at the bottom right or the `?` key to see the list at any time.
+Press the `?` button at the bottom right or the `?` key to show the list at any time.
 
 | Action | Mouse | Keyboard |
 |---|---|---|
-| Move | Drag | Arrow keys |
-| Zoom in / out | Wheel (toward the cursor), right-drag | PageUp / PageDown, + / - |
-| Rotate | Shift + drag left/right, middle-button drag | Shift + ← → |
-| Tilt | Shift + drag up/down, Shift + wheel | Shift + ↑ ↓ |
+| Move | Drag | Arrows |
+| Zoom | Wheel, right-drag | PageUp / PageDown, + / - |
+| Rotate and tilt | Shift + drag, middle-button drag | Shift + arrows |
 | Look around | Ctrl + drag | |
-| Zoom toward / away | Double-click / right double-click | |
-| Raise / lower altitude | | Shift + PageUp / PageDown |
-| North up / top-down / both | Click the compass | N / U / R |
-| Switch 2D / 3D | Button at the bottom right | O |
-| Stop / search / controls list | | Space / `/` / ? |
+| North up, straight down, both | Click the compass | N, U, R |
+| Switch the look (Apple Maps / Google Earth style) | "A / G" button on the right | G |
+| Switch between 2D and 3D | "3D" button on the right | O |
+| Screenshot | Camera button on the right | P (4K with Shift + P) |
 
 Hold Alt while moving to move slowly.
 
+### URL options
+
+| Add | Effect |
+|---|---|
+| `?season=sakura`, `?season=momiji` | Trees become cherry blossoms or autumn leaves (with `--r3d`) |
+| `?light=morning`, `evening`, `cloudy`, `night` | Removes the shadows from the photos and lights them as morning, evening, cloudy or night (with `--r3d`) |
+| `?look=apple`, `?look=google` | The look (same as the G key) |
+
 ## Export
 
-Fetch the tiles around a given point and save them as a set of files you can view in the browser (three.js).
-
 ```bash
-python scripts/export.py 36.5722 136.6680 --out out/higashi-chaya   # Higashi Chaya District, Kanazawa
-python scripts/export.py --bbox 34.6418 135.3729 34.6601 135.4045 --r3d --quality 100 --block 15 --out out/yumeshima   # all of Yumeshima, in blocks
+python scripts/export.py 36.5722 136.6680 --out out/higashi-chaya   # around Higashi Chaya District, Kanazawa
 python scripts/serve.py out                                          # http://localhost:8000/higashi-chaya/
 ```
 
-For the 9×9 tiles around Higashi Chaya (about 280 m square, 88 tiles, 150,000 triangles), fetching and exporting takes about 10 seconds.
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--out` | (required) | Output folder |
-| `--zoom` | 20 | Tile detail (at 20, one tile is about 30 m square) |
-| `--radius` | 4 | How many tiles to fetch in each direction from the center tile (4 gives 9×9 tiles) |
-| `--bbox` | none | Give the area as south, west, north, east latitude/longitude instead of a center and `--radius` |
-| `--r3d` | off | Use the new Flyover (iOS 27); only tiles without it, or that fail to parse, use the old Flyover |
-| `--block` | none | Write N×N tiles per folder, plus an index page (a large area on one page does not fit in GPU memory) |
-| `--jobs` | 8 | Number of tiles fetched at once |
-| `--obj` | none | Also export OBJ (give a file name, e.g. `--obj out/kanazawa.obj`). With `--r3d`, splats such as trees become triangles with vertex colors (`splats`). OBJ has no transparency, so their soft edges are lost |
-| `--glb` | none | Also export glb (glTF) (give a file name, e.g. `--glb out/yumeshima.glb`). With `--r3d`, splats are included as semi-transparent triangles with vertex colors and soft edges, as in the viewer. Opens in Blender, three.js, Windows 3D Viewer, and others |
-| `--quality` | 90 | JPEG quality of the images (95 or more keeps full color resolution) |
-| `--hevc` | none | Write new-Flyover images as HEVC instead of JPEG (the browser decodes them on the GPU; image files are about 1/5 the size, and photos are not recompressed, so no quality loss; only viewable in browsers that can decode HEVC on the GPU) |
-| `--cache` | `cache` | Where fetched data is saved |
+Use `--r3d` for the new Flyover, and `--obj` or `--glb` to also export OBJ or glb. All options are listed in [docs/how-it-works.en.md](docs/how-it-works.en.md#export-options).
 
 ## How it works
 
-1. Like the Apple Maps app, read the configuration (the resource manifest) to get the tile URLs and the values used for authentication
-2. Request tiles by position (`x, y, z`) and height slab (`h`)
-3. Decode the 3D model that arrives (C3M format). The shapes are compressed with Apple's own scheme, and the images are HEIC
-4. Convert them to formats the browser can handle (glb and JPEG) and display them
+1. Like the Apple Maps app, it reads a settings file (the resource manifest) to get the tile URLs and the values used for authentication
+2. It requests tiles by position and height slab, and decodes the 3D models it receives (the old C3M format and the new R3D format)
+3. It converts them into formats the browser can handle (glb with JPEG or HEVC) and shows them
 
-For the details, and for what makes loading fast, see [docs/how-it-works.en.md](docs/how-it-works.en.md).
-
-## Files
-
-| File | Contents |
-|---|---|
-| `scripts/earth.py` | Starts the globe viewer |
-| `scripts/export.py` | From fetching to export |
-| `scripts/serve.py` | A server that only serves exported files locally |
-| `scripts/compare_go.py` | Comparison against the Go version |
-| `flyover/client.py` | Requests to Apple (manifest, region selection, authentication, tile fetching) |
-| `flyover/c3m.py`, `edgebreaker.py`, `huffman.py`, `_fast.py` | Reading and decoding C3M (`_fast.py` is a faster version using numba) |
-| `flyover/r3d.py` | Reading the mesh and splats of the new Flyover (style 98, R3D) |
-| `flyover/c3mm.py` | Reads the index of the new Flyover (style 100): which height slabs of which tiles have data |
-| `flyover/glb.py`, `terrain.py`, `earth.py`, `earth/` | Server and page for the globe viewer |
-| `flyover/web.py` | Export (for the browser, OBJ, and glb) |
-| `tools/retroplasma-2026.patch` | Fixes for running the Go version against today's Apple servers (for the comparison) |
+How the data is fetched, how the viewers are built, the work done to speed up loading, and the file layout are described in [docs/how-it-works.en.md](docs/how-it-works.en.md).
 
 ## Tests
 
@@ -120,13 +101,13 @@ Tests for the parts that can be checked without Apple's data:
 python -m pytest tests -q
 ```
 
-C3M reading has been checked to **match the original Go version bit for bit** on 209 real tiles (88 in Kanazawa and 121 in Shibuya). The steps to check again are in [docs/how-it-works.en.md](docs/how-it-works.en.md#comparison-with-the-go-version).
+C3M reading has been checked to **match the original Go version bit for bit** on 209 real tiles ([steps](docs/how-it-works.en.md#comparison-with-the-go-version)).
 
 ## Credits
 
-- The analysis and implementation of [retroplasma/flyover-reverse-engineering](https://github.com/retroplasma/flyover-reverse-engineering) (Go, archived in 2021) were ported to Python. C3M decoding copies that code down to Go's integer overflow behavior. Apple's servers have changed in places since then (as of 2026), and this project is adapted to those changes
+- The analysis and implementation of [retroplasma/flyover-reverse-engineering](https://github.com/retroplasma/flyover-reverse-engineering) (Go, archived in 2021) were ported to Python and adapted to Apple's servers as of 2026
 - The authentication steps follow the implementation in [sk-zk/streetlevel](https://github.com/sk-zk/streetlevel) (for Look Around)
-- The globe is drawn with [CesiumJS](https://cesium.com/platform/cesiumjs/), and place search uses [OpenStreetMap's Nominatim](https://nominatim.openstreetmap.org/)
+- The CesiumJS version is drawn with [CesiumJS](https://cesium.com/platform/cesiumjs/), and place search uses [OpenStreetMap's Nominatim](https://nominatim.openstreetmap.org/)
 
 ## Notes
 
@@ -144,4 +125,4 @@ The parts written for this project are under the [MIT License](LICENSE). The fol
 
 `definitions.glsl` and `functions.glsl` in `flyover/earth/atmosphere/` come from Eric Bruneton's [precomputed_atmospheric_scattering](https://github.com/ebruneton/precomputed_atmospheric_scattering) and are under its license (BSD 3-Clause, [flyover/earth/atmosphere/LICENSE](flyover/earth/atmosphere/LICENSE)). `flyover/earth/atmosphere.js` is a WebGL2 port of its `model.cc` and related code, so it also keeps that license's notice.
 
-Fetched data is Apple's copyrighted material and is not covered by this license.
+Fetched data and the Apple Maps imagery in the screenshots are Apple's copyrighted material and are not covered by this license.
