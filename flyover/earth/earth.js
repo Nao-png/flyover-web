@@ -56,13 +56,37 @@ const viewer = new C.Viewer('globe', {
   sceneModePicker: false, navigationHelpButton: false, fullscreenButton: false, infoBox: false,
   selectionIndicator: false, projectionPicker: false, scene3DOnly: true,
   creditContainer: document.getElementById('credits'),
-  msaaSamples: 4, useBrowserRecommendedResolution: false,
+  // ?msaa= でアンチエイリアスの倍率を変えられる（1 で切る。調べる用。描いている途中で変えると GPU のメモリが
+  // 足りなくなって描けなくなることがあったので、開くときに決める）
+  msaaSamples: Number(new URLSearchParams(location.search).get('msaa')) || 4, useBrowserRecommendedResolution: false,
   // 止まっているときは描かない（カメラが動いたときと、読み込みや動きがあるときだけ描く）
   requestRenderMode: true, maximumRenderTimeChange: Infinity,
 });
 const scene = viewer.scene, camera = scene.camera, globe = scene.globe, canvas = scene.canvas;
 const ellipsoid = C.Ellipsoid.WGS84;
 globe.depthTestAgainstTerrain = true;
+// ?logdepth=0 で対数の深度を切る（調べる用。描いている途中で変えると、全部のシェーダーを一度に作り直して GPU が
+// 応答しなくなり、描けなくなることがあったので、開くときに決める）
+if (new URLSearchParams(location.search).get('logdepth') === '0') scene.logarithmicDepthBuffer = false;
+// Cesium の操作（ホイールで寄る、つかんで動かす、回す）は、始めるたびにカーソルの下の点を建物の深度から探す。
+// 深度を読むと GPU が描き終わるまで待つので、読み込み中は 1 回 0.1〜0.3 秒止まる（30 秒で 30 回）。寄るときも
+// 動かすときもカーソルの下の点は同じ所に留まるので、続けて操作している間（PICK_REUSE_MS 以内に、ほぼ同じ
+// 画面の位置）は、前に探した点を使う
+const PICK_REUSE_MS = 400;
+{
+  const raw = scene.pickPositionWorldCoordinates.bind(scene);
+  let last = null;
+  scene.pickPositionWorldCoordinates = (pos, result) => {
+    const now = performance.now();
+    if (last && now - last.at < PICK_REUSE_MS && C.Cartesian2.distance(pos, last.pos) < 8) {
+      last.at = now;
+      return last.p && C.Cartesian3.clone(last.p, result);
+    }
+    const p = raw(pos, result);
+    last = { at: now, pos: C.Cartesian2.clone(pos), p: p && C.Cartesian3.clone(p) };
+    return p;
+  };
+}
 globe.maximumScreenSpaceError = 1.5;
 globe.tileCacheSize = 150;
 // 地球儀が 1 コマで読み込みを進める時間 [ms]（Cesium の既定は 5 ms）。既定では、画像が手元にあっても
@@ -289,13 +313,18 @@ addEventListener('pointerup', e => { if (orbitDrag && e.pointerId === orbitDrag.
 canvas.addEventListener('auxclick', e => { if (e.button === 1) e.preventDefault(); });
 canvas.addEventListener('mousedown', e => { if (e.button === 1) e.preventDefault(); });   // 中ボタンの自動スクロールを止める
 
+let wheelPivot = null;
 // Shift + ホイール = 傾き（Windows の Chrome は Shift + ホイールを横スクロール deltaX にする）
 canvas.addEventListener('wheel', e => {
   stopAll();
   if (!e.shiftKey || mode2D) return;
   e.preventDefault();
   const d = e.deltaY || e.deltaX;
-  orbitBy(pivot(), 0, -Math.sign(d) * 0.06);
+  // 回す中心は、続けて回している間は同じ点を使う（中心を探すと深度を読み、GPU を待たせてカクつく）
+  const now = performance.now();
+  if (!wheelPivot || now - wheelPivot.at > 400) wheelPivot = { p: pivot() };
+  wheelPivot.at = now;
+  orbitBy(wheelPivot.p, 0, -Math.sign(d) * 0.06);
 }, { passive: false, capture: true });
 
 canvas.addEventListener('dblclick', e => {
@@ -368,26 +397,28 @@ addEventListener('keyup', e => {
 });
 addEventListener('blur', () => held.clear());
 
+// キーで回す中心は、押している間は同じ点を使う（毎コマ探すと深度を読み、GPU を待たせてカクつく）。
+// 動かしたら探し直す
+let keyPivot;
 function keyTick(dt) {
-  if (!held.size) return;
+  if (!held.size) { keyPivot = undefined; return; }
   const slow = alt ? 0.25 : 1;
   const h = altitude();
-  let at;
-  const need = () => at === undefined ? (at = pivot() || null) : at;
+  const need = () => keyPivot === undefined ? (keyPivot = pivot() || null) : keyPivot;
   for (const act of new Set(held.values())) {
     const pan = Math.max(h, 30) * 0.9 * dt * slow;
     switch (act) {
-      case 'panUp': panBy(pan, 0); break;
-      case 'panDown': panBy(-pan, 0); break;
-      case 'panLeft': panBy(0, -pan); break;
-      case 'panRight': panBy(0, pan); break;
+      case 'panUp': panBy(pan, 0); keyPivot = undefined; break;
+      case 'panDown': panBy(-pan, 0); keyPivot = undefined; break;
+      case 'panLeft': panBy(0, -pan); keyPivot = undefined; break;
+      case 'panRight': panBy(0, pan); keyPivot = undefined; break;
       case 'rotLeft': orbitBy(need(), 1.0 * dt * slow, 0); break;
       case 'rotRight': orbitBy(need(), -1.0 * dt * slow, 0); break;
       case 'tiltUp': orbitBy(need(), 0, 0.7 * dt * slow); break;
       case 'tiltDown': orbitBy(need(), 0, -0.7 * dt * slow); break;
       case 'zoomIn': case 'zoomOut': {
         const k = Math.exp((act === 'zoomIn' ? -1.8 : 1.8) * dt * slow);
-        if (need()) zoomAround(at, k);
+        if (need()) zoomAround(keyPivot, k);
         else camera.moveForward((act === 'zoomIn' ? 1 : -1) * h * 1.5 * dt * slow);
         break;
       }
@@ -398,6 +429,7 @@ function keyTick(dt) {
           C.Cartesian3.multiplyByScalar(up, (act === 'altUp' ? 1 : -1) * Math.max(h, 20) * 1.2 * dt * slow, up), new C.Cartesian3());
         camera.setView({ destination: pos, orientation: { direction: camera.directionWC, up: camera.upWC } });
         if (underground()) restoreCamera(before);
+        keyPivot = undefined;
         break;
       }
     }
@@ -546,8 +578,11 @@ const REFINE_PX = (Number(new URLSearchParams(location.search).get('lodpx')) || 
 // 同時に読み込む数。Apple は 1 枚 1 秒ほどかかるので並べるほど速いが、48 本ほどで回線（手元では
 // 65 Mbps ほど）が埋まり、それ以上並べても 1 枚ごとの待ちが延びるだけ
 const MAX_ACTIVE = 48;
-const MAX_MODELS = 240;    // これを超えたら、しばらく使っていないものから捨てる（GPU のメモリを食うので）
-const MAX_MODELS_SHOT = 600;   // スクリーンショットを写す間（4K では 240 では足りず、捨てては読み直す）
+// 描かなくなったタイルは KEEP_MS たったら捨てる（GPU のメモリを食うので）。すぐに捨てると、寄ったり動かしたり
+// して細かいタイルと粗いタイルが入れ替わるたびに作り直しになり、動かしている間に止まる（38 秒で 694 回作り直し、
+// 合わせて 5 秒ほど止まった）。それでも MAX_MODELS を超えたら、使っていないものから捨てる
+const KEEP_MS = 5000;
+const MAX_MODELS = 150;
 // 新しい Flyover の画像は、HEVC のまま受け取って GPU の専用回路で展開し（hevc.js）、Y と UV の面の
 // ままテクスチャにする。サーバーで JPEG にする手間がなく、GPU のメモリも RGBA の 4 割ほどで済む。
 // 専用回路で展開できない（Chrome は HEVC をソフトウェアでは展開しない）ときと ?hevc=0 のときは JPEG
@@ -567,14 +602,16 @@ class Tile {
     this.rect = tileRect(z, x, y);
     this.width = this.rect.width * 6378137 * Math.cos(C.Rectangle.center(this.rect).latitude);
     this.state = 'none';     // none | loading | ready | empty | failed
-    this.model = null; this.obb = null; this.used = 0; this.wanted = 0; this.wantedAt = 0; this.touched = 0;
+    this.model = null; this.obb = null; this.used = 0; this.wanted = 0; this.wantedAt = 0;
     this.abort = null; this.failedAt = 0; this.pri = Infinity;
     this.mask = 0; this.clip = 0;   // 表示する 4 分の 1（0 は全部）と、モデルに今かけてある切り方
   }
   // 見えるかどうかを調べる箱（建物の高さまで含める）と、距離を測る薄い箱（地面のあたり）。
   // 厚い箱で距離を測ると、カメラが箱の中に入って距離が 0 になり、細かくしすぎる。
-  // 読み込んだタイルは、見えるかどうかをモデルの実際の範囲で調べる
-  box() { return this.model ? this.model.boundingSphere : this.boxes().tall; }
+  // 一度読んだタイルは、見えるかどうかを、そのときのモデルの実際の範囲（seen）で調べる。捨てた後も覚えておく
+  // （読む前の箱と読んだ後の範囲で判断が変わると、見える・見えないが読んだ・捨てたで行ったり来たりして、
+  // 読んでは捨てるをくり返す）
+  box() { return this.seen || this.boxes().tall; }
   flat() { return this.boxes().flat; }
   boxes() {
     // 地面の高さが取れたら、その箱をずっと使う。調べるのは重い（光線で地形と交わる所を探す）ので、
@@ -766,7 +803,7 @@ const atmoHaze = Number(atmoParams.get('haze')) || 0.5;   // 空気中のちり�
 const atmoAces = atmoParams.get('tone') !== 'exp';
 // 色合い。apple は Apple マップ本来の見え方で、大気の処理をしない（大気を入れる前と同じ。Cesium の空で、
 // 写真はそのまま）。google は大気で Google Earth に寄せた見え方（空とかすみが青く、近くからかすむ）。右のボタンか
-// G キーで切り替え、?look= でも選べる。選んだものはこのブラウザーに覚える。大気のテクスチャは apple のときも
+// G キーで切り替え、?look= でも選べる。初めて開いたときは apple で、選んだものはこのブラウザーに覚える。大気のテクスチャは apple のときも
 // 計算しておき、切り替えは後処理を入れたり外したりするだけ。google の値:
 // - balance: 空とかすみ（写真ではない部分）に掛ける色。物理の計算どおりの空は Google Earth の空より青が弱い（どの
 //   曲線でも赤と青の比が合わない）ので、青を少し強める。Google Earth に合わせた値（0.85, 0.88, 1.8）は
@@ -790,7 +827,7 @@ let atmoLook = (() => {
   let saved = null;
   try { saved = localStorage.getItem('look'); } catch (e) { /* 覚えられない環境 */ }
   const name = atmoParams.get('look') || saved;
-  return ATMO_LOOKS.includes(name) ? name : 'google';
+  return ATMO_LOOKS.includes(name) ? name : 'apple';     // 初めて開いたときは Apple マップの見え方
 })();
 let atmoApply = () => {};   // 大気の後処理ができたら、入れたり外したりする関数になる（startAtmosphere）
 const lookBtn = document.getElementById('look-btn');
@@ -1370,6 +1407,32 @@ function releasePlanes(t) {
   t.planesFreed = true;
 }
 
+// GPU に載せる（テクスチャと頂点を送り、シェーダーを作る）のは重く、1 枚 20〜30 ms ほど。届いたタイルを一度に
+// 何枚も載せると 0.4〜0.5 秒止まるので、1 コマに載せる数を、動かしている間は MODELS_MOVING、止まっているときは
+// MODELS_STILL までにする。待っているものは、見えているもの・画面の中央に近いものから
+const MODELS_MOVING = 1, MODELS_STILL = 4;
+let modelSlots = MODELS_STILL;
+const modelWait = [];
+const modelSlot = t => {
+  if (modelSlots > 0 && !modelWait.length) { modelSlots--; return Promise.resolve(); }
+  return new Promise((resolve, reject) => modelWait.push({ t, resolve, reject }));
+};
+function modelNext(moving) {
+  modelSlots = moving ? MODELS_MOVING : MODELS_STILL;
+  // しばらく（4 秒）要らなかったものは載せない（読みかけを取りやめるのと同じ）
+  const now = performance.now();
+  for (let i = modelWait.length - 1; i >= 0; i--) {
+    if (now - modelWait[i].t.wantedAt > 4000) modelWait.splice(i, 1)[0].reject(new DOMException('要らなくなった', 'AbortError'));
+  }
+  const rank = ({ t }) => (t.vis && t.wanted === frame ? 0 : 1e9) + t.pri;
+  while (modelSlots > 0 && modelWait.length) {
+    let best = 0;
+    for (let i = 1; i < modelWait.length; i++) if (rank(modelWait[i]) < rank(modelWait[best])) best = i;
+    modelSlots--;
+    modelWait.splice(best, 1)[0].resolve();
+  }
+}
+
 const NO_IBL = new C.ImageBasedLighting({ imageBasedLightingFactor: new C.Cartesian2(0, 0) });
 async function makeModel(t, buf, useHevc) {
   let shader, planes = null;
@@ -1394,6 +1457,12 @@ async function makeModel(t, buf, useHevc) {
     } catch (e) {
       console.warn('季節の色の印', t.z, t.x, t.y, e);
     }
+  }
+  try {
+    await modelSlot(t);
+  } catch (e) {
+    if (planes) for (const p of planes) if (p.bitmap) p.bitmap.close();
+    throw e;
   }
   if (planes) {
     try {
@@ -1430,6 +1499,8 @@ async function makeModel(t, buf, useHevc) {
   }
   t.cesiumMs = performance.now() - tm;
   t.model = model; t.shader = shader; t.planesFreed = !shader; t.clip = 0; t.state = 'ready';
+  t.seen = C.BoundingSphere.clone(model.boundingSphere);
+  t.usedAt = performance.now();     // 読み終えたばかりのものを、まだ描いていないからとすぐに捨てない
   if (t.z === FLY.max && t.captured !== undefined) capturedKnown.set(t.x + '/' + t.y, t.captured || null);
   if (lightGlsl && shader) setSun0(t, shader);
 }
@@ -1463,7 +1534,14 @@ function setClip(t, mask) {
 //   親を読まない（読んでいない）もの。途中の階層は 1 段おきに読み、読む量を減らす
 // - 描くときは、子孫で埋め尽くせる 4 分の 1 は子孫を描き、埋まらない 4 分の 1 だけ親を切り出して
 //   描く（子にデータがない水面などもここで親が埋める）。こうすると、揃った所から細かくなる
-let lastView = null, dirty = true;
+let lastView = null, dirty = true, evictTimer = 0;
+// カメラが前のコマから動いたか（GPU に載せる数を決める用。viewChanged とは別に覚える）
+const prevView = new C.Matrix4();
+function viewChanging() {
+  const moving = !C.Matrix4.equalsEpsilon(camera.viewMatrix, prevView, 1e-9);
+  C.Matrix4.clone(camera.viewMatrix, prevView);
+  return moving;
+}
 function viewChanged() {
   const v = [...C.Cartesian3.pack(camera.positionWC, []), ...C.Cartesian3.pack(camera.directionWC, []),
     canvas.clientWidth, canvas.clientHeight];
@@ -1517,7 +1595,6 @@ function updateFlyover() {
       const d = dist(t);
       // 画面に写っている範囲だけを読む（画面の外は先読みしない）
       if (!t.vis) return true;
-      t.touched = frame;                 // 見ている所（捨てるときの順番に使う）
       if (t.z < FLY.min) {
         t.refine = t.width / 2 ** (FLY.min - t.z) * k / d >= SHOW_PX;
         if (t.refine) for (const c of t.children()) visit(c);
@@ -1538,16 +1615,18 @@ function updateFlyover() {
       return t.cov;
     };
     // 2 回目: 描くタイルと、親を切り出す 4 分の 1 を決める
-    const show = (t, mask) => { t.used = frame; t.mask = mask; };
-    const drawLoaded = t => {
+    const show = (t, mask) => { t.used = frame; t.usedAt = now; t.mask = mask; };
+    // 読み込み済みの子孫（3 段下まで）を、埋め尽くせなくても、あるだけ描く。粗いタイルが届くまで、
+    // 子孫が 1 つ欠けただけで範囲全体を空けないように（初めての所では Apple から 1 秒ほどかかり、目立つ）
+    const drawLoaded = (t, depth = 3) => {
       if (t.state === 'ready') show(t, 0);
-      else t.kids.forEach(c => { if (c.lvis) drawLoaded(c); });
+      else if (depth > 0 && t.kids) t.kids.forEach(c => { if (visible(c)) drawLoaded(c, depth - 1); });
     };
     const draw = t => {
       if (!t.vis) return;
       const kids = t.refine ? t.children() : [];
       if (t.z < FLY.min || t.refine && t.kidsCov) { kids.forEach(draw); return; }
-      if (t.descCov) { drawLoaded(t); return; }
+      if (!t.refine && t.state !== 'ready') { drawLoaded(t); return; }
       if (t.refine && t.state === 'ready') {
         let mask = 0;
         kids.forEach((c, i) => { if (c.vis && !c.cov) mask |= 1 << i; });
@@ -1557,7 +1636,8 @@ function updateFlyover() {
         show(t, 0);
         return;
       }
-      kids.forEach(c => { if (c.vis && c.cov) draw(c); });
+      // 親を描いていれば、埋まらない子は親が埋める。親がなければ、埋まらない子も、あるだけ描く
+      kids.forEach(c => { if (c.vis && (c.cov || t.state !== 'ready')) draw(c); });
     };
     // 遠い地域（ズーム 13 のタイルも出さない距離より遠いもの）は、中心からの距離だけで外す
     const far = Math.max(aroundR * 4, 6000 * k / SHOW_PX);
@@ -1568,7 +1648,6 @@ function updateFlyover() {
   }
   // 表示の切り替え
   const now = performance.now();
-  let n = 0;
   for (const t of tiles.values()) {
     if (t.model) {
       const show = t.used === frame;
@@ -1576,7 +1655,6 @@ function updateFlyover() {
       t.model.show = show;
       if (show && t.clip !== t.mask) setClip(t, t.mask);
       if (!t.planesFreed) releasePlanes(t);
-      n++;
     }
     // 読みかけは、しばらく（4 秒）要らなかったときだけ取りやめる（回している間に取りやめると、
     // 戻ってきたときに初めからになる）
@@ -1588,16 +1666,20 @@ function updateFlyover() {
     if (active >= MAX_ACTIVE) break;
     load(t);
   }
-  // 捨てる: 見ている所で最近たどっていないものから（親は子で置き換わって表示して
-  // いなくても、穴を埋める役なので残す）
-  const maxModels = shooting ? MAX_MODELS_SHOT : MAX_MODELS;
-  if (n > maxModels) {              // 毎コマにならないよう、20 個ぶん余裕を作る
-    const old = [...tiles.values()].filter(t => t.model && t.touched !== frame).sort((a, b) => (a.touched || 0) - (b.touched || 0));
-    for (const t of old.slice(0, n - maxModels + 20)) {
-      flyover.remove(t.model);      // remove は destroy もする（シェーダーは捨てないので別に捨てる）
-      if (t.shader) t.shader.destroy();
-      t.model = null; t.shader = null; t.state = 'none';
-    }
+  // 捨てる: 描かなくなって KEEP_MS たったもの（画面の外に出たもの、子や親で置き換わったもの）と、MAX_MODELS を
+  // 超えた分を、使っていないものから。戻ってきたら読み直す（サーバーに残っているので速い）。粗いタイルを読み直す
+  // 間は、細かいタイルがあればそれで埋める
+  const idle = [...tiles.values()].filter(t => t.model && t.used !== frame).sort((a, b) => (a.usedAt || 0) - (b.usedAt || 0));
+  const models = [...tiles.values()].filter(t => t.model).length;
+  idle.forEach((t, i) => {
+    if (now - (t.usedAt || 0) < KEEP_MS && models - i <= MAX_MODELS) return;
+    flyover.remove(t.model);        // remove は destroy もする（シェーダーは捨てないので別に捨てる）
+    if (t.shader) t.shader.destroy();
+    t.model = null; t.shader = null; t.state = 'none';
+  });
+  // 止まっていると描かず、捨てるのも描くついでなので、残したものは KEEP_MS たったら選び直して捨てる
+  if (idle.some(t => t.model) && !evictTimer) {
+    evictTimer = setTimeout(() => { evictTimer = 0; dirty = true; scene.requestRender(); }, KEEP_MS + 50);
   }
   return active + queue.length;
 }
@@ -1618,6 +1700,7 @@ scene.preUpdate.addEventListener(() => {
     if (t >= 1) anim = null;
   }
   keyTick(dt);
+  modelNext(viewChanging());
   const t0 = performance.now();
   pendingFly = updateFlyover();
   updateMs = performance.now() - t0;
@@ -1712,18 +1795,26 @@ function capturedAtCenter() {
 
 const needle = document.getElementById('needle');
 const shownView = new C.Matrix4();
-let cursorAt = 0;
+const STILL_MS = 300;
+let cursorAt = 0, cursorRough = false, movedAt = 0;
 setInterval(() => {
   // 読み込み中
   $('loading').hidden = !(pendingFly > 0 || globeQueue > 0 || shooting);
   // 描き直しもマウスの動きもなければ、同じ表示のままなので何もしない
-  if (rendered === shownRender && !mouseMoved) return;
+  if (rendered === shownRender && !mouseMoved && !cursorRough) return;
   shownRender = rendered;
   // 読み込み中は毎コマ描き直すが、カメラもマウスも動いていなければ、カーソルの標高と縮尺は
   // 1 秒ごとに直せば足りる（カーソルの下を調べるのは GPU を待たせる）
   const now = performance.now();
-  const moved = mouseMoved || !C.Matrix4.equalsEpsilon(camera.viewMatrix, shownView, 1e-9);
-  const refresh = moved || now - cursorAt > 1000;
+  const camMoved = !C.Matrix4.equalsEpsilon(camera.viewMatrix, shownView, 1e-9);
+  const moved = mouseMoved || camMoved;
+  if (moved) movedAt = now;
+  // カメラかマウスが動いている間（止まって STILL_MS たつまで）と、タイルの読み込み中は、カーソルの下を地形だけで
+  // 調べる（建物の深度を読むと GPU が描き終わるまで待ち、読み込み中は 1 回 0.1〜0.3 秒止まってカクつく）。
+  // 止まって読み込みも終わったら、建物まで含めて調べ直す
+  const rough = now - movedAt < STILL_MS || pendingFly > 0;
+  const refresh = moved || (cursorRough && !rough) || now - cursorAt > 1000;
+  if (refresh) cursorRough = rough;
   if (refresh) { C.Matrix4.clone(camera.viewMatrix, shownView); cursorAt = now; }
   mouseMoved = false;
   // 方位
@@ -1735,7 +1826,7 @@ setInterval(() => {
   if (refresh) $('date').textContent = capturedAtCenter();
   // カーソルの位置と標高
   if (mouse && refresh) {
-    const r = pick(mouse);
+    const r = pick(mouse, rough);
     $('cursor').textContent = r ? `${fmtLatLon(ellipsoid.cartesianToCartographic(r.p))}  標高 ${fmtDist(Math.round(elevation(r.p, r.onGlobe)))}` : '';
   }
   // 縮尺（画面の下の方で 100 px が何 m か）。地形の上で測れば足りる
