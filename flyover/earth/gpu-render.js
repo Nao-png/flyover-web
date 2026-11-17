@@ -426,7 +426,97 @@ function photoTexture(w, h, fmt, acc) {
   mem[acc] += tex.bytes;
   return { tex, levels };
 }
-function dropTexture(tex) { if (tex.acc) mem[tex.acc] -= tex.bytes; tex.destroy(); }
+// 写真を GPU に載せる命令（ミップマップ、Y・UV への変換、BC 圧縮）は 1 つにまとめて、コマの終わり（コマの外で
+// 作ったときは今の仕事の終わり）に 1 回で送る。送る前に捨てられないもの（作業用のテクスチャやバッファ、HEVC の
+// コマ）は送ったあとで捨てる。?batch=0 で 1 枚ずつ送る
+const BATCH = params.get('batch') !== '0';
+let upEnc = null, upAfter = [], upSubmits = 0;
+function upEncoder() {
+  if (!upEnc) { upEnc = device.createCommandEncoder(); setTimeout(flushUploads, 0); }
+  return upEnc;
+}
+function upDone() { if (!BATCH) flushUploads(); }
+function afterUpload(fn) { if (upEnc) upAfter.push(fn); else fn(); }
+function flushUploads() {
+  if (!upEnc) return;
+  device.queue.submit([upEnc.finish()]);
+  upEnc = null; upSubmits++;
+  const after = upAfter;
+  upAfter = [];
+  after.forEach(f => f());
+}
+function dropTexture(tex) { if (tex.acc) mem[tex.acc] -= tex.bytes; afterUpload(() => tex.destroy()); }
+// JPEG・PNG は ImageDecoder で開いて CPU に出し（JPEG は Y・U・V のまま、ほかは RGBA）、GPU には putPixels で
+// 送る。ImageBitmap を copyExternalImageToTexture で写すと、描いている最中は 1 枚で数十 ms 止まることがある。yuv が true なら、I420 のときは { w, h, y, uv }（UV は U と V を交互に並べたもの）。開けなければ ImageBitmap。
+// ?imgdec=0 で今までどおり ImageBitmap
+const IMGDEC = typeof ImageDecoder !== 'undefined' && params.get('imgdec') !== '0';
+async function decodeImage(data, type, yuv) {
+  if (!IMGDEC) return createImageBitmap(new Blob([data], { type }));
+  let dec = null, f = null;
+  try {
+    dec = new ImageDecoder({ data, type });
+    f = (await dec.decode()).image;
+    const w = f.visibleRect.width, h = f.visibleRect.height;
+    if (yuv && f.format === 'I420') {
+      const buf = new Uint8Array(f.allocationSize());
+      const [py, pu, pv] = await f.copyTo(buf);
+      let y = buf.subarray(py.offset, py.offset + w * h);
+      if (py.stride !== w) {
+        y = new Uint8Array(w * h);
+        for (let j = 0; j < h; j++) y.set(buf.subarray(py.offset + j * py.stride, py.offset + j * py.stride + w), j * w);
+      }
+      const cw = (w + 1) >> 1, ch = (h + 1) >> 1, uv = new Uint8Array(cw * ch * 2);
+      for (let j = 0; j < ch; j++) {
+        const ou = pu.offset + j * pu.stride, ov = pv.offset + j * pv.stride, o = j * cw * 2;
+        for (let i = 0; i < cw; i++) { uv[o + 2 * i] = buf[ou + i]; uv[o + 2 * i + 1] = buf[ov + i]; }
+      }
+      return { w, h, y, uv };
+    }
+    const rgba = new Uint8Array(w * h * 4);
+    await f.copyTo(rgba, { format: 'RGBA' });
+    return { w, h, rgba };
+  } catch (e) {
+    return createImageBitmap(new Blob([data], { type }));
+  } finally {
+    if (f) f.close();
+    if (dec) dec.close();
+  }
+}
+// CPU の画素（items: { tex, data, w, h, bpp }）をテクスチャの一番上の段に送る。書き込める状態で作ったバッファに 1 行
+// 256 バイトにそろえて詰め、テクスチャへの写しはまとめた命令の中で（queue.writeTexture は、描いている最中だと 1 回で
+// 100 ms を超えて待たされることがある）
+function putPixels(items) {
+  let size = 0;
+  const lay = items.map(it => { const row = Math.ceil(it.w * it.bpp / 256) * 256, o = size; size += row * it.h; return { row, o }; });
+  const buf = device.createBuffer({ size, usage: GPUBufferUsage.COPY_SRC, mappedAtCreation: true });
+  const dst = new Uint8Array(buf.getMappedRange());
+  items.forEach((it, k) => {
+    const { row, o } = lay[k], w = it.w * it.bpp;
+    if (row === w) dst.set(it.data.subarray(0, w * it.h), o);
+    else for (let j = 0; j < it.h; j++) dst.set(it.data.subarray(j * w, j * w + w), o + j * row);
+  });
+  buf.unmap();
+  const enc = upEncoder();
+  items.forEach((it, k) => enc.copyBufferToTexture({ buffer: buf, offset: lay[k].o, bytesPerRow: lay[k].row, rowsPerImage: it.h },
+    { texture: it.tex }, [it.w, it.h]));
+  afterUpload(() => buf.destroy());
+}
+// 画像（ImageBitmap か decodeImage の RGBA）をテクスチャの一番上の段に写す。r8unorm なら赤だけ
+function putImage(src, tex) {
+  if (!src.rgba) {
+    device.queue.copyExternalImageToTexture({ source: src }, { texture: tex }, [src.width, src.height]);
+    src.close();
+    return;
+  }
+  let data = src.rgba, bpp = 4;
+  if (tex.format === 'r8unorm') {
+    data = new Uint8Array(src.w * src.h);
+    for (let i = 0; i < data.length; i++) data[i] = src.rgba[i * 4];
+    bpp = 1;
+  }
+  putPixels([{ tex, data, w: src.w, h: src.h, bpp }]);
+}
+const imageSize = src => src.rgba || src.y ? [src.w, src.h] : [src.width, src.height];
 const mipPipes = new Map();
 const pipeFor = (fmt, entry) => {
   const k = fmt + entry;
@@ -459,13 +549,12 @@ function makeMips(enc, tex, levels) {
   }
 }
 // 画像（ImageBitmap）をミップマップ付きのテクスチャに（fmt が r8unorm なら赤だけ。日の当たり方の画像）
-function bitmapTexture(bitmap, acc, fmt = 'rgba8unorm') {
-  const { tex, levels } = photoTexture(bitmap.width, bitmap.height, fmt, acc);
-  device.queue.copyExternalImageToTexture({ source: bitmap }, { texture: tex }, [bitmap.width, bitmap.height]);
-  bitmap.close();
-  const enc = device.createCommandEncoder();
-  makeMips(enc, tex, levels);
-  device.queue.submit([enc.finish()]);
+function bitmapTexture(src, acc, fmt = 'rgba8unorm') {
+  const [w, h] = imageSize(src);
+  const { tex, levels } = photoTexture(w, h, fmt, acc);
+  putImage(src, tex);
+  makeMips(upEncoder(), tex, levels);
+  upDone();
   return tex;
 }
 // 写真の圧縮: 明るさ（r8）を BC4、色（rg8）を BC5 にする。4 x 4 画素ごとに、いちばん明るい値と暗い値と、その間の
@@ -536,7 +625,7 @@ function bcTexture(src, chans) {
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
   tex.bytes = Math.round(w * h * BYTES[fmt] * 4 / 3); tex.acc = src.acc;
   if (tex.acc) mem[tex.acc] += tex.bytes;
-  const enc = device.createCommandEncoder();
+  const enc = upEncoder();
   const pass = enc.beginComputePass();
   pass.setPipeline(bcPipe);
   lv.forEach((v, l) => {
@@ -549,8 +638,9 @@ function bcTexture(src, chans) {
   pass.end();
   lv.forEach((v, l) => enc.copyBufferToTexture({ buffer: buf, offset: v.offset, bytesPerRow: v.row, rowsPerImage: v.by },
     { texture: tex, mipLevel: l }, [v.bx * 4, v.by * 4]));
-  device.queue.submit([enc.finish()]);
-  buf.destroy(); ubuf.destroy(); dropTexture(src);
+  afterUpload(() => { buf.destroy(); ubuf.destroy(); });
+  dropTexture(src);
+  upDone();
   return tex;
 }
 // Y と UV を圧縮したものに取りかえる（できないときはそのまま）
@@ -558,38 +648,40 @@ function bcYuv(t) {
   if (!BC || t.y.width % 4 || t.y.height % 4 || t.uv.width % 4 || t.uv.height % 4) return t;
   return { y: bcTexture(t.y, 1), uv: bcTexture(t.uv, 2) };
 }
-// 写真（ImageBitmap）を GPU の中で明るさ（Y、r8）と縦横半分の色（UV、rg8）のテクスチャに（今のビューアの gpuPlanes と
-// 同じ。UV は RGB の 2 x 2 画素の真ん中を線形補間で引いて平均する）
-function yuvTextures(bitmap, acc) {
-  const w = bitmap.width, h = bitmap.height;
+// 写真（ImageBitmap か decodeImage の RGBA）を GPU の中で明るさ（Y、r8）と縦横半分の色（UV、rg8）のテクスチャに（今の
+// ビューアの gpuPlanes と同じ。UV は RGB の 2 x 2 画素の真ん中を線形補間で引いて平均する）。decodeImage が Y と UV で
+// 出したものは planeTextures へ
+function yuvTextures(src, acc) {
+  if (src.y) return planeTextures(src, acc);
+  const [w, h] = imageSize(src);
   const rgb = device.createTexture({ size: [w, h], format: 'rgba8unorm',
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT });
-  device.queue.copyExternalImageToTexture({ source: bitmap }, { texture: rgb }, [w, h]);
-  bitmap.close();
+  putImage(src, rgb);
   const y = photoTexture(w, h, 'r8unorm', acc), uv = photoTexture((w + 1) >> 1, (h + 1) >> 1, 'rg8unorm', acc);
-  const enc = device.createCommandEncoder();
+  const enc = upEncoder();
   blit(enc, pipeFor('r8unorm', 'fsY'), rgb.createView(), y.tex.createView({ baseMipLevel: 0, mipLevelCount: 1 }));
   blit(enc, pipeFor('rg8unorm', 'fsUV'), rgb.createView(), uv.tex.createView({ baseMipLevel: 0, mipLevelCount: 1 }));
   makeMips(enc, y.tex, y.levels);
   makeMips(enc, uv.tex, uv.levels);
-  device.queue.submit([enc.finish()]);
-  rgb.destroy();
+  afterUpload(() => rgb.destroy());
+  upDone();
   return bcYuv({ y: y.tex, uv: uv.tex });
 }
-// 展開したコマ（VideoFrame）から、RGB の画像を作らずに直接 Y と UV のテクスチャに。コマはすぐ閉じる（専用回路の
-// コマを抱えていると、次の展開が詰まる）
+// 展開したコマ（VideoFrame）から、RGB の画像を作らずに直接 Y と UV のテクスチャに。コマは命令を送ったらすぐ閉じる
+// （専用回路のコマを抱えていると、次の展開が詰まる）
 function frameTextures(frame, acc) {
   try {
     const w = frame.visibleRect.width, h = frame.visibleRect.height;
     const ext = device.importExternalTexture({ source: frame });
     const y = photoTexture(w, h, 'r8unorm', acc), uv = photoTexture((w + 1) >> 1, (h + 1) >> 1, 'rg8unorm', acc);
-    const enc = device.createCommandEncoder();
+    const enc = upEncoder();
     for (const [t, entry] of [[y, 'fsY'], [uv, 'fsUV']]) blit(enc, extPipes.get(entry), ext, t.tex.createView({ baseMipLevel: 0, mipLevelCount: 1 }));
     makeMips(enc, y.tex, y.levels);
     makeMips(enc, uv.tex, uv.levels);
-    device.queue.submit([enc.finish()]);
-    return { ...bcYuv({ y: y.tex, uv: uv.tex }), ready: true };
-  } finally { frame.close(); }
+    const out = { ...bcYuv({ y: y.tex, uv: uv.tex }), ready: true };
+    upDone();
+    return out;
+  } finally { afterUpload(() => frame.close()); }
 }
 // 展開したもの（frameTextures の結果、ImageBitmap、CPU の Y と UV）を手放す
 function dropFrames(frames) {
@@ -599,16 +691,15 @@ function dropFrames(frames) {
     else if (f.bitmap) f.bitmap.close();
   }
 }
-// CPU にある Y と UV（hevc.js が読み戻したもの。季節の色のとき）から
+// CPU にある Y と UV（hevc.js が読み戻したもの（季節の色のとき）と、decodeImage が開いた JPEG）から
 function planeTextures(p, acc) {
   const cw = (p.w + 1) >> 1, ch = (p.h + 1) >> 1;
   const y = photoTexture(p.w, p.h, 'r8unorm', acc), uv = photoTexture(cw, ch, 'rg8unorm', acc);
-  device.queue.writeTexture({ texture: y.tex }, p.y, { bytesPerRow: p.w }, [p.w, p.h]);
-  device.queue.writeTexture({ texture: uv.tex }, p.uv, { bytesPerRow: cw * 2 }, [cw, ch]);
-  const enc = device.createCommandEncoder();
+  putPixels([{ tex: y.tex, data: p.y, w: p.w, h: p.h, bpp: 1 }, { tex: uv.tex, data: p.uv, w: cw, h: ch, bpp: 2 }]);
+  const enc = upEncoder();
   makeMips(enc, y.tex, y.levels);
   makeMips(enc, uv.tex, uv.levels);
-  device.queue.submit([enc.finish()]);
+  upDone();
   return bcYuv({ y: y.tex, uv: uv.tex });
 }
 const tex1 = (fmt, data) => {
@@ -760,16 +851,21 @@ class Tile {
 }
 const roots = [];
 for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) roots.push(new Tile(1, x, y, null));
-const MAX_ACTIVE = 32;
+// 読み込んだ地面のタイルは groundUploads に並べ、1 コマに GROUND_UPLOADS_PER_FRAME 枚まで GPU に載せる（一度に
+// たくさん届いても、1 コマが重くならないように）
+const MAX_ACTIVE = 32, GROUND_UPLOADS_PER_FRAME = 8;
 let active = 0, loadedCount = 0;
+const groundUploads = [];
 async function load(t) {
   t.state = 'loading'; active++;
   const ac = t.abort = new AbortController();
   try {
     const n = 2 ** t.z;
     const img = fetch(`${hostBase(t.x + t.y + t.z)}/api/sat/${t.z}/${t.x}/${t.y}.jpg`, { signal: ac.signal })
-      .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.blob(); })
-      .then(b => createImageBitmap(b));
+      .then(async r => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return decodeImage(await r.arrayBuffer(), (r.headers.get('content-type') || 'image/jpeg').split(';')[0], true);
+      });
     // 地形: 東西の幅が同じ地理座標のタイル（ズーム z ならレベル z - 1）。南北は 1〜2 枚にかかる。ズーム 5 以下は
     // サーバーが地形を入れない（ジオイドだけ）ので、楕円体のまま
     const L = Math.min(t.z - 1, TERRAIN_MAX);
@@ -801,20 +897,24 @@ async function load(t) {
     P.forEach((p, k) => put(k, p, UV[k]));
     const edges = [i => i, i => (N - 1) * N + i, j => j * N, j => j * N + N - 1];
     edges.forEach((e, k) => { for (let i = 0; i < N; i++) { const p = P[e(i)]; put(N * N + k * N + i, sub(p, mul(norm(p), skirt)), UV[e(i)]); } });
-    const bitmap = await img;
-    const vbuf = device.createBuffer({ size: verts.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-    device.queue.writeBuffer(vbuf, 0, verts);
-    const tex = yuvTextures(bitmap, 'ground');
-    t.vbuf = vbuf; t.tex = tex; t.meshCenter = center;
-    t.bind = device.createBindGroup({ layout: groundLayout, entries: [
-      { binding: 0, resource: { buffer: uniformBuffer, size: 96 } },
-      { binding: 1, resource: linear }, { binding: 2, resource: tex.y.createView() }, { binding: 3, resource: tex.uv.createView() }] });
-    t.state = 'ready'; loadedCount++;
+    groundUploads.push({ t, verts, center, image: await img });
   } catch (e) {
     t.state = e.name === 'AbortError' ? 'none' : 'failed';
   } finally {
     active--; t.abort = null; dirty = true; selStale = true;
   }
+}
+function groundUpload({ t, verts, center, image }) {
+  // 書き込める状態で作って詰める（queue.writeBuffer は、描いている最中だと長く待たされることがある）
+  const vbuf = device.createBuffer({ size: verts.byteLength, usage: GPUBufferUsage.VERTEX, mappedAtCreation: true });
+  new Float32Array(vbuf.getMappedRange()).set(verts);
+  vbuf.unmap();
+  const tex = yuvTextures(image, 'ground');
+  t.vbuf = vbuf; t.tex = tex; t.meshCenter = center;
+  t.bind = device.createBindGroup({ layout: groundLayout, entries: [
+    { binding: 0, resource: { buffer: uniformBuffer, size: 96 } },
+    { binding: 1, resource: linear }, { binding: 2, resource: tex.y.createView() }, { binding: 3, resource: tex.uv.createView() }] });
+  t.state = 'ready'; loadedCount++;
 }
 function unload(t) {
   t.vbuf.destroy(); dropTexture(t.tex.y); dropTexture(t.tex.uv);
@@ -941,7 +1041,9 @@ const FLY_ACTIVE = 48, KEEP_MS = 5000, MAX_MODELS = 150, UPLOADS_PER_FRAME = 4;
 let hevc = cfg.r3d && typeof VideoDecoder !== 'undefined' && params.get('hevc') !== '0'
   && (await VideoDecoder.isConfigSupported({ codec: 'hvc1.3.E.L120.B0', hardwareAcceleration: 'prefer-hardware' })
     .catch(() => ({}))).supported === true;
-const HEVC_WORKERS = 3;
+// 展開は 1 つずつ（同時にいくつも展開すると GPU の側が詰まり、画面が 100 ms 単位で止まる。読み込みも遅くなる）。
+// ?hevcw= で数を変えられる
+const HEVC_WORKERS = Number(params.get('hevcw')) || 1;
 const hevcWorkers = hevc ? Array.from({ length: HEVC_WORKERS }, () => ({ worker: new Worker('hevc.js'), job: null })) : [];
 const hevcPending = [];
 // コマをそのまま受け取るか（?hevcframe=0 で前と同じく RGB の画像で受け取る）
@@ -1093,7 +1195,7 @@ async function flyLoad(t) {
       if (light && m.occlusionTexture) need.add(g.textures[m.occlusionTexture.index].source);
     }
     const images = await Promise.all((g.images || []).map((im, i) => need.has(i)
-      ? createImageBitmap(new Blob([view(im.bufferView)], { type: im.mimeType })) : null));
+      ? decodeImage(view(im.bufferView), im.mimeType, false) : null));
     uploads.push({ t, g, bin, frames, images });
     queued = true;
     if (light) setSun0(t);
@@ -1260,7 +1362,7 @@ function flyUploads() {
     const u = uploads[i];
     if (now - u.t.wantedAt > 4000) {
       uploads.splice(i, 1);
-      dropFrames(u.frames); u.images.forEach(b => b && b.close());
+      dropFrames(u.frames); u.images.forEach(b => b && b.close && b.close());
       u.t.state = 'none';
     }
   }
@@ -1323,6 +1425,11 @@ function prepare(W, H, cssH, force = false) {
   }
   const t2 = performance.now();
   flyUploads();
+  if (groundUploads.length) {
+    for (const u of groundUploads.splice(0, GROUND_UPLOADS_PER_FRAME)) groundUpload(u);
+    selStale = true; dirty = true;
+  }
+  flushUploads();
   upMs = performance.now() - t2;
   const { list, fly } = sel;
   const n = Math.min(list.length, MAX_DRAW), nf = Math.min(fly.length, MAX_DRAW - n);
@@ -1635,8 +1742,8 @@ Object.assign(GE, {
   redraw: () => { dirty = true; }, rendered: () => rendered,
   look: () => look, setLook: name => { look = name; try { localStorage.setItem('look', name); } catch (e) { /* */ } dirty = true; },
   atmosphere: ATMOSPHERE, mode2D: false,
-  pending: () => active + flyActive + uploads.length, shooting: () => !!shooting,
-  stats: () => ({ gpuMs, cpuMs, ...stats, groundTiles: loadedCount, flyModels, flyActive, uploads: uploads.length, active,
+  pending: () => active + flyActive + uploads.length + groundUploads.length, shooting: () => !!shooting,
+  stats: () => ({ gpuMs, cpuMs, ...stats, groundTiles: loadedCount, flyModels, flyActive, uploads: uploads.length, groundUploads: groundUploads.length, upSubmits, active,
     memMB: { ground: mem.ground / 1048576, fly: mem.fly / 1048576 }, hevc, bc: BC }),
 });
 requestAnimationFrame(tick);
