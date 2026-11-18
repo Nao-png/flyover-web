@@ -10,7 +10,7 @@ Python だけで動き、Mac も Apple のアプリも要りません。
 | | |
 |---|---|
 | ![宇宙から見た日本](docs/images/globe.jpg) | ![桜にした大阪城公園](docs/images/osaka-castle-sakura.jpg) |
-| 地球全体から寄っていける（Google Earth 風の色合い） | `?season=sakura` で木を桜に |
+| 地球全体から寄っていける（大気のかすみあり） | `?season=sakura` で木を桜に |
 | ![夕方の光の中之島](docs/images/nakanoshima-evening.jpg) | |
 | `?light=evening` で夕方の光に | |
 
@@ -62,7 +62,7 @@ python scripts/earth.py --r3d
 | 回転・傾き | Shift + ドラッグ、中ボタンでドラッグ | Shift + 矢印 |
 | 見回す | Ctrl + ドラッグ | |
 | 北を上に・真上から・両方 | 方位磁針をクリック | N・U・R |
-| 色合いの切り替え（Apple マップ / Google Earth 風） | 右の「A / G」ボタン | G |
+| 色合いの切り替え（Apple マップ / 大気あり） | 右の「A / G」ボタン | G |
 | 2D と 3D の切り替え | 右の「3D」ボタン | O |
 | スクリーンショット | 右のカメラのボタン | P（4K は Shift + P） |
 
@@ -74,6 +74,7 @@ Alt キーを押しながら動かすと、ゆっくり動きます。
 |---|---|
 | `?season=sakura`、`?season=momiji` | 木が桜・紅葉になる（`--r3d` のとき） |
 | `?light=morning`、`evening`、`cloudy`、`night` | 写真の影を取り除き、朝・夕方・曇り・夜の光にする（`--r3d` のとき） |
+| `?sun=200,10` | 太陽を好きな方位・高さ（[°]）にする。光の色と強さは大気から求める（`--r3d` のとき） |
 | `?look=apple`、`?look=google` | 色合い（G キーと同じ） |
 
 ## 書き出し
@@ -123,6 +124,6 @@ C3M の読み取りは、元の Go 版と**ビット単位で一致**するこ�
 - `flyover/_fast.py`（上の 2 つの重い部分を書き写したもの）
 - `flyover/client.py` のうち、マニフェストの読み取り（`_varint`、`_fields`、`Manifest`）と認証（`TOKEN_P1`、`Client.auth`）
 
-`flyover/earth/atmosphere/` の `definitions.glsl`・`functions.glsl` は Eric Bruneton の [precomputed_atmospheric_scattering](https://github.com/ebruneton/precomputed_atmospheric_scattering) のもので、そのライセンス（BSD 3-Clause、[flyover/earth/atmosphere/LICENSE](flyover/earth/atmosphere/LICENSE)）に従います。`flyover/earth/atmosphere.js` はその `model.cc` などを WebGL2 に移したものなので、同じライセンスの表記も守ります。
+`flyover/earth/atmosphere/` の `definitions.glsl`・`functions.glsl` は Eric Bruneton の [precomputed_atmospheric_scattering](https://github.com/ebruneton/precomputed_atmospheric_scattering) のもので、そのライセンス（BSD 3-Clause、[flyover/earth/atmosphere/LICENSE](flyover/earth/atmosphere/LICENSE)）に従います。`flyover/earth/atmosphere.js` はその `model.cc` などを WebGL2 に、`flyover/earth/gpu-atmo.js` は画面で使う関数を WGSL に移したもの、`flyover/earth/sunlight.js` は同じ表の引き方を使うものなので、同じライセンスの表記も守ります。
 
 取得したデータと画面写真の Apple マップの画像は Apple の著作物で、このライセンスの対象ではありません。

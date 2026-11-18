@@ -381,12 +381,12 @@ function set2D(on) {
   if (on) resetView({ top: true });
 }
 dimBtn.onclick = () => set2D(!GE.mode2D);
-// 色合い（A: Apple マップ、G: Google Earth 風）
+// 色合い（A: Apple マップ、G: 大気あり）
 const lookBtn = $('look-btn');
 function setLook(name) {
   GE.setLook(name);
   lookBtn.textContent = name === 'apple' ? 'A' : 'G';
-  lookBtn.title = `色合い: ${name === 'apple' ? 'Apple マップ（大気なし）' : 'Google Earth 風'}（G で切り替え）`;
+  lookBtn.title = `色合い: ${name === 'apple' ? 'Apple マップ（大気なし）' : '大気あり'}（G で切り替え）`;
 }
 lookBtn.onclick = () => setLook(GE.look() === 'apple' ? 'google' : 'apple');
 lookBtn.hidden = !GE.atmosphere;
