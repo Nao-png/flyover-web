@@ -26,8 +26,10 @@ const SOLAR = ${v([1.474, 1.8504, 1.91198])};
 // 画面ごとの値。cam0: 大気の座標（km）でのカメラと、w に大気の使い方（0 なし、1 空だけ、2 空とかすみ）。
 // sun: 太陽の向き（地球の座標の軸）。balance: 空とかすみに掛ける色と、w に明るさ。aerial: かすみの倍率（遠く、近く、
 // 目安の距離 km）と、w に灰色に寄せる割合。invVP: 画面からカメラを原点にした向きへ。pickM: カーソルの下の点を
-// 探すときに 1 画素を画面全体に広げる行列（ふだんは単位行列）。camPos: カメラの位置（季節の色の模様用）
-struct Frame { cam0: vec4f, sun: vec4f, balance: vec4f, aerial: vec4f, invVP: mat4x4f, pickM: mat4x4f, camPos: vec4f };
+// 探すときに 1 画素を画面全体に広げる行列（ふだんは単位行列）。camPos: カメラの位置（季節の色の模様用）。
+// lsun・lsky: ?light= の太陽の光と空の光（gpu-render.js の lightNow）
+struct Frame { cam0: vec4f, sun: vec4f, balance: vec4f, aerial: vec4f, invVP: mat4x4f, pickM: mat4x4f, camPos: vec4f,
+  lsun: vec4f, lsky: vec4f };
 @group(1) @binding(0) var<uniform> fr: Frame;
 @group(1) @binding(1) var atmoSamp: sampler;
 @group(1) @binding(2) var transTex: texture_2d<f32>;
@@ -161,9 +163,13 @@ fn aerialAt(rel: vec3f) -> Aer {
   let dist = max(length(rel), 0.01);
   let rr = skyToPoint(fr.cam0.xyz, fr.cam0.xyz + rel / 1000.0, fr.sun.xyz);
   let a = fr.aerial.x * (1.0 + (fr.aerial.y - 1.0) * exp(-dist / 1000.0 / fr.aerial.z));
-  var S = rr.l * fr.balance.rgb;
+  // 空気の量を a 倍にしたときの透けぐあいと空気の光（光の足し方と色の薄れ方を同じ割合で変える。空気の光だけを
+  // 減らすと、遠くが明るいかすみに溶けずに暗く沈む）
+  let t = pow(rr.t, vec3f(a));
+  let k = select(vec3f(a), (1.0 - t) / max(1.0 - rr.t, vec3f(1e-6)), rr.t < vec3f(0.9999));
+  var S = rr.l * k * fr.balance.rgb;
   S = mix(S, vec3f(dot(S, vec3f(0.2126, 0.7152, 0.0722))), fr.aerial.w);
-  return Aer(rr.t, S * a * fr.balance.w);
+  return Aer(t, S * fr.balance.w);
 }
 // 写真の色 c（sRGB）にかすみをかける（今のビューアの後処理と同じ式）
 fn atmoApply(c: vec3f, t: vec3f, s: vec3f) -> vec3f {

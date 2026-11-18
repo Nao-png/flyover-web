@@ -749,7 +749,12 @@ const LIGHTS = {
   night: { sun: null, sky: [0.07, 0.09, 0.17] },
   check: { check: true, sun: null, sky: [1, 1, 1] },   // 撮ったときの日なた（白）・日かげ（黒）をそのまま見る（確かめ用）
 };
-const light = cfg.r3d ? LIGHTS[new URLSearchParams(location.search).get('light')] : undefined;
+// ?sun=方位,高さ（[°]）で、好きな太陽の光にする（光の色と強さは大気から。大気のない間は朝の値）
+const sunParam = (new URLSearchParams(location.search).get('sun') || '').split(',').map(Number);
+if (sunParam.length === 2 && sunParam.every(Number.isFinite)) LIGHTS.sun = { ...LIGHTS.morning, sun: sunParam };
+const light = cfg.r3d ? LIGHTS[LIGHTS.sun ? 'sun' : new URLSearchParams(location.search).get('light')] : undefined;
+// 今使っている光（太陽の光と空の光）。太陽のある光は、大気の表ができたら大気から求めた値にする（sunlight.js、setLight）
+const lightNow = light ? { sunColor: C.Cartesian3.fromArray(light.sunColor || [0, 0, 0]), sky: C.Cartesian3.fromArray(light.sky) } : null;
 const glslVec = v => `vec3(${v.map(x => x.toFixed(4)).join(', ')})`;
 const lightGlsl = !light ? '' : (() => {
   const sun = light.sun && light.sun.map(d => d * Math.PI / 180);
@@ -777,7 +782,7 @@ void lightApply(inout czm_modelMaterial material, vec3 pe, vec3 pw, vec4 color) 
   vec3 upE = normalize(czm_viewRotation * up);
   vec3 sunE = normalize(czm_viewRotation * (east * ${sunENU[0].toFixed(5)} + north * ${sunENU[1].toFixed(5)} + up * ${sunENU[2].toFixed(5)}));
   float sky = 0.65 + 0.35 * dot(n, upE);              // 上を向いた面ほど空の光が多い
-  vec3 L = ${glslVec(light.sky)} * sky${light.sun ? ` + ${glslVec(light.sunColor)} * max(dot(n, sunE), 0.0)` : ''};
+  vec3 L = u_lsky * sky${light.sun ? ' + u_lsun * max(dot(n, sunE), 0.0)' : ''};
   material.diffuse = albedo * L;
 }`;
 })();
@@ -795,22 +800,23 @@ void lightApply(inout czm_modelMaterial material, vec3 pe, vec3 pw, vec4 color) 
 // なめらかにした点が空に消されないように、奥行きではなく不透明度で重ねる
 const atmoParams = new URLSearchParams(location.search);
 const ATMOSPHERE = atmoParams.get('atmo') !== '0';
-// 明るさとちりの量は、富山で Google Earth と同じ場所の空と山の色を比べて決めた（元のデモは 10 と 1）
+// 明るさは、富山で Google Earth と同じ場所の空と山の色を比べて決めた（元のデモは 10）。ちりの量は、都市の晴れた日の
+// 遠くが白っぽい灰色にかすむように、元のデモの 3 倍
 const atmoExposure = Number(atmoParams.get('exposure')) || 6;
-const atmoHaze = Number(atmoParams.get('haze')) || 0.5;   // 空気中のちりの量の倍率（1 で元のデモの値）
+const atmoHaze = Number(atmoParams.get('haze')) || 3;     // 空気中のちりの量の倍率（1 で元のデモの値）
 // 明るさの曲線。aces（既定）は映画で使われる ACES の近似（Narkowicz）で、元のデモの 1 - exp(-x)（?tone=exp）
 // より明暗の差と色が濃く出る
 const atmoAces = atmoParams.get('tone') !== 'exp';
 // 色合い。apple は Apple マップ本来の見え方で、大気の処理をしない（大気を入れる前と同じ。Cesium の空で、
-// 写真はそのまま）。google は大気で Google Earth に寄せた見え方（空とかすみが青く、近くからかすむ）。右のボタンか
+// 写真はそのまま）。google は大気ありの見え方（空と、遠いほど白っぽくなるかすみ）。右のボタンか
 // G キーで切り替え、?look= でも選べる。初めて開いたときは apple で、選んだものはこのブラウザーに覚える。大気のテクスチャは apple のときも
 // 計算しておき、切り替えは後処理を入れたり外したりするだけ。google の値:
-// - balance: 空とかすみ（写真ではない部分）に掛ける色。物理の計算どおりの空は Google Earth の空より青が弱い（どの
-//   曲線でも赤と青の比が合わない）ので、青を少し強める。Google Earth に合わせた値（0.85, 0.88, 1.8）は
-//   青みが強すぎたので控えめにした（緑を下げすぎると地平線の近くが紫がかる）
-// - aerial: 写真（地面と街）に足す空気の光の倍率。距離 d で aerial × (1 + (aerialNear − 1) × exp(−d / aerialKm))。
-//   Google Earth は 2 km ほどの近さでも青いかすみが強く、遠くは物理の計算より弱い（富山で同じ建物の色を比べた）。
-//   それに合わせた 6 倍は青すぎたので、近くは 3 倍に控えた
+// - balance: 空とかすみ（写真ではない部分）に掛ける色。青を 1.1 倍だけ強める（前は Google Earth に寄せて 0.95, 0.97, 1.3。
+//   Google Earth に合わせた値は 0.85, 0.88, 1.8。緑を下げすぎると地平線の近くが紫がかる）
+// - aerial: 写真（地面と街）にかける空気の量の倍率。距離 d で aerial × (1 + (aerialNear − 1) × exp(−d / aerialKm))。
+//   既定は遠く 0.4、近く 2.5 倍、目安 100 km で、街を見る数十 km まではほぼ物理の計算どおり（10 km で 0.94、30 km で
+//   0.84）、宇宙から見るときは 0.4（1 のままだと地面全体が青白くかすむ）。前は Google Earth に寄せて近く 3 倍、目安 2 km
+//   にしていた（Google Earth は 2 km ほどの近さでも青いかすみが強く、遠くは物理の計算より弱い）
 // - grey: 写真に足す空気の光を灰色に寄せる割合（青ではなく灰色っぽくかすませたいとき）
 // URL の ?balance=r,g,b・?aerial=・?aerialNear=・?aerialKm=・?grey= で上書きできる
 const ATMO_LOOKS = ['apple', 'google'];
@@ -818,9 +824,9 @@ const atmoNum = (name, d) => (v => Number.isFinite(v) ? v : d)(Number(atmoParams
 const atmoGoogle = (() => {
   const b = (atmoParams.get('balance') || '').split(',').map(Number);
   return {
-    balance: b.length === 3 && b.every(Number.isFinite) ? b : [0.95, 0.97, 1.3],
-    aerial: atmoNum('aerial', 0.4), aerialNear: atmoNum('aerialNear', 3),
-    aerialKm: Math.max(atmoNum('aerialKm', 2), 0.01), grey: atmoNum('grey', 0),
+    balance: b.length === 3 && b.every(Number.isFinite) ? b : [1, 1, 1.1],
+    aerial: atmoNum('aerial', 0.4), aerialNear: atmoNum('aerialNear', 2.5),
+    aerialKm: Math.max(atmoNum('aerialKm', 100), 0.01), grey: atmoNum('grey', 0),
   };
 })();
 let atmoLook = (() => {
@@ -835,13 +841,25 @@ function setLook(name) {
   atmoLook = name;
   try { localStorage.setItem('look', name); } catch (e) { /* 覚えられない環境 */ }
   lookBtn.textContent = name === 'apple' ? 'A' : 'G';
-  lookBtn.title = `色合い: ${name === 'apple' ? 'Apple マップ（大気なし）' : 'Google Earth 風'}（G で切り替え）`;
+  lookBtn.title = `色合い: ${name === 'apple' ? 'Apple マップ（大気なし）' : '大気あり'}（G で切り替え）`;
   atmoApply();
   scene.requestRender();
 }
 lookBtn.onclick = () => setLook(atmoLook === 'apple' ? 'google' : 'apple');
 lookBtn.hidden = !ATMOSPHERE;
 setLook(atmoLook);
+// ?light= の光を変え、読み込み済みのタイルのシェーダーにも入れる
+function setLight({ sunColor, sky }) {
+  C.Cartesian3.fromArray(sunColor, 0, lightNow.sunColor);
+  C.Cartesian3.fromArray(sky, 0, lightNow.sky);
+  for (const t of tiles.values()) {
+    if (!t.shader) continue;
+    t.shader.setUniform('u_lsun', lightNow.sunColor);
+    t.shader.setUniform('u_lsky', lightNow.sky);
+  }
+  scene.requestRender();
+}
+
 // 太陽の方位（北から時計回り）と高さ [°]。?light= に太陽があればそれ、夜は沈んだ太陽、ほかは昼の太陽
 const atmoSun = (() => {
   const name = atmoParams.get('light');
@@ -909,9 +927,13 @@ void main() {
     vec3 S = GetSkyRadianceToPoint(ATMOSPHERE, transmittance_texture, scattering_texture, scattering_texture,
         u_camera, point, 0.0, u_sun, transmittance);
     float aerial = u_aerial.x * (1.0 + (u_aerial.y - 1.0) * exp(-distance / 1000.0 / u_aerial.z));
-    S *= u_balance;
+    // 空気の量を aerial 倍にしたときの透けぐあいと空気の光（光の足し方と色の薄れ方を同じ割合で変える。空気の光
+    // だけを減らすと、遠くが明るいかすみに溶けずに暗く沈む）
+    vec3 t = pow(transmittance, vec3(aerial));
+    vec3 k = mix(vec3(aerial), (1.0 - t) / max(1.0 - transmittance, vec3(1e-6)), step(transmittance, vec3(0.9999)));
+    S *= k * u_balance;
     S = mix(S, vec3(dot(S, vec3(0.2126, 0.7152, 0.0722))), u_grey);
-    p = tone(untone(p) * transmittance + S * aerial * u_exposure);
+    p = tone(untone(p) * t + S * u_exposure);
   }
   out_FragColor = vec4(pow(p * c.a + sky * (1.0 - c.a), vec3(1.0 / 2.2)), 1.0);
 }`;
@@ -952,6 +974,7 @@ async function startAtmosphere() {
     gl.bindTexture(target, null);
     return { _target: target, _texture: t, dimensions: new C.Cartesian2(w, h) };
   };
+  if (light && light.sun && !light.check) setLight(SUNLIGHT.light(data, light.sun[1]));
   const tex = {
     transmittance: texture(gl.TEXTURE_2D, floatLinear ? gl.RGBA32F : gl.RGBA16F, 256, 64, 1, data.transmittance),
     scattering: texture(gl.TEXTURE_3D, gl.RGBA16F, 256, 128, 32, data.scattering),
@@ -1302,7 +1325,9 @@ const tweakCall = (seasonGlsl ? 'seasonTint(material, fsInput.attributes.positio
 
 // 季節の色と光の当たり方だけのシェーダー（HEVC でない glb）。頂点の色があるのはスプラットだけで、メッシュには
 // Cesium が白を入れるので、季節の色では写真（パリのような JPEG のテクスチャも）は変わらない
-const sun0Uniform = () => ({ u_sun0: { type: C.UniformType.VEC3, value: new C.Cartesian3(0, 0, 0) } });
+const sun0Uniform = () => ({ u_sun0: { type: C.UniformType.VEC3, value: new C.Cartesian3(0, 0, 0) },
+  u_lsun: { type: C.UniformType.VEC3, value: C.Cartesian3.clone(lightNow.sunColor) },
+  u_lsky: { type: C.UniformType.VEC3, value: C.Cartesian3.clone(lightNow.sky) } });
 function tweakShader() {
   return new C.CustomShader({ uniforms: lightGlsl ? sun0Uniform() : {}, fragmentShaderText: `${tweakGlsl}
 void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
@@ -1401,7 +1426,7 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
 // テクスチャを作り終えたら、元の Y と UV の配列を手放す（JS のメモリに残さない）
 function releasePlanes(t) {
   const tm = t.shader._textureManager, u = t.shader.uniforms;
-  const planes = Object.keys(u).filter(k => k !== 'u_sun0');
+  const planes = Object.keys(u).filter(k => !['u_sun0', 'u_lsun', 'u_lsky'].includes(k));
   if (!tm || !planes.every(k => tm._textures[k])) return;
   for (const k of planes) u[k].value.typedArray = undefined;
   t.planesFreed = true;

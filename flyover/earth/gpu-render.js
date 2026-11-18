@@ -70,7 +70,7 @@ let selStale = true;     // 選んだあとにタイルが届いた（選び直�
 
 // ---------------------------------------------------------------- 見た目の設定
 
-// 色合い: apple（初めて開いたとき）は空だけで写真にかすみをかけない、google は空とかすみ（今のビューアと同じ値）。
+// 色合い: apple（初めて開いたとき）は空だけで写真にかすみをかけない、google は空とかすみ（大気あり。今のビューアと同じ値）。
 // 選んだものは今のビューアと同じくこのブラウザーに覚える（localStorage の look）。?look= でも選べる。?atmo=0 で大気を使わない
 const ATMOSPHERE = params.get('atmo') !== '0';
 let look = (() => {
@@ -82,10 +82,10 @@ let look = (() => {
 const num = (name, d) => (v => Number.isFinite(v) ? v : d)(Number(params.get(name) ?? NaN));
 const bal = (params.get('balance') || '').split(',').map(Number);
 const ATMO = {
-  exposure: Number(params.get('exposure')) || 6, haze: Number(params.get('haze')) || 0.5,
+  exposure: Number(params.get('exposure')) || 6, haze: Number(params.get('haze')) || 3,
   aces: params.get('tone') !== 'exp',
-  balance: bal.length === 3 && bal.every(Number.isFinite) ? bal : [0.95, 0.97, 1.3],
-  aerial: num('aerial', 0.4), aerialNear: num('aerialNear', 3), aerialKm: Math.max(num('aerialKm', 2), 0.01), grey: num('grey', 0),
+  balance: bal.length === 3 && bal.every(Number.isFinite) ? bal : [1, 1, 1.1],
+  aerial: num('aerial', 0.4), aerialNear: num('aerialNear', 2.5), aerialKm: Math.max(num('aerialKm', 100), 0.01), grey: num('grey', 0),
 };
 // ?light=: 撮ったときの日なたと日かげを取り除いて、別の光で描き直す（今のビューアと同じ値と式）
 const LIGHTS = {
@@ -95,7 +95,12 @@ const LIGHTS = {
   night: { sun: null, sky: [0.07, 0.09, 0.17] },
   check: { check: true, sun: null, sky: [1, 1, 1] },
 };
-const light = cfg.r3d ? LIGHTS[params.get('light')] : undefined;
+// ?sun=方位,高さ（[°]）で、好きな太陽の光にする（光の色と強さは大気から。大気のない間は朝の値）
+const sunParam = (params.get('sun') || '').split(',').map(Number);
+if (sunParam.length === 2 && sunParam.every(Number.isFinite)) LIGHTS.sun = { ...LIGHTS.morning, sun: sunParam };
+const light = cfg.r3d ? LIGHTS[LIGHTS.sun ? 'sun' : params.get('light')] : undefined;
+// 今使っている光（太陽の光と空の光）。太陽のある光は、大気の表ができたら大気から求めた値にする（sunlight.js）
+const lightNow = light ? { sunColor: light.sunColor || [0, 0, 0], sky: light.sky } : null;
 // 空の太陽: ?light= に太陽があればそれ、夜は沈んだ太陽、ほかは昼の太陽（方位と高さ [°]）
 const atmoSun = light && light.sun ? light.sun : params.get('light') === 'night' ? [0, -20] : [150, 45];
 const SEASONS = { sakura: 0, momiji: 1, check: 2 };
@@ -154,7 +159,7 @@ fn lightRgb(c: vec3f, lit0: f32, n: vec3f) -> vec3f {
   let albedo = srgbToLinear(c) / mix(vec3f(0.10, 0.15, 0.17), vec3f(1.0), lit * k);
   let sunE = normalize(east * ${f4(sunENU[0])} + north * ${f4(sunENU[1])} + up * ${f4(sunENU[2])});
   let sky = 0.65 + 0.35 * dot(n, up);
-  let L = ${v3w(light.sky)} * sky${light.sun ? ` + ${v3w(light.sunColor)} * max(dot(n, sunE), 0.0)` : ''};
+  let L = fr.lsky.xyz * sky${light.sun ? ' + fr.lsun.xyz * max(dot(n, sunE), 0.0)' : ''};
   return linearToSrgb(albedo * L);
 }`;
 })();
@@ -711,8 +716,8 @@ const white = tex1('rgba8unorm', [255, 255, 255, 255]), whiteR = tex1('r8unorm',
 
 // ---------------------------------------------------------------- 大気の表と画面ごとの値
 
-const frameMain = device.createBuffer({ size: 208, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-const framePick = device.createBuffer({ size: 208, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+const frameMain = device.createBuffer({ size: 240, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+const framePick = device.createBuffer({ size: 240, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 const atmoSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
 const atmoFormat = floatFilter ? 'rgba32float' : 'rgba16float';
 let atmoT2 = device.createTexture({ size: [1, 1], format: atmoFormat, usage: GPUTextureUsage.TEXTURE_BINDING });
@@ -734,6 +739,7 @@ if (ATMOSPHERE && floatFilter) {
       return t;
     };
     atmoT2 = tex(256, 64, 1, data.transmittance); atmoT3 = tex(256, 128, 32, data.scattering);
+    if (light && light.sun && !light.check) Object.assign(lightNow, SUNLIGHT.light(data, light.sun[1]));
     groupMain = frameBind(frameMain); groupPick = frameBind(framePick);
     atmoReady = true; dirty = true;
   };
@@ -746,11 +752,12 @@ function frameData(vp, pickM) {
   const [az, el] = atmoSun.map(d => d * RAD);
   const sun = norm(add(add(mul(east, Math.sin(az) * Math.cos(el)), mul(north, Math.cos(az) * Math.cos(el))), mul(up, Math.sin(el))));
   const mode = !atmoReady ? 0 : look === 'apple' ? 1 : 2;
-  const f = new Float32Array(52);
+  const f = new Float32Array(60);
   f.set([...mul(up, 6360 + h), mode, ...sun, 0, ...ATMO.balance, ATMO.exposure, ATMO.aerial, ATMO.aerialNear, ATMO.aerialKm, ATMO.grey]);
   f.set(mat4inv(vp), 16);
   f.set(pickM || IDENTITY, 32);
   f.set([...cam.pos, 0], 48);
+  if (lightNow) f.set([...lightNow.sunColor, 0, ...lightNow.sky, 0], 52);
   return f;
 }
 

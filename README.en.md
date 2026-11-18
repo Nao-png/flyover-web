@@ -10,7 +10,7 @@ It runs on Python alone; no Mac or Apple apps are needed.
 | | |
 |---|---|
 | ![Japan seen from space](docs/images/globe.jpg) | ![Osaka Castle Park with cherry blossoms](docs/images/osaka-castle-sakura.jpg) |
-| Zoom in from the whole Earth (Google Earth style look) | `?season=sakura` turns the trees into cherry blossoms |
+| Zoom in from the whole Earth (with atmospheric haze) | `?season=sakura` turns the trees into cherry blossoms |
 | ![Nakanoshima in evening light](docs/images/nakanoshima-evening.jpg) | |
 | `?light=evening` for evening light | |
 
@@ -62,7 +62,7 @@ Press the `?` button at the bottom right or the `?` key to show the list at any 
 | Rotate and tilt | Shift + drag, middle-button drag | Shift + arrows |
 | Look around | Ctrl + drag | |
 | North up, straight down, both | Click the compass | N, U, R |
-| Switch the look (Apple Maps / Google Earth style) | "A / G" button on the right | G |
+| Switch the look (Apple Maps / with atmosphere) | "A / G" button on the right | G |
 | Switch between 2D and 3D | "3D" button on the right | O |
 | Screenshot | Camera button on the right | P (4K with Shift + P) |
 
@@ -74,6 +74,7 @@ Hold Alt while moving to move slowly.
 |---|---|
 | `?season=sakura`, `?season=momiji` | Trees become cherry blossoms or autumn leaves (with `--r3d`) |
 | `?light=morning`, `evening`, `cloudy`, `night` | Removes the shadows from the photos and lights them as morning, evening, cloudy or night (with `--r3d`) |
+| `?sun=200,10` | Puts the sun at any azimuth and height (degrees). The light's color and strength come from the atmosphere (with `--r3d`) |
 | `?look=apple`, `?look=google` | The look (same as the G key) |
 
 ## Export
@@ -123,6 +124,6 @@ The parts written for this project are under the [MIT License](LICENSE). The fol
 - `flyover/_fast.py` (a copy of the heavy parts of the two above)
 - In `flyover/client.py`, reading the manifest (`_varint`, `_fields`, `Manifest`) and authentication (`TOKEN_P1`, `Client.auth`)
 
-`definitions.glsl` and `functions.glsl` in `flyover/earth/atmosphere/` come from Eric Bruneton's [precomputed_atmospheric_scattering](https://github.com/ebruneton/precomputed_atmospheric_scattering) and are under its license (BSD 3-Clause, [flyover/earth/atmosphere/LICENSE](flyover/earth/atmosphere/LICENSE)). `flyover/earth/atmosphere.js` is a WebGL2 port of its `model.cc` and related code, so it also keeps that license's notice.
+`definitions.glsl` and `functions.glsl` in `flyover/earth/atmosphere/` come from Eric Bruneton's [precomputed_atmospheric_scattering](https://github.com/ebruneton/precomputed_atmospheric_scattering) and are under its license (BSD 3-Clause, [flyover/earth/atmosphere/LICENSE](flyover/earth/atmosphere/LICENSE)). `flyover/earth/atmosphere.js` is a WebGL2 port of its `model.cc` and related code, `flyover/earth/gpu-atmo.js` is a WGSL port of the functions used on screen, and `flyover/earth/sunlight.js` uses the same way of reading the tables, so they also keep that license's notice.
 
 Fetched data and the Apple Maps imagery in the screenshots are Apple's copyrighted material and are not covered by this license.
