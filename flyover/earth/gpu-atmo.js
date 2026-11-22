@@ -24,12 +24,15 @@ const RAY = ${v(rayleigh)};
 const MIE = ${v(rayleigh.map(() => mie * 0.9))};
 const SOLAR = ${v([1.474, 1.8504, 1.91198])};
 // 画面ごとの値。cam0: 大気の座標（km）でのカメラと、w に大気の使い方（0 なし、1 空だけ、2 空とかすみ）。
-// sun: 太陽の向き（地球の座標の軸）。balance: 空とかすみに掛ける色と、w に明るさ。aerial: かすみの倍率（遠く、近く、
+// sun: 太陽の向き（地球の座標の軸）と、w にかすみの表の一番遠い距離 [m]。balance: 空とかすみに掛ける色と、w に明るさ。aerial: かすみの倍率（遠く、近く、
 // 目安の距離 km）と、w に灰色に寄せる割合。invVP: 画面からカメラを原点にした向きへ。pickM: カーソルの下の点を
 // 探すときに 1 画素を画面全体に広げる行列（ふだんは単位行列）。camPos: カメラの位置（季節の色の模様用）。
-// lsun・lsky: ?light= の太陽の光と空の光（gpu-render.js の lightNow）
+// lsun・lsky: ?light= の太陽の光と空の光（gpu-render.js の lightNow）。lsun.w は太陽の高さの正弦、lsky.w は
+// 地面にも光をかけるなら 1。ngrid: 20 km ごとの区切りの点からカメラまで（夜の窓の模様を細かく決めるため。地球の
+// 座標のままでは f32 で 0.5 m 刻みになる）、nup: その点の上の向き（w は雲を出すか）。shadowC: カメラから、雲の影の
+// 地図の真ん中（カメラの位置を 1 km ごとに丸めた点）までの逆向き [m]（gpu-clouds.js）
 struct Frame { cam0: vec4f, sun: vec4f, balance: vec4f, aerial: vec4f, invVP: mat4x4f, pickM: mat4x4f, camPos: vec4f,
-  lsun: vec4f, lsky: vec4f };
+  lsun: vec4f, lsky: vec4f, ngrid: vec4f, nup: vec4f, shadowC: vec4f };
 @group(1) @binding(0) var<uniform> fr: Frame;
 @group(1) @binding(1) var atmoSamp: sampler;
 @group(1) @binding(2) var transTex: texture_2d<f32>;
@@ -115,7 +118,30 @@ fn skyRadiance(cam: vec3f, v: vec3f, sun: vec3f) -> Rad {
   let cs = combined(r, mu, mus, nu, g);
   return Rad(cs.rgb * rayleighPhase(nu) + extrapolatedMie(cs) * miePhase(MIE_G, nu), t);
 }
-fn skyToPoint(cam: vec3f, point: vec3f, sun: vec3f) -> Rad {
+// 光芒（Bruneton の論文の式 18）: 視線の上の、雲の影に入った長さ sl [km] の分の空気の光を除く（影はカメラの近くに
+// まとまっているとみなし、カメラから sl 先の点からの空気の光に、そこまでの透けぐあいを掛ける）
+fn skyRadianceSL(cam: vec3f, v: vec3f, sun: vec3f, sl: f32) -> Rad {
+  if (sl <= 0.0) { return skyRadiance(cam, v, sun); }
+  var c = cam;
+  var r = length(c);
+  var rmu = dot(c, v);
+  let dtop = -rmu - sqrt(rmu * rmu - r * r + TOP * TOP);
+  if (dtop > 0.0) { c = c + v * dtop; r = TOP; rmu = rmu + dtop; }
+  else if (r > TOP) { return Rad(vec3f(0.0), vec3f(1.0)); }
+  let mu = rmu / r;
+  let mus = dot(c, sun) / r;
+  let nu = dot(v, sun);
+  let g = hitsGround(r, mu);
+  var t = vec3f(0.0);
+  if (!g) { t = transToTop(r, mu); }
+  let rp = clamp(sqrt(sl * sl + 2.0 * r * mu * sl + r * r), BOTTOM, TOP);
+  let cs = combined(rp, (r * mu + sl) / rp, (r * mus + sl * nu) / rp, nu, g);
+  let st = transmittance(r, mu, sl, g);
+  return Rad((cs.rgb * rayleighPhase(nu) + extrapolatedMie(cs) * miePhase(MIE_G, nu)) * st, t);
+}
+fn skyToPoint(cam: vec3f, point: vec3f, sun: vec3f) -> Rad { return skyToPointSL(cam, point, sun, 0.0); }
+// 光芒つき（Bruneton の論文の式 17）: 視線の上の、雲の影に入った長さ sl [km] の分の空気の光を除く
+fn skyToPointSL(cam: vec3f, point: vec3f, sun: vec3f, sl: f32) -> Rad {
   let v = normalize(point - cam);
   var c = cam;
   var r = length(c);
@@ -129,10 +155,12 @@ fn skyToPoint(cam: vec3f, point: vec3f, sun: vec3f) -> Rad {
   let g = hitsGround(r, mu);
   let t = transmittance(r, mu, d, g);
   let cs = combined(r, mu, mus, nu, g);
-  let rp = clamp(sqrt(d * d + 2.0 * r * mu * d + r * r), BOTTOM, TOP);
-  let csp = combined(rp, (r * mu + d) / rp, (r * mus + d * nu) / rp, nu, g);
-  let s = cs.rgb - t * csp.rgb;
-  let m = extrapolatedMie(cs) - t * extrapolatedMie(csp);
+  let dp = max(d - sl, 0.0);
+  let rp = clamp(sqrt(dp * dp + 2.0 * r * mu * dp + r * r), BOTTOM, TOP);
+  let csp = combined(rp, (r * mu + dp) / rp, (r * mus + dp * nu) / rp, nu, g);
+  let st = select(t, transmittance(r, mu, dp, g), sl > 0.0);
+  let s = cs.rgb - st * csp.rgb;
+  let m = extrapolatedMie(cs) - st * extrapolatedMie(csp);
   let mie = extrapolatedMie(vec4f(s, m.r)) * smoothstep(0.0, 0.01, mus);
   return Rad(s * rayleighPhase(nu) + mie * miePhase(MIE_G, nu), t);
 }
@@ -155,13 +183,15 @@ fn untone(y0: vec3f) -> vec3f {
   return (-b - sqrt(max(b * b - 4.0 * a * c, vec3f(0.0)))) / (2.0 * a);`
          : 'return -log(max(1.0 - y0, vec3f(1e-4)));'}
 }
-// カメラから rel [m] の所までのかすみ（透けぐあい t と、足す空気の光 s）。頂点で計算して、画素の間は補間する
-// （かすみは距離でなめらかに変わる。画素ごとに計算すると、重なったスプラットの分まで計算して重い）
+// カメラから rel [m] の所までのかすみ（透けぐあい t と、足す空気の光 s）。毎コマ、画面の向きと距離ごとの表に計算して
+// おき（gpu-render.js の AERIAL_CS）、頂点はその表を引いて、画素の間は補間する（かすみは距離でなめらかに変わる）
 struct Aer { t: vec3f, s: vec3f };
-fn aerialAt(rel: vec3f) -> Aer {
+fn aerialAt(rel: vec3f) -> Aer { return aerialAtSL(rel, 0.0); }
+// sl: 視線の上の、雲の影に入った長さ [km]（光芒）
+fn aerialAtSL(rel: vec3f, sl: f32) -> Aer {
   if (fr.cam0.w < 1.5) { return Aer(vec3f(1.0), vec3f(0.0)); }
   let dist = max(length(rel), 0.01);
-  let rr = skyToPoint(fr.cam0.xyz, fr.cam0.xyz + rel / 1000.0, fr.sun.xyz);
+  let rr = skyToPointSL(fr.cam0.xyz, fr.cam0.xyz + rel / 1000.0, fr.sun.xyz, sl);
   let a = fr.aerial.x * (1.0 + (fr.aerial.y - 1.0) * exp(-dist / 1000.0 / fr.aerial.z));
   // 空気の量を a 倍にしたときの透けぐあいと空気の光（光の足し方と色の薄れ方を同じ割合で変える。空気の光だけを
   // 減らすと、遠くが明るいかすみに溶けずに暗く沈む）
@@ -175,6 +205,11 @@ fn aerialAt(rel: vec3f) -> Aer {
 fn atmoApply(c: vec3f, t: vec3f, s: vec3f) -> vec3f {
   if (fr.cam0.w < 1.5) { return c; }
   return pow(tone(untone(pow(c, vec3f(2.2))) * t + s), vec3f(1.0 / 2.2));
+}
+// 線形の値（c の 2.2 乗にあたるもの）を受け取る版（?light= のとき。色の変換の往復を省く）
+fn atmoApplyLin(l: vec3f, t: vec3f, s: vec3f) -> vec3f {
+  if (fr.cam0.w < 1.5) { return pow(l, vec3f(1.0 / 2.2)); }
+  return pow(tone(untone(l) * t + s), vec3f(1.0 / 2.2));
 }
 // 空。画面全体に最初に描く（奥行きは書かない）
 struct SkyV { @builtin(position) pos: vec4f, @location(0) ndc: vec2f };

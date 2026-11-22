@@ -1107,15 +1107,22 @@ def texture(data, sec=None, k=0):
     return bytes(data[i:e])
 
 
-def shade_image(data, sec, k):
+def shade_image(data, sec, k, item=6):
     """k 枚目のテクスチャの、日の当たり方の画像（項目 6。縦横半分の灰色の HEIF。撮ったときの日なたが白、
-    日かげが黒）。なければ None。"""
+    日かげが黒）。なければ None。item=8 なら、もう 1 枚の灰色の画像（ガラスの地図。gloss_image）。"""
     for t, s, e in _image_items(data, sec, k):
-        if t == 6:
+        if t == item:
             i = data.find(b"ftyp", s, e) - 4
             if i >= s:
                 return bytes(data[i:e])
     return None
+
+
+def gloss_image(data, sec, k):
+    """k 枚目のテクスチャの、ガラスの地図（項目 8。縦横半分の灰色の HEIF）。ガラス張りの壁や窓が黒く、屋上・
+    コンクリート・道路は明るい灰色（大阪のビルの壁の 60 枚で、写真の明るさとの相関は 0.17）。表面のなめらかさ
+    （反射のしやすさ）らしい。スプラットの 1 番目の値と同じ量らしい。なければ None。"""
+    return shade_image(data, sec, k, 8)
 
 
 # 画像の項目 13 の値 -> メッシュの種類（c3m.Mesh.kind と同じ番号）
@@ -1192,8 +1199,9 @@ def parse(data):
         if groups or kind == 0:
             meshes.append(Mesh(V, uv, groups, kind))
     shades = [shade_image(data, sec, k) for k in range(len(heics))]
-    return C3M(rot, trans, [Material(h, "jpeg" if h[:2] == b"\xff\xd8" else "heic", r, sh)
-                            for h, r, sh in zip(heics, repeat, shades)],
+    glosses = [gloss_image(data, sec, k) for k in range(len(heics))]
+    return C3M(rot, trans, [Material(h, "jpeg" if h[:2] == b"\xff\xd8" else "heic", r, sh, gl)
+                            for h, r, sh, gl in zip(heics, repeat, shades, glosses)],
                meshes, splats, captured)
 
 

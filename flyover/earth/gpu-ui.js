@@ -7,6 +7,9 @@ if (!GE) return;
 const { RAD, add, sub, mul, dot, cross, len, norm, clamp, lerp3, ecef, geodetic, enu, rot, hitEllipsoid } = GM;
 const { cam, cfg, canvas } = GE;
 const $ = id => document.getElementById(id);
+// 下の帯とスクリーンショットの出典。夜景では道路の街灯に OpenStreetMap のデータを使う（ODbL。表記が要る）
+const CREDITS = '画像・3D © Apple' + (cfg.r3d && new URLSearchParams(location.search).get('light') === 'night'
+  ? '、道路 © OpenStreetMap contributors、夜の明るさ NASA Black Marble' : '');
 
 // ---------------------------------------------------------------- 視点の計算
 
@@ -302,6 +305,7 @@ addEventListener('keydown', e => {
     case 'r': resetView({ north: true, top: true }); break;
     case 'o': set2D(!GE.mode2D); break;
     case 'g': if (GE.atmosphere) setLook(GE.look() === 'apple' ? 'google' : 'apple'); break;
+    case 'c': if (GE.cloudsAvailable) setClouds(!GE.clouds()); break;
     case 'p': screenshot(e.shiftKey ? '4k' : 'screen'); break;
     case ' ': e.preventDefault(); stopAll(); held.clear(); break;
   }
@@ -391,6 +395,17 @@ function setLook(name) {
 lookBtn.onclick = () => setLook(GE.look() === 'apple' ? 'google' : 'apple');
 lookBtn.hidden = !GE.atmosphere;
 setLook(GE.look());
+// 雲（出す・消す）。?clouds=0 では雲の仕組みがないので、ボタンも出さない。始めはボタンの見た目だけ合わせる
+// （ブラウザーに書き込まない）
+const cloudBtn = $('cloud-btn');
+function showClouds(on) {
+  cloudBtn.style.opacity = on ? '1' : '0.45';
+  cloudBtn.title = `雲: ${on ? '出す' : '消す'}（C で切り替え）`;
+}
+function setClouds(on) { GE.setClouds(on); showClouds(on); }
+cloudBtn.onclick = () => setClouds(!GE.clouds());
+cloudBtn.hidden = !GE.cloudsAvailable;
+if (GE.cloudsAvailable) showClouds(GE.clouds());
 
 // スクリーンショット: 地球儀と 3D だけを PNG で保存する。大きさは今の画面か、HD・2K・4K。右下に出典を入れる
 const SHOT_SIZES = { screen: null, hd: [1920, 1080], '2k': [2560, 1440], '4k': [3840, 2160] };
@@ -400,7 +415,7 @@ async function screenshot(key = 'screen') {
   const size = SHOT_SIZES[key] || [Math.round(canvas.clientWidth * dpr), Math.round(canvas.clientHeight * dpr)];
   const c = await GE.shot(size[0], size[1]);
   const g = c.getContext('2d');
-  const s = Math.max(1, c.height / 900), text = '画像・3D © Apple';
+  const s = Math.max(1, c.height / 900), text = CREDITS;
   g.font = `${Math.round(12 * s)}px system-ui, sans-serif`;
   const w = g.measureText(text).width, pad = 6 * s;
   g.fillStyle = 'rgba(0,0,0,0.5)';
@@ -435,7 +450,7 @@ function elevation(p, onGlobe) {
   const [la, lo, h] = geodetic(p);
   return h - GE.geoid(la / RAD, lo / RAD) + (onGlobe ? cfg.terrainDrop : 0);
 }
-$('credits').textContent = '画像・3D © Apple';
+$('credits').textContent = CREDITS;
 let mouse = null, mouseMoved = false, shownRender = -1, shownVer = -1, cursorAt = 0, movedAt = 0, cursorRough = false;
 const STILL_MS = 300;
 function capturedAtCenter() {

@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
-from . import c3m, glb, huffman, r3d
+from . import c3m, glb, huffman, osm, r3d
 from .client import Client
 from .terrain import DROP, Geoid, Terrain
 
@@ -97,10 +97,10 @@ def parse_heights(raws, parse=c3m.parse):
     return ok, failed
 
 
-def build_glb(raws, name, parse=c3m.parse, strict=False, hevc=False):
+def build_glb(raws, name, parse=c3m.parse, strict=False, hevc=False, night=False):
     """高さ区分ごとの C3M（parse が r3d.parse なら R3D）のバイト列から glb を作る（別のプロセスで動かす）。
     読めない区分は飛ばす。strict なら、1 つでも読めなければ None（ほかの形式で作り直せるように）。
-    hevc なら、R3D の画像を HEVC のまま入れる（glb.tile_glb を見よ）。"""
+    hevc なら、R3D の画像を HEVC のまま入れる。night なら、窓の位置（ガラスの地図）も入れる（glb.tile_glb を見よ）。"""
     tiles = []
     for k, b in enumerate(raws):
         if b:
@@ -110,7 +110,7 @@ def build_glb(raws, name, parse=c3m.parse, strict=False, hevc=False):
                 print(f"  {name} h={k}: {e}", flush=True)
                 if strict:
                     return None
-    return glb.tile_glb(tiles, hevc=hevc) if tiles else None
+    return glb.tile_glb(tiles, hevc=hevc, night=night) if tiles else None
 
 
 def _warm_worker():
@@ -155,6 +155,7 @@ class Earth:
         threading.Thread(target=lambda: [self.cpu.submit(_warm_wait) for _ in range(n)],
                          daemon=True).start()
         self.terrain = Terrain(self.client, Geoid(cache_dir, self.client.http), self.map)
+        self.osm = None                # 夜景の道路（使うときに作る）
         self._locks, self._locks_lock = {}, threading.Lock()
         self.tile_hosts = []            # タイルを受けるアドレス（serve が足す）
 
@@ -173,22 +174,22 @@ class Earth:
                 "geoid": {"step": 2, "rows": np.round(g).astype(int).tolist()},
                 "terrainDrop": DROP, "tileHosts": self.tile_hosts, "r3d": self.r3d}
 
-    def flyover(self, z, x, y, timing=None, hevc=False):
+    def flyover(self, z, x, y, timing=None, hevc=False, night=False):
         """タイルの glb。データがなければ None。timing（dict）があれば、Apple から取るのと
         glb を作るのにかかった時間 [ms] を入れる。hevc なら、新しい Flyover の画像を HEVC のまま
-        入れる（ビューアが GPU で展開できるとき）。"""
+        入れる（ビューアが GPU で展開できるとき）。night なら、夜景の窓の明かり用に窓の位置も入れる。"""
         timing = {} if timing is None else timing
         if not MIN_ZOOM <= z <= MAX_ZOOM:
             return None
         region = self.client.region_of_tile(x, y, z, strict=True)
         if region is None:
             return None
-        hevc = hevc and self.r3d
-        kind = ("glb98_20h" if hevc else "glb98_20") if self.r3d else "glb4"    # 作り方を変えたら番号を上げる
+        hevc, night = hevc and self.r3d, night and self.r3d
+        kind = ("glb98_20h" if hevc else "glb98_20") + ("n" if night else "") if self.r3d else "glb4"   # 作り方を変えたら番号を上げる
         d = os.path.join(self.cache_dir, kind, f"{region['region']}_{region['version']}", str(z))
         path = os.path.join(d, f"{x}_{y}.glb")
         t0 = time.perf_counter()
-        with self._lock(("glb", z, x, y, hevc)):
+        with self._lock(("glb", z, x, y, hevc, night)):
             timing["wait"] = (time.perf_counter() - t0) * 1000
             if os.path.exists(path):
                 return open(path, "rb").read() or None
@@ -201,7 +202,7 @@ class Earth:
                 # 保存せずに 502 を返し、ビューアがあとで取り直す
                 if any(raws):
                     # 1 区分でも読めなければ、タイルごと C3M にする（区分が欠けて建物の上が消えないよう）
-                    out = self.cpu.submit(build_glb, raws, f"{z}/{x}/{y} r3d", r3d.parse, True, hevc).result()
+                    out = self.cpu.submit(build_glb, raws, f"{z}/{x}/{y} r3d", r3d.parse, True, hevc, night).result()
             if out is None:
                 raws = fetch_heights(z, lambda hs: self.map(
                     lambda k: self.client.tile_cached(region, x, y, z, k), hs))
@@ -213,6 +214,27 @@ class Earth:
             open(tmp, "wb").write(out or b"")
             os.replace(tmp, path)
             return out
+
+    def night_image(self, kind, z, x, y):
+        """夜景の画像（flyover/osm.py。OpenStreetMap のデータを OpenFreeMap から、夜の明るさを NASA の Black Marble から取る）。
+        roads: Flyover のタイルの範囲の道路（アルファは夜の明るさ。cache/osm/night3/）、areas: 水面・商業地・線路・競技場
+        （cache/osm/areas2/）。どちらもズーム 13〜20。lights: 遠くの地面用の夜の明るさ（ズーム 0〜20、cache/osm/lights/）。
+        範囲の外は None。"""
+        dirs = {"roads": ("night3", 13), "areas": ("areas2", 13), "lights": ("lights", 0)}
+        name, zmin = dirs[kind]
+        if not zmin <= z <= 20:
+            return None
+        path = os.path.join(self.cache_dir, "osm", name, str(z), f"{x}_{y}.png")
+        if os.path.exists(path):
+            return open(path, "rb").read()
+        if self.osm is None:
+            self.osm = osm.OSM(self.cache_dir)
+        out = {"roads": self.osm.image, "areas": self.osm.areas, "lights": self.osm.night_tile}[kind](z, x, y)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{threading.get_ident()}.tmp"
+        open(tmp, "wb").write(out)
+        os.replace(tmp, path)
+        return out
 
     def captured(self, z, x, y):
         """新しい Flyover の写真を撮った時刻（Unix 時刻）。なければ None。時刻はズーム 20 のタイルにしか
@@ -247,6 +269,7 @@ ROUTES = [
     (re.compile(r"/api/sat/(\d+)/(\d+)/(\d+)\.jpg"), "sat"),
     (re.compile(r"/api/terrain/(\d+)/(\d+)/(\d+)\.bin"), "terrain"),
     (re.compile(r"/api/captured/(\d+)/(\d+)/(\d+)"), "captured"),
+    (re.compile(r"/api/(roads|areas|lights)/(\d+)/(\d+)/(\d+)\.png"), "night"),
 ]
 
 
@@ -298,10 +321,13 @@ def handler(earth):
                 m = rx.fullmatch(path)
                 if not m:
                     continue
+                if kind == "night":
+                    out = earth.night_image(m.group(1), *map(int, m.groups()[1:]))
+                    return self.send(200, out, "image/png") if out else self.send(404)
                 a, b, c = map(int, m.groups())
                 if kind == "flyover":
                     timing = {}
-                    out = earth.flyover(a, b, c, timing, query.get("hevc") == ["1"])
+                    out = earth.flyover(a, b, c, timing, query.get("hevc") == ["1"], query.get("night") == ["1"])
                     # ブラウザには覚えさせない（作り方を変えたときに古いものが残らないよう）。cache/ にはある
                     return self.send(200 if out else 204, out or b"", "model/gltf-binary", cache=False, timing=timing)
                 if kind == "captured":

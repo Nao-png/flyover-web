@@ -73,8 +73,9 @@ Hold Alt while moving to move slowly.
 | Add | Effect |
 |---|---|
 | `?season=sakura`, `?season=momiji` | Trees become cherry blossoms or autumn leaves (with `--r3d`) |
-| `?light=morning`, `evening`, `cloudy`, `night` | Removes the shadows from the photos and lights them as morning, evening, cloudy or night (with `--r3d`) |
+| `?light=morning`, `evening`, `cloudy`, `night` | Removes the shadows from the photos and lights them as morning, evening, cloudy or night (with `--r3d`). With `night`, the WebGPU viewer lights the windows (`?windows=0.3` and so on sets how many, `?bloom=0` turns off the glow, `?time=2` and so on sets the time of night (0–24, default 21), `?traffic=0` stops the car lights) |
 | `?sun=200,10` | Puts the sun at any azimuth and height (degrees). The light's color and strength come from the atmosphere (with `--r3d`) |
+| `?clouds=0.4` | Cloud amount in the sky (0–1, default 0.3; WebGPU viewer; ported from the clouds of [takram's three-geospatial](https://github.com/takram-design-engineering/three-geospatial); clouds cast shadows on the ground, with haze and light shafts). `?clouds=0` removes the cloud system. The cloud button (C key) shows or hides them |
 | `?look=apple`, `?look=google` | The look (same as the G key) |
 
 ## Export
@@ -109,10 +110,13 @@ C3M reading has been checked to **match the original Go version bit for bit** on
 - The analysis and implementation of [retroplasma/flyover-reverse-engineering](https://github.com/retroplasma/flyover-reverse-engineering) (Go, archived in 2021) were ported to Python and adapted to Apple's servers as of 2026
 - The authentication steps follow the implementation in [sk-zk/streetlevel](https://github.com/sk-zk/streetlevel) (for Look Around)
 - The CesiumJS version is drawn with [CesiumJS](https://cesium.com/platform/cesiumjs/), and place search uses [OpenStreetMap's Nominatim](https://nominatim.openstreetmap.org/)
+- The WebGPU viewer's clouds are a WGSL port of the cloud shaders of [takram's three-geospatial](https://github.com/takram-design-engineering/three-geospatial) (MIT License, © 2024 Shota Matsuda) (`flyover/earth/gpu-clouds.js`; the noise includes Sébastien Hillaire's TileableVolumeNoise and GLM's Perlin noise, both MIT)
+- The roads for the night view's street lights are [OpenStreetMap](https://www.openstreetmap.org/copyright) data (© OpenStreetMap contributors, ODbL), taken from [OpenFreeMap](https://openfreemap.org/) vector tiles (in the [OpenMapTiles](https://www.openmaptiles.org/) schema). The night view also shows this credit on screen
+- Per-place brightness for the night view comes from NASA's [Black Marble](https://www.earthdata.nasa.gov/data/projects/black-marble) (2016, VIIRS) via [GIBS](https://www.earthdata.nasa.gov/engage/open-data-services-software/earthdata-developer-portal/gibs-api) map tiles (no registration needed; kept in `cache/blackmarble/`)
 
 ## Notes
 
-- Fetched data (`cache/`, `out/`) is Apple's copyrighted material. It is kept out of the repository (`.gitignore`). Do not publish or redistribute it
+- Fetched data (`cache/`, `out/`) is Apple's copyrighted material (the roads in `cache/osm/` are OpenStreetMap data under the ODbL). It is kept out of the repository (`.gitignore`). Do not publish or redistribute it
 - Apple's servers can change without notice, which may break this tool
 - The server only accepts connections from your own PC (127.0.0.1–127.0.0.17)
 

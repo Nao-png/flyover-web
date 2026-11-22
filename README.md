@@ -73,8 +73,9 @@ Alt キーを押しながら動かすと、ゆっくり動きます。
 | 付けるもの | 変わること |
 |---|---|
 | `?season=sakura`、`?season=momiji` | 木が桜・紅葉になる（`--r3d` のとき） |
-| `?light=morning`、`evening`、`cloudy`、`night` | 写真の影を取り除き、朝・夕方・曇り・夜の光にする（`--r3d` のとき） |
+| `?light=morning`、`evening`、`cloudy`、`night` | 写真の影を取り除き、朝・夕方・曇り・夜の光にする（`--r3d` のとき）。`night` は WebGPU 版で窓に明かりがつく（`?windows=0.3` などで明かりの数、`?bloom=0` で光のにじみなし、`?time=2` などで時刻（0〜24 時、既定 21 時）、`?traffic=0` で車の光を止める） |
 | `?sun=200,10` | 太陽を好きな方位・高さ（[°]）にする。光の色と強さは大気から求める（`--r3d` のとき） |
+| `?clouds=0.4` | 空の雲の量（0〜1、既定 0.3。WebGPU 版。[takram の three-geospatial](https://github.com/takram-design-engineering/three-geospatial) の雲を移したもの。地面に雲の影が落ち、霧と光芒もかかる）。`?clouds=0` で雲の仕組みごとなし。画面の雲のボタン（C キー）で出す・消すを切り替えられる |
 | `?look=apple`、`?look=google` | 色合い（G キーと同じ） |
 
 ## 書き出し
@@ -109,10 +110,13 @@ C3M の読み取りは、元の Go 版と**ビット単位で一致**するこ�
 - [retroplasma/flyover-reverse-engineering](https://github.com/retroplasma/flyover-reverse-engineering)（Go、2021 年にアーカイブ）の解析と実装を Python に移し、2026 年の Apple のサーバーに合わせて直しました
 - 認証の手順は [sk-zk/streetlevel](https://github.com/sk-zk/streetlevel)（Look Around 用）の実装を参考にしました
 - CesiumJS 版の表示には [CesiumJS](https://cesium.com/platform/cesiumjs/) を、地名の検索には [OpenStreetMap の Nominatim](https://nominatim.openstreetmap.org/) を使っています
+- WebGPU 版の雲は、[takram の three-geospatial](https://github.com/takram-design-engineering/three-geospatial)（MIT ライセンス、© 2024 Shota Matsuda）の雲のシェーダーを WGSL に移したものです（`flyover/earth/gpu-clouds.js`。ノイズは Sébastien Hillaire の TileableVolumeNoise と GLM の Perlin ノイズ（どちらも MIT）を含みます）
+- 夜景の街灯の道路は [OpenStreetMap](https://www.openstreetmap.org/copyright) のデータ（© OpenStreetMap contributors、ODbL）を、[OpenFreeMap](https://openfreemap.org/) のベクタータイル（[OpenMapTiles](https://www.openmaptiles.org/) の形）から取っています。夜景のときは画面にも表記します
+- 夜景の場所ごとの明るさは、NASA の [Black Marble](https://www.earthdata.nasa.gov/data/projects/black-marble)（2016 年、VIIRS）を [GIBS](https://www.earthdata.nasa.gov/engage/open-data-services-software/earthdata-developer-portal/gibs-api) の地図タイルから取っています（登録は要りません。`cache/blackmarble/` に置きます）
 
 ## 注意
 
-- 取得したデータ（`cache/`、`out/`）は Apple の著作物です。リポジトリには入らないようにしてあります（`.gitignore`）。公開や再配布はしないでください
+- 取得したデータ（`cache/`、`out/`）は Apple の著作物です（`cache/osm/` の道路は OpenStreetMap のデータで、ODbL に従います）。リポジトリには入らないようにしてあります（`.gitignore`）。公開や再配布はしないでください
 - Apple のサーバーの仕様は予告なく変わります。変わると動かなくなることがあります
 - サーバーは自分の PC の中（127.0.0.1〜127.0.0.17）からの接続だけを受け付けます
 
