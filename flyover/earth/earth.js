@@ -746,7 +746,7 @@ const LIGHTS = {
   morning: { sun: [100, 18], sunColor: [1.25, 1.05, 0.8], sky: [0.42, 0.5, 0.66] },
   evening: { sun: [255, 9], sunColor: [1.5, 0.78, 0.4], sky: [0.34, 0.3, 0.45] },
   cloudy: { sun: null, sky: [0.92, 0.95, 1.0] },
-  night: { sun: null, sky: [0.07, 0.09, 0.17] },
+  night: { sun: null, sky: [0.014, 0.017, 0.034] },
   check: { check: true, sun: null, sky: [1, 1, 1] },   // 撮ったときの日なた（白）・日かげ（黒）をそのまま見る（確かめ用）
 };
 // ?sun=方位,高さ（[°]）で、好きな太陽の光にする（光の色と強さは大気から。大気のない間は朝の値）

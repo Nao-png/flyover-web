@@ -48,8 +48,10 @@ def _jpeg_pot(material, quality):
     return out.getvalue()
 
 
-def _shade_jpeg(shade, quality=85):
-    """日の当たり方の画像（HEIF の灰色）を、縦横を 1 つ下の 2 のべき乗に縮めた灰色の JPEG に。"""
+def _shade_jpeg(shade, quality=85, gloss=None):
+    """日の当たり方の画像（HEIF の灰色）を、縦横を 1 つ下の 2 のべき乗に縮めた灰色の JPEG に。gloss（ガラスの
+    地図。HEIF の灰色）があれば、赤に日の当たり方、緑にガラスの地図を入れた色の JPEG にする（色の間でにじまない
+    よう、色を間引かない 4:4:4 で）。"""
     from PIL import Image
     from pillow_heif import register_heif_opener
 
@@ -59,7 +61,11 @@ def _shade_jpeg(shade, quality=85):
     if size != img.size:
         img = img.resize(size, Image.BICUBIC)
     out = io.BytesIO()
-    img.save(out, "JPEG", quality=quality)
+    if gloss is None:
+        img.save(out, "JPEG", quality=quality)
+    else:
+        g = Image.open(io.BytesIO(gloss)).convert("L").resize(size, Image.BICUBIC)
+        Image.merge("RGB", (img, g, Image.new("L", size, 0))).save(out, "JPEG", quality=quality, subsampling=0)
     return out.getvalue()
 
 
@@ -101,7 +107,7 @@ def heif_hevc(heic):
         return None
 
 
-def tile_glb(c3ms, quality=85, hevc=False):
+def tile_glb(c3ms, quality=85, hevc=False, night=False):
     """c3ms: 同じタイルの C3M（高さ区分ごと）の並び。三角形がなければ None。
 
     hevc なら、新しい Flyover の画像（HEIC）は JPEG にせず、HEVC のままビューアに渡す（ビューアが
@@ -112,7 +118,10 @@ def tile_glb(c3ms, quality=85, hevc=False):
     R3D の日の当たり方の画像（Material.shade）は、灰色の JPEG にして材質の occlusionTexture に入れる。
     スプラットの日の当たり方（Splats.params の 4 番目、0〜63 の 0.05 刻み）は、不透明度（16 ビット）の
     下位 6 ビットに入れる（不透明度は 65535 分の 63 しか変わらない）。どちらもビューアが光の当たり方を
-    変えるときに使う（flyover/earth/earth.js の ?light=）。"""
+    変えるときに使う（flyover/earth/earth.js の ?light=）。
+
+    night なら、日の当たり方の画像の緑に、ガラスの地図（Material.gloss。窓の位置）も入れる（夜景の窓の明かり用。
+    flyover/earth/gpu-render.js の ?light=night）。"""
     parts = []   # (ECEF の頂点, UV, 三角形, (C3M の番号, 材質の番号))
     splats = []  # (ECEF の頂点 (3N, 3), RGBA (N, 4), 日の当たり方 (N,) 0〜63)
     for ci, c in enumerate(c3ms):
@@ -177,7 +186,8 @@ def tile_glb(c3ms, quality=85, hevc=False):
                   else None)              # くり返して貼る画像は JPEG にする（標本の取り方で wrap を指定する）
             shade = None
             if getattr(m, "shade", None) and not m.repeat:
-                images.append({"bufferView": view(_shade_jpeg(m.shade)), "mimeType": "image/jpeg"})
+                gloss = getattr(m, "gloss", None) if night else None
+                images.append({"bufferView": view(_shade_jpeg(m.shade, gloss=gloss)), "mimeType": "image/jpeg"})
                 shade = {"occlusionTexture": {"index": len(images) - 1}}
             if hv:
                 config, data, w, h = hv
