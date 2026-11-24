@@ -77,6 +77,7 @@ Hold Alt while moving to move slowly.
 | `?sun=200,10` | Puts the sun at any azimuth and height (degrees). The light's color and strength come from the atmosphere (with `--r3d`) |
 | `?clouds=0.4` | Cloud amount in the sky (0–1, default 0.3; WebGPU viewer; ported from the clouds of [takram's three-geospatial](https://github.com/takram-design-engineering/three-geospatial); clouds cast shadows on the ground, with haze and light shafts). `?clouds=0` removes the cloud system. The cloud button (C key) shows or hides them |
 | `?look=apple`, `?look=google` | The look (same as the G key) |
+| `?raw=1` | Shows the Flyover tiles as received from Apple, decoded in the browser instead of converted to glb on the server (WebGPU viewer; needs a browser that decodes HEVC on the GPU). The new Flyover with `--r3d`, otherwise the old one. `?c3m=1` always shows the old Flyover. Not available with `?light=` (falls back to normal loading) |
 
 ## Export
 
@@ -124,7 +125,7 @@ C3M reading has been checked to **match the original Go version bit for bit** on
 
 The parts written for this project are under the [MIT License](LICENSE). The following parts are based on code from retroplasma/flyover-reverse-engineering, which has no license, and are not covered by the MIT License (this project has no right to grant one):
 
-- `flyover/c3m.py`, `flyover/edgebreaker.py`, `flyover/huffman.py` (ports of the Go code)
+- `flyover/c3m.py`, `flyover/edgebreaker.py`, `flyover/huffman.py` (ports of the Go code), `flyover/earth/c3m.js` (a further port of them to JavaScript)
 - `flyover/_fast.py` (a copy of the heavy parts of the two above)
 - In `flyover/client.py`, reading the manifest (`_varint`, `_fields`, `Manifest`) and authentication (`TOKEN_P1`, `Client.auth`)
 

@@ -77,6 +77,7 @@ Alt キーを押しながら動かすと、ゆっくり動きます。
 | `?sun=200,10` | 太陽を好きな方位・高さ（[°]）にする。光の色と強さは大気から求める（`--r3d` のとき） |
 | `?clouds=0.4` | 空の雲の量（0〜1、既定 0.3。WebGPU 版。[takram の three-geospatial](https://github.com/takram-design-engineering/three-geospatial) の雲を移したもの。地面に雲の影が落ち、霧と光芒もかかる）。`?clouds=0` で雲の仕組みごとなし。画面の雲のボタン（C キー）で出す・消すを切り替えられる |
 | `?look=apple`、`?look=google` | 色合い（G キーと同じ） |
+| `?raw=1` | Flyover のタイルを、サーバーで glb にせず、Apple から受け取ったままブラウザで読み解いて見る（WebGPU 版。HEVC を GPU で展開できるブラウザのみ）。`--r3d` なら新しい Flyover、そうでなければ古い Flyover。`?c3m=1` はいつも古い Flyover。`?light=` のときは使えない（ふだんの読み込みになる） |
 
 ## 書き出し
 
@@ -124,7 +125,7 @@ C3M の読み取りは、元の Go 版と**ビット単位で一致**するこ�
 
 自分で書いた部分は [MIT ライセンス](LICENSE) です。ただし、ライセンスの表記がない retroplasma/flyover-reverse-engineering のコードを元にした次の部分は、MIT の対象外です（こちらに配布を許す権利がないため）。
 
-- `flyover/c3m.py`、`flyover/edgebreaker.py`、`flyover/huffman.py`（Go のコードの移植）
+- `flyover/c3m.py`、`flyover/edgebreaker.py`、`flyover/huffman.py`（Go のコードの移植）、`flyover/earth/c3m.js`（それをさらに JavaScript に移したもの）
 - `flyover/_fast.py`（上の 2 つの重い部分を書き写したもの）
 - `flyover/client.py` のうち、マニフェストの読み取り（`_varint`、`_fields`、`Manifest`）と認証（`TOKEN_P1`、`Client.auth`）
 

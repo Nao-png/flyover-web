@@ -91,6 +91,10 @@ Satellite imagery is style 7, and terrain is style 17 (zoom 7 and 11 worldwide, 
 - **Stutter while loading**: GPU commands for photos are sent once per frame, and up to 8 ground tiles and 4 Flyover models are put on the GPU per frame. HEVC is decoded one at a time (decoding several at once clogged the GPU side and froze the screen for around 100 ms). `queue.writeBuffer`, `writeTexture` and `copyExternalImageToTexture` can wait for tens of ms to over 100 ms per call while drawing, so they are not used for large data
 - **Drawing**: While the camera moves, MSAA is 1x and the view is drawn at 0.75 of the width and height (56% of the pixels) and stretched to the screen. 0.15 s after it stops, the view is redrawn at full size with 4x MSAA (the cost follows the pixel count closely: at 1600×1000 while moving, a frame took 27 → 25 ms in daytime and 40 → 33 ms in the night view).
 - **Haze table**: The distant haze (`aerialAt`) used to be computed per vertex, and with millions of vertices it cost about 17 ms of GPU time (compared with `?look=apple`). Now a compute shader works out the haze once per frame for 32×32 view directions and 32 distances from the camera (30,000 points; distances up to the visible horizon + 200 km, evenly spaced in the square root), and vertices look it up (GPU time while moving at 1600×1000: 45 → 34 ms). It is not used when the camera is above 30 km (from outside the atmosphere the haze changes abruptly where rays enter it and the table shows bands; few vertices are drawn from high up). Tree splats are blended with Weighted Blended OIT (McGuire and Bavoil 2013), as in the CesiumJS version
+- **Reading tiles in the browser (`?raw=1`, `?c3m=1`)**: The server (`/api/r3d/<z>/<x>/<y>.bin`, `/api/c3m/<z>/<x>/<y>.bin`) only passes on the R3D or C3M of each height slab as received from Apple, and browser workers (`earth/c3m.js`, `earth/r3d.js`, JavaScript ports of the Python readers) expand the meshes and splats. They build the same layout as a glb in memory, so from there it takes the same path as a glb (seasonal colors included). Tiles without R3D, or with any slab that can't be read, use C3M (as the server does). The images (HEIC holding one HEVC frame) are decoded on the GPU. R3D's sun-exposure and glass maps are monochrome (4:0:0) HEVC, which Chrome's WebCodecs doesn't accept (`hvc1.4…` is unsupported), so `?light=` falls back to the normal glb
+  - Speed (on the same 40 files): C3M mesh expansion runs at about the same speed as the Python version with numba (3–4 ms per file). The server's glb build (about 27 ms per height slab, mostly turning HEIC into JPEG) goes away; the browser spends about 3 ms per slab plus the HEVC decode on the GPU. For R3D, reading takes 12 ms (7 ms in Python with numba) and building the glb layout 15 ms in total (the server's glb build also takes 15 ms)
+  - The glb content matches the server's (positions, UVs, triangles, splat colors and capture time compared). Only the splat order can swap two splats of almost the same height (the dot product rounds differently from numpy)
+  -  Apple's responses have no `Access-Control-Allow-Origin` and the URLs need an auth string, so the browser cannot fetch from Apple directly (a relay is still needed)
 
 URL options to compare with the earlier ways: `?reuse=0` (choose every frame), `?hevcframe=0` (receive HEVC as ImageBitmap), `?bc=0` (no compression), `?imgdec=0` (copy JPEG through ImageBitmap), `?batch=0` (send commands one texture at a time), `?hevcw=3` (decode 3 HEVC at once), `?msaa=1`, `?scale=1` (do not shrink while moving), `?lodpx=520` (size at which tiles are refined).
 
@@ -214,6 +218,7 @@ For the 9×9 tiles around Higashi Chaya (about 280 m square, 88 tiles, 150,000 t
 | `flyover/earth/index.html`, `earth.js` | The CesiumJS viewer |
 | `flyover/earth/gpu.html`, `gpu-*.js` | The WebGPU viewer |
 | `flyover/earth/hevc.js` | HEVC decoding (a worker used by both viewers) |
+| `flyover/earth/c3m.js`, `r3d.js` | The browser versions of the C3M and R3D readers (workers for `?raw=1` in the WebGPU viewer) |
 | `flyover/earth/gpu-bloom.js` | The glow (bloom) of the WebGPU viewer's night view |
 | `flyover/earth/gpu-clouds.js` | The WebGPU viewer's clouds (a WGSL port of takram's three-geospatial clouds) |
 | `flyover/earth/sunlight.js` | The sunlight and sky light for `?light=`, from the atmosphere tables (used by both viewers) |
@@ -234,3 +239,10 @@ python scripts/compare_go.py ../flyover-reverse-engineering/dump-json.exe cache/
 ```
 
 The patch also makes the Go version itself work against today's servers (`go run ./cmd/export-obj 36.5722 136.6680 20 4 4`).
+
+The browser readers (`flyover/earth/c3m.js`, `r3d.js`) have also been checked to match the Python versions bit for bit (3,909 tiles from `cache/c3m/` and 1,416 from `cache/r3d/`; for R3D also splats, images and capture time). They run under Node.js for the comparison:
+
+```bash
+python scripts/check_c3m_js.py            # every 40th file in cache/c3m/ (change with --every)
+python scripts/check_c3m_js.py --r3d      # cache/r3d/
+```

@@ -454,7 +454,7 @@ $('credits').textContent = CREDITS;
 let mouse = null, mouseMoved = false, shownRender = -1, shownVer = -1, cursorAt = 0, movedAt = 0, cursorRough = false;
 const STILL_MS = 300;
 function capturedAtCenter() {
-  if (!cfg.r3d || GE.mode2D) return '';
+  if (!cfg.r3d || GE.mode2D || GE.rawMode === 'c3m') return '';     // 時刻は新しい Flyover のもの（?c3m=1 の古い Flyover には出さない）
   const p = GE.pickTerrain(...center());
   if (!p) return '';
   const [la, lo] = geodetic(p).map(v => v / RAD);

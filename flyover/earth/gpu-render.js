@@ -1791,10 +1791,57 @@ const FLY = { min: cfg.minZoom, max: cfg.maxZoom };
 const SHOW_PX = 175 / devicePixelRatio;
 const FLY_REFINE_PX = (Number(params.get('lodpx')) || 520) / devicePixelRatio;   // CSS px（?lodpx= で変えられる）
 const FLY_ACTIVE = 48, KEEP_MS = 5000, MAX_MODELS = 150, UPLOADS_PER_FRAME = 4;
+// ?raw=1: Flyover のタイルを、サーバーで glb にせず、Apple から受け取ったまま（/api/r3d/、/api/c3m/）受け取って、
+// ブラウザの作業用のスレッド（c3m.js と r3d.js）で読み解く。--r3d のサーバーなら新しい Flyover（R3D。ないタイルと
+// 読めないタイルは古い Flyover）、そうでなければ古い Flyover（C3M）。?c3m=1 はいつも古い Flyover。画像は HEVC のまま
+// GPU で展開する。HEVC を GPU で展開できないときと、?light= のときはふだんの glb（R3D の日の当たり方とガラスの地図は
+// 白黒の HEVC で、ブラウザでは展開できない）
+const RAW_WANT = params.get('c3m') === '1' ? 'c3m' : params.get('raw') === '1' ? (cfg.r3d ? 'r3d' : 'c3m') : null;
 // HEVC のまま受け取って GPU の専用回路で展開する（できないときと ?hevc=0 のときは JPEG）
-let hevc = cfg.r3d && typeof VideoDecoder !== 'undefined' && params.get('hevc') !== '0'
+let hevc = (cfg.r3d || RAW_WANT) && typeof VideoDecoder !== 'undefined' && params.get('hevc') !== '0'
   && (await VideoDecoder.isConfigSupported({ codec: 'hvc1.3.E.L120.B0', hardwareAcceleration: 'prefer-hardware' })
     .catch(() => ({}))).supported === true;
+const RAW = RAW_WANT && hevc && !light ? RAW_WANT : null;
+if (RAW_WANT && !RAW) console.warn(light ? '?light= では R3D の日の当たり方の画像が要るので、ふだんの glb で読み込む'
+  : 'HEVC を GPU で展開できないので、ふだんの glb で読み込む');
+const C3M_WORKERS = RAW ? Array.from({ length: 2 }, () => ({ worker: new Worker('c3m.js'), jobs: new Map() })) : [];
+let c3mId = 0;
+for (const w of C3M_WORKERS) {
+  w.worker.onmessage = ({ data }) => {
+    const job = w.jobs.get(data.id);
+    w.jobs.delete(data.id);
+    for (const m of data.warnings || []) console.warn(job.kind.toUpperCase(), job.key, m);
+    if (data.error) job.reject(new Error(data.error)); else job.resolve(data);
+  };
+  // スレッドごと落ちたら、待っているものを全部失敗にする（読み込み中のまま残らないよう）。スレッドは作り直す
+  w.worker.onerror = e => {
+    for (const job of w.jobs.values()) job.reject(new Error('c3m.js: ' + (e.message || 'エラー')));
+    w.jobs.clear();
+    w.worker.terminate();
+    const onmessage = w.worker.onmessage, onerror = w.worker.onerror;
+    w.worker = new Worker('c3m.js');
+    Object.assign(w.worker, { onmessage, onerror });
+  };
+}
+const rawDecode = (key, kind, raw) => new Promise((resolve, reject) => {
+  const w = C3M_WORKERS.reduce((a, b) => (b.jobs.size < a.jobs.size ? b : a));
+  const id = ++c3mId;
+  w.jobs.set(id, { key, kind, resolve, reject });
+  w.worker.postMessage({ id, raw, kind }, [raw]);
+});
+// そのまま受け取って読み解いたタイルの glb（Uint8Array）。データがなければ null。R3D がないか読めなければ C3M にする
+async function rawTile(t, signal) {
+  for (const kind of RAW === 'r3d' ? ['r3d', 'c3m'] : ['c3m']) {
+    const r = await fetch(`${hostBase(t.x + t.y + 1)}/api/${kind}/${t.z}/${t.x}/${t.y}.bin`, { signal });
+    if (r.status === 204) continue;
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await rawDecode(t.key, kind, await r.arrayBuffer());
+    if (signal.aborted) throw new DOMException('要らなくなった', 'AbortError');
+    if (d.fallback) continue;
+    return d.empty ? null : d.glb;
+  }
+  return null;
+}
 // 展開は 1 つずつ（同時にいくつも展開すると GPU の側が詰まり、画面が 100 ms 単位で止まる。読み込みも遅くなる）。
 // ?hevcw= で数を変えられる
 const HEVC_WORKERS = Number(params.get('hevcw')) || 1;
@@ -1924,10 +1971,16 @@ async function flyLoad(t) {
   const areasP = NIGHT ? fetch(`${hostBase(t.x + t.y + 2)}/api/areas/${t.z}/${t.x}/${t.y}.png?v=2`, { signal: ac.signal })
     .then(r => r.ok ? r.arrayBuffer() : null).then(b => b && decodeImage(new Uint8Array(b), 'image/png', false, true)).catch(() => null) : null;
   try {
-    const r = await fetch(`${hostBase(t.x + t.y + 1)}/api/flyover/${t.z}/${t.x}/${t.y}.glb${useHevc ? '?hevc=1' : '?hevc=0'}${NIGHT ? '&night=1' : ''}`, { signal: ac.signal });
-    if (r.status === 204) { t.state = 'empty'; return; }
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const buf = new Uint8Array(await r.arrayBuffer());
+    let buf;
+    if (RAW) {                 // glb と同じ並びを、作業用のスレッドがメモリの上で作る
+      buf = await rawTile(t, ac.signal);
+      if (!buf) { t.state = 'empty'; return; }
+    } else {
+      const r = await fetch(`${hostBase(t.x + t.y + 1)}/api/flyover/${t.z}/${t.x}/${t.y}.glb${useHevc ? '?hevc=1' : '?hevc=0'}${NIGHT ? '&night=1' : ''}`, { signal: ac.signal });
+      if (r.status === 204) { t.state = 'empty'; return; }
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      buf = new Uint8Array(await r.arrayBuffer());
+    }
     let { json: g, bin } = glbParts(buf);
     const view = i => { const v = g.bufferViews[i]; return bin.subarray(v.byteOffset || 0, (v.byteOffset || 0) + v.byteLength); };
     t.captured = g.asset.extras && g.asset.extras.captured;
@@ -1938,6 +1991,7 @@ async function flyLoad(t) {
       try {
         frames = await hevcDecode(t, hv.map(h => ({ config: view(h.config).slice(), data: view(h.data).slice() })));
       } catch (e) {
+        if (e.name !== 'AbortError' && RAW) throw e;       // そのまま読むときは JPEG にできない
         if (e.name !== 'AbortError') { hevc = false; console.warn('HEVC を展開できないので、JPEG にする', e); }
         t.state = 'none';
         return;
@@ -2616,7 +2670,7 @@ function tick(now) {
 
 Object.assign(GE, {
   cfg, cam, setView, fovy, geoid, heightAt, pickTerrain, pickAsync, canvas, rayAt,
-  lastPick: () => lastPick, capturedOf, capturedKnown, z20Key, shot,
+  lastPick: () => lastPick, capturedOf, capturedKnown, z20Key, shot, rawMode: RAW,
   redraw: () => { dirty = true; }, rendered: () => rendered,
   cloudsAvailable: CN, clouds: () => cloudsOn,
   setClouds: on => { cloudsOn = on; try { localStorage.setItem('clouds', on ? '1' : '0'); } catch (e) { /* */ } dirty = true; },
