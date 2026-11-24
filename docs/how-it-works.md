@@ -91,6 +91,10 @@
 - **読み込み中のカクつき**: 写真まわりの GPU の命令は 1 フレームに 1 回まとめて送り、地面のタイルは 1 フレームに 8 枚、Flyover は 4 個まで載せる。HEVC は 1 つずつ展開する（同時に展開すると GPU の側が詰まり、画面が 100 ms 単位で止まった）。`queue.writeBuffer`・`writeTexture`・`copyExternalImageToTexture` は、描いている最中だと 1 回で数十〜100 ms 以上待たされることがあるので、大きなデータには使わない
 - **描き方**: 動かしている間は MSAA を 1 倍にし、縦横 0.75 倍（画素は 56%）で描いて画面に引き伸ばす。止まって 0.15 秒たったら、元の大きさの 4 倍で描き直す（描く画素の数がほぼそのまま効く。1600×1000 で動かしている間、昼は 1 コマ 27 ms → 25 ms、夜景は 40 ms → 33 ms）。
 - **かすみの表**: 遠くのかすみ（`aerialAt`）は、前は頂点ごとに計算していて、頂点が数百万あるので GPU で 17 ms ほどかかっていた（`?look=apple` と比べて）。画面の向き 32×32 とカメラからの距離 32 段の点のかすみを、毎フレーム計算シェーダーで 1 回だけ求めておき（3 万点。距離は見える地平線 + 200 km までを平方根で等分）、頂点はそれを引く（1600×1000 で動かしている間の GPU 45 ms → 34 ms）。カメラが 30 km より高いときは使わない（大気の外からだと大気に入る所でかすみが急に変わり、表では縞になる。高い所から見るときは頂点が少ない）。木のスプラットは CesiumJS 版と同じく Weighted Blended OIT（McGuire と Bavoil 2013）で重ねる
+- **タイルをブラウザで読む（`?raw=1`、`?c3m=1`）**: サーバー（`/api/r3d/<z>/<x>/<y>.bin`、`/api/c3m/<z>/<x>/<y>.bin`）は高さ区分ごとの R3D・C3M を Apple から受け取ったまま並べて渡すだけで、メッシュとスプラットの展開はブラウザの作業用のスレッド（`earth/c3m.js`、`earth/r3d.js`。Python 版をさらに JavaScript に移したもの）でする。描くための形は glb と同じ並びをメモリの上で作るので、そのあとは glb と同じ道を通る（季節の色も同じ）。R3D がないタイルと、1 区分でも読めないタイルは C3M にする（サーバーと同じ）。画像（HEVC の 1 コマの HEIC）は GPU で展開する。R3D の日の当たり方とガラスの地図は白黒（4:0:0）の HEVC で、Chrome の WebCodecs が受け付けない（`hvc1.4…` は対応していない）ので、`?light=` のときはふだんの glb にする
+  - 速さ（同じ 40 枚で比べた）: C3M のメッシュの展開は numba を使った Python 版とほぼ同じ（1 枚 3〜4 ms）。サーバーでの glb 作り（高さ区分 1 つ 27 ms ほど。ほとんどが HEIC を JPEG にする時間）がなくなる代わりに、ブラウザでは区分 1 つ 3 ms ほどと、HEVC の GPU での展開がかかる。R3D は、読むのが 12 ms（Python と numba は 7 ms）、glb の並びまでで 15 ms（サーバーの glb 作りも 15 ms）
+  - glb の中身はサーバーのものと同じ（位置・UV・三角形・スプラットの色・撮った時刻を比べた）。スプラットの順だけ、高さがほぼ同じ 2 つが入れ替わることがある（numpy と内積の丸めが違う）
+  - Apple の応答には `Access-Control-Allow-Origin` がなく、URL には認証の文字列も要るので、ブラウザから Apple に直接は取りに行けない（中継は要る）
 
 URL に付けると前のやり方と比べられる: `?reuse=0`（毎フレーム選ぶ）、`?hevcframe=0`（HEVC を ImageBitmap で受け取る）、`?bc=0`（圧縮しない）、`?imgdec=0`（JPEG を ImageBitmap で写す）、`?batch=0`（命令を 1 枚ずつ送る）、`?hevcw=3`（HEVC を 3 つ同時に展開）、`?msaa=1`、`?scale=1`（動かしている間も縮めない）、`?lodpx=520`（細かくする大きさ）。
 
@@ -214,6 +218,7 @@ python scripts/serve.py out                                          # http://lo
 | `flyover/earth/index.html`、`earth.js` | CesiumJS 版のビューア |
 | `flyover/earth/gpu.html`、`gpu-*.js` | WebGPU 版のビューア |
 | `flyover/earth/hevc.js` | HEVC の展開（両方のビューアで使うワーカー） |
+| `flyover/earth/c3m.js`、`r3d.js` | C3M・R3D の読み取りのブラウザ版（WebGPU 版の `?raw=1` で使うワーカー） |
 | `flyover/earth/gpu-bloom.js` | WebGPU 版の光のにじみ（夜景） |
 | `flyover/earth/gpu-clouds.js` | WebGPU 版の空の雲（takram の three-geospatial の雲を WGSL に移したもの） |
 | `flyover/earth/sunlight.js` | `?light=` の太陽の光と空の光を大気の表から求める（両方のビューアで使う） |
@@ -234,3 +239,10 @@ python scripts/compare_go.py ../flyover-reverse-engineering/dump-json.exe cache/
 ```
 
 パッチは Go 版そのものも今のサーバーで動くようにする（`go run ./cmd/export-obj 36.5722 136.6680 20 4 4`）。
+
+ブラウザ版の読み取り（`flyover/earth/c3m.js`、`r3d.js`）も、Python 版とビット単位で一致することを確かめている（`cache/c3m/` の 3,909 タイル、`cache/r3d/` の 1,416 タイル。R3D はスプラット・画像・撮った時刻も）。Node.js で動かして比べる:
+
+```bash
+python scripts/check_c3m_js.py            # cache/c3m/ の 40 枚に 1 枚（--every で変える）
+python scripts/check_c3m_js.py --r3d      # cache/r3d/
+```

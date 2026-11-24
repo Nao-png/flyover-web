@@ -3,6 +3,10 @@
 
     /api/config                        Flyover のある地域（ズーム 9 のタイル）など
     /api/flyover/<z>/<x>/<y>.glb       Flyover のタイル（高さ区分をまとめた glb）。ないときは 204
+    /api/c3m/<z>/<x>/<y>.bin           古い Flyover のタイルの C3M を、Apple から受け取ったまま（高さ区分を
+                                       まとめたもの。形は Earth.c3m_raw を見よ）。ないときは 204
+    /api/r3d/<z>/<x>/<y>.bin           新しい Flyover のタイルの R3D を、同じく受け取ったまま（--r3d のとき）。
+                                       ないときは 204（ビューアは /api/c3m/ を使う）
     /api/sat/<z>/<x>/<y>.jpg           衛星画像
     /api/terrain/<level>/<x>/<y>.bin   地形（地理座標のタイル、65 x 65 の float32 の楕円体高と、
                                        これより細かいタイルがないとき 1 になる float32 が 1 つ）
@@ -140,6 +144,15 @@ def _warm_wait():
     time.sleep(0.5)      # 1 つのプロセスに片寄らず、全部のプロセスが立ち上がるように
 
 
+def _pack_raw(raws):
+    """高さ区分ごとのバイト列（None はデータなし）を 1 つに: uint32 の区分の数 n、uint32 の長さ x n（0 はデータなし）、
+    つなげたバイト列（little endian）。どれにもデータがなければ None。"""
+    if not any(raws):
+        return None
+    raws = [b or b"" for b in raws]
+    return struct.pack(f"<{1 + len(raws)}I", len(raws), *map(len, raws)) + b"".join(raws)
+
+
 class Earth:
     def __init__(self, cache_dir="cache", jobs=192, r3d=False):
         self.client = Client(cache_dir=cache_dir)
@@ -215,6 +228,28 @@ class Earth:
             os.replace(tmp, path)
             return out
 
+    def c3m_raw(self, z, x, y):
+        """古い Flyover のタイルの、高さ区分ごとの C3M を、読み解かずにそのまま並べたもの（ビューアが
+        earth/c3m.js で読み解く）。形: uint32 の区分の数 n、uint32 の長さ x n（0 はデータなし）、C3M の
+        バイト列（つなげたもの）。どれも little endian。データがなければ None。"""
+        if not MIN_ZOOM <= z <= MAX_ZOOM:
+            return None
+        region = self.client.region_of_tile(x, y, z, strict=True)
+        if region is None:
+            return None
+        raws = fetch_heights(z, lambda hs: self.map(lambda k: self.client.tile_cached(region, x, y, z, k), hs))
+        return _pack_raw(raws)
+
+    def r3d_raw(self, z, x, y):
+        """新しい Flyover（R3D）のタイルの、高さ区分ごとの R3D を、そのまま並べたもの（形は c3m_raw と同じ。ビューアが
+        earth/r3d.js で読み解く）。データがないか、--r3d でなければ None。"""
+        if not self.r3d or not R3D_MIN_ZOOM <= z <= MAX_ZOOM:
+            return None
+        region = self.client.region_of_tile(x, y, z, strict=True)
+        if region is None:
+            return None
+        return _pack_raw(fetch_r3d(self.client, region, x, y, z, lambda hs, get: self.map(get, hs)))
+
     def night_image(self, kind, z, x, y):
         """夜景の画像（flyover/osm.py。OpenStreetMap のデータを OpenFreeMap から、夜の明るさを NASA の Black Marble から取る）。
         roads: Flyover のタイルの範囲の道路（アルファは夜の明るさ。cache/osm/night3/）、areas: 水面・商業地・線路・競技場
@@ -266,6 +301,8 @@ class Earth:
 
 ROUTES = [
     (re.compile(r"/api/flyover/(\d+)/(\d+)/(\d+)\.glb"), "flyover"),
+    (re.compile(r"/api/c3m/(\d+)/(\d+)/(\d+)\.bin"), "c3m"),
+    (re.compile(r"/api/r3d/(\d+)/(\d+)/(\d+)\.bin"), "r3d"),
     (re.compile(r"/api/sat/(\d+)/(\d+)/(\d+)\.jpg"), "sat"),
     (re.compile(r"/api/terrain/(\d+)/(\d+)/(\d+)\.bin"), "terrain"),
     (re.compile(r"/api/captured/(\d+)/(\d+)/(\d+)"), "captured"),
@@ -330,6 +367,9 @@ def handler(earth):
                     out = earth.flyover(a, b, c, timing, query.get("hevc") == ["1"], query.get("night") == ["1"])
                     # ブラウザには覚えさせない（作り方を変えたときに古いものが残らないよう）。cache/ にはある
                     return self.send(200 if out else 204, out or b"", "model/gltf-binary", cache=False, timing=timing)
+                if kind in ("c3m", "r3d"):
+                    out = (earth.c3m_raw if kind == "c3m" else earth.r3d_raw)(a, b, c)
+                    return self.send(200 if out else 204, out or b"", cache=False)
                 if kind == "captured":
                     return self.send(200, json.dumps(earth.captured(a, b, c)).encode(), "application/json", cache=False)
                 if kind == "sat":
