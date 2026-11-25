@@ -7,8 +7,10 @@
 // 今のビューアと同じワーカー（atmosphere.js。WebGL2 で計算する）のものを使う。大気の値は atmosphere.js の header と同じ
 // （長さは km、3 波長 680・550・440 nm、散乱のテクスチャはミー散乱を 1 つにまとめた形）
 'use strict';
-// haze: 空気中のちり（ミー散乱）の量の倍率。返すのは WGSL（画面の値 fr と、atmoApply などの関数）
-function gpuAtmoWGSL(haze) {
+// haze: 空気中のちり（ミー散乱）の量の倍率。返すのは WGSL（画面の値 fr と、atmoApply などの関数）。
+// lobes: 画面で使うちりの散乱の形（Cornette-Shanks の重みつきの和 [[重み, g], ...]。なければ元の g = MIE_G の 1 つ）。前もっての
+// 計算（多重散乱）は元の g のまま
+function gpuAtmoWGSL(haze, lobes = null) {
   const um = [0.68, 0.55, 0.44];
   const rayleigh = um.map(l => 1.24062e-6 * Math.pow(l, -4) * 1000);
   const mie = 5.328e-3 / 1200 * 1000 * haze;
@@ -101,6 +103,10 @@ fn miePhase(g: f32, nu: f32) -> f32 {
   let k = 3.0 / (8.0 * PI) * (1.0 - g * g) / (2.0 + g * g);
   return k * (1.0 + nu * nu) / pow(1.0 + g * g - 2.0 * g * nu, 1.5);
 }
+// 空とかすみのちりの散乱の形
+fn hazePhase(nu: f32) -> f32 {
+  return ${lobes ? lobes.map(([w, g]) => `${w.toFixed(4)} * miePhase(${g.toFixed(4)}, nu)`).join(' + ') : 'miePhase(MIE_G, nu)'};
+}
 struct Rad { l: vec3f, t: vec3f };
 fn skyRadiance(cam: vec3f, v: vec3f, sun: vec3f) -> Rad {
   var c = cam;
@@ -116,7 +122,7 @@ fn skyRadiance(cam: vec3f, v: vec3f, sun: vec3f) -> Rad {
   var t = vec3f(0.0);
   if (!g) { t = transToTop(r, mu); }
   let cs = combined(r, mu, mus, nu, g);
-  return Rad(cs.rgb * rayleighPhase(nu) + extrapolatedMie(cs) * miePhase(MIE_G, nu), t);
+  return Rad(cs.rgb * rayleighPhase(nu) + extrapolatedMie(cs) * hazePhase(nu), t);
 }
 // 光芒（Bruneton の論文の式 18）: 視線の上の、雲の影に入った長さ sl [km] の分の空気の光を除く（影はカメラの近くに
 // まとまっているとみなし、カメラから sl 先の点からの空気の光に、そこまでの透けぐあいを掛ける）
@@ -137,7 +143,7 @@ fn skyRadianceSL(cam: vec3f, v: vec3f, sun: vec3f, sl: f32) -> Rad {
   let rp = clamp(sqrt(sl * sl + 2.0 * r * mu * sl + r * r), BOTTOM, TOP);
   let cs = combined(rp, (r * mu + sl) / rp, (r * mus + sl * nu) / rp, nu, g);
   let st = transmittance(r, mu, sl, g);
-  return Rad((cs.rgb * rayleighPhase(nu) + extrapolatedMie(cs) * miePhase(MIE_G, nu)) * st, t);
+  return Rad((cs.rgb * rayleighPhase(nu) + extrapolatedMie(cs) * hazePhase(nu)) * st, t);
 }
 fn skyToPoint(cam: vec3f, point: vec3f, sun: vec3f) -> Rad { return skyToPointSL(cam, point, sun, 0.0); }
 // 光芒つき（Bruneton の論文の式 17）: 視線の上の、雲の影に入った長さ sl [km] の分の空気の光を除く
@@ -162,7 +168,7 @@ fn skyToPointSL(cam: vec3f, point: vec3f, sun: vec3f, sl: f32) -> Rad {
   let s = cs.rgb - st * csp.rgb;
   let m = extrapolatedMie(cs) - st * extrapolatedMie(csp);
   let mie = extrapolatedMie(vec4f(s, m.r)) * smoothstep(0.0, 0.01, mus);
-  return Rad(s * rayleighPhase(nu) + mie * miePhase(MIE_G, nu), t);
+  return Rad(s * rayleighPhase(nu) + mie * hazePhase(nu), t);
 }
 `;
 }

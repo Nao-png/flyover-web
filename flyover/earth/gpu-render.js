@@ -87,6 +87,10 @@ const ATMO = {
   balance: bal.length === 3 && bal.every(Number.isFinite) ? bal : [1, 1, 1.1],
   aerial: num('aerial', 0.4), aerialNear: num('aerialNear', 2.5), aerialKm: Math.max(num('aerialKm', 100), 0.01), grey: num('grey', 0),
 };
+// 空とかすみのちりの散乱の形（gpu-atmo.js の hazePhase）: 前に強く鋭い山（g 0.92）と広い山（0.6）と、少しの後ろ向き（-0.25）の
+// Cornette-Shanks の和。太陽のまわりのもやが明るく光り、横から見たもやは少し明るくなる。元は g 0.8 の 1 つ（?phase=0）
+// （Ray（kuwacom）の霞の調べで知った、散乱の形を重ねる考え方。重みと g はこのビューアで選んだ）
+const HAZE_LOBES = params.get('phase') === '0' ? null : [[0.5, 0.92], [0.4, 0.6], [0.1, -0.25]];
 // ?light=: 撮ったときの日なたと日かげを取り除いて、別の光で描き直す（今のビューアと同じ値と式）
 const LIGHTS = {
   morning: { sun: [100, 18], sunColor: [1.25, 1.05, 0.8], sky: [0.42, 0.5, 0.66] },
@@ -104,6 +108,9 @@ const lightNow = light ? { sunColor: light.sunColor || [0, 0, 0], sky: light.sky
 // ?light=night では窓に明かりをともす。サーバーに night=1 で頼むと、日の当たり方の画像の緑にガラスの地図（項目 8。
 // ガラス張りの壁や窓が黒い）が入る（flyover/glb.py）。?windows=0 で明かりなし、?windows=0.5 などで明かりの数の割合（既定 0.7）
 const NIGHT = light === LIGHTS.night && params.get('windows') !== '0';
+// ?light= の朝・夕方・曇り・?sun= の水面を、空を映す面として描き直す（waterLin）。水面は OpenStreetMap の水面の画像
+// （/api/areas/、夜景と同じもの）で見分ける。夜は夜景の水面の描き方があるので使わない。?water=0 で使わない
+const WATER = !!light && !light.check && light !== LIGHTS.night && params.get('water') !== '0';
 const WINDOWS_ON = Math.min(Math.max(num('windows', 0.22), 0), 1);
 // 夜景の時刻（?time=21 など。0〜24 時、既定 21 時）。時刻ごとの明かりの量（0〜1）の表を、1 時間ごとの値から線形に補う。
 // office: オフィスの窓（白い LED）、home: 住まいとホテルの窓（暖かい白）、shop: 店先とネオン、traffic: 車、stadium: 競技場
@@ -122,8 +129,20 @@ const TRAFFIC = params.get('traffic') !== '0';
 const BLOOM = params.get('bloom') === null ? light === LIGHTS.night : params.get('bloom') !== '0';
 const BLOOM_STRENGTH = num('bloom', 0) > 0 && params.get('bloom') !== '1' ? num('bloom', 1) : 1;
 const BLOOM_THRESHOLD = light === LIGHTS.night ? 0.4 : 0.2;   // 夜は低いと街の明かり全体がにじんで白くぼやける
+// 画面の上の光芒（gpu-godrays.js）。昼と朝夕に使う（夜は使わない）。?godrays=0 で使わない、?godrays=1 などで強さ（既定 0.35。
+// 太陽が隠れていないときは光芒が太陽のまわりの光のかたまりになり、大気の太陽のまわりの明るさと重なるので控えめに）
+const GODRAYS = light === LIGHTS.night ? 0 : Math.max(num('godrays', 0.35), 0);
 // 空の太陽: ?light= に太陽があればそれ、夜は沈んだ太陽、ほかは昼の太陽（方位と高さ [°]）
 const atmoSun = light && light.sun ? light.sun : params.get('light') === 'night' ? [0, -20] : [150, 45];
+// 混合層のもやの上端 [km]（atmosphere.js の mixTop）。太陽の高さで、5° 以下の 0.4 km から 35° 以上の 1.5 km まで（朝夕は対流が
+// 弱く低い）。夜 0.3 km、曇り 1 km。?hazeTop=0.8 などで決める、?hazeTop=0 で元の指数の形
+const MIX_TOP = (() => {
+  const v = num('hazeTop', NaN);
+  if (Number.isFinite(v)) return v > 0 ? v : null;
+  if (light === LIGHTS.night) return 0.3;
+  if (light === LIGHTS.cloudy) return 1.0;
+  return 0.4 + 1.1 * clamp((atmoSun[1] - 5) / 30, 0, 1);
+})();
 const SEASONS = { sakura: 0, momiji: 1, check: 2 };
 const season = cfg.r3d ? SEASONS[params.get('season')] : undefined;
 const SAMPLES = Number(params.get('msaa')) === 1 ? 1 : 4;
@@ -201,7 +220,7 @@ fn nightGrade(c: vec3f) -> vec3f {
   return c * mix(vec3f(1.0), vec3f(0.8, 0.95, 1.3), k) + vec3f(0.0, 0.006, 0.014) * k;
 }
 `;
-const ATMO_BASE_WGSL = (NIGHT_GRADE_WGSL + TOWER_WGSL + gpuAtmoWGSL(ATMO.haze) + gpuLookWGSL(ATMO.aces) + CLOUD.fns)
+const ATMO_BASE_WGSL = (NIGHT_GRADE_WGSL + TOWER_WGSL + gpuAtmoWGSL(ATMO.haze, HAZE_LOBES) + gpuLookWGSL(ATMO.aces) + CLOUD.fns)
   .replace('var L = rr.l;', 'var L = rr.l;' + NIGHT_SKY_WGSL)
   .replace('  return Aer(t, S * fr.balance.w);', NIGHT ? '  return Aer(t, S * 0.2 * fr.balance.w);' : '  return Aer(t, S * fr.balance.w);')
   // 夜は、暗い所だけを紺色寄りに（色の仕上げ。明るさの曲線をかけたあとの値で、暗いほど強く。明かりの色は変えない）
@@ -296,6 +315,205 @@ fn yuv(y: f32, c0: vec2f) -> vec3f {
   return vec4f(atmoApplyLin(lin + glow + towerGlow(i.rel) * ${NIGHT_GAIN}, i.at, i.as_ + NIGHT_HAZE * (1.0 - i.at)), 1.0);` : ''}
   return vec4f(atmoApply(cloudShade(rgb, 1.0, cloudShadow(i.rel)), i.at, i.as_), 1.0);
 }`;
+// 水面（WATER のとき）。Apple の日の当たり方の画像は水面ではタイルの区画ごとにばらばらな灰色で、日かげを取り除くと
+// 6〜10 倍に明るい青緑になり、区画の継ぎはぎも見えた。水面は日かげを取り除かず（写真の水の色を水の中の色とみなし、
+// 今の空の光を当てる）、フレネルの式（水の屈折率 1.33、真上から見て 2%）の割合で、反射した向きの空（今の大気の
+// skyRadiance。空の描き方と同じ明るさ）と、太陽の照り返し（Beckmann の微小面）を足す。光の量で足してから明るさの曲線（tone）を
+// 通して、ほかの所と同じ線形の値で返す。雲は映さない（雲の影は照り返しにだけ掛ける）。
+// 水面とみなすのは、水面の画像の赤が 0.3〜0.7 以上で、ほぼ水平（上向きとの内積 0.9〜0.97 以上）の所。道路の画像の高架（緑）の
+// 範囲は、海抜（タイルの中心のジオイド高 u.rc.w から）が 6〜10 m より高ければ橋の上として外し、低ければ橋の下の水面として、
+// 空と太陽を橋がさえぎる分だけ暗くする（高架の範囲をまるごと外すと、橋の下の水面が前の明るい青緑のままになった。
+// 地面からの高さでは見分けられない: 海のタイルは水面の下に垂れた縁があって地面の高さ（lowGround）が低く出る）。
+// 海抜で見るので、海抜 6 m より高い川や湖では、橋の下も橋の上と同じく外れる。
+//
+// 水面の波の画像（WATER のとき）。Tessendorf（2001）の FFT の海面を、1 枚の周期のタイル（WAVE_N² 画素、時間も WAVE_T コマで
+// ループ）に起動時に計算する。画素は波の高さの傾き（x・y の 2 つ。rg8snorm に ±WAVE_ENC で詰める）。シェーダーはこのタイルを
+// 大きさを変えて何段も重ねる（waterWaves）。
+// - スペクトル: Phillips の k^-4 の尾（傾きの分散が波数の対数あたり一定）に、対数の波数で cos² の窓（中心 WAVE_BAND、
+//   半幅は段の倍率 WAVE_RATIO）を掛けた帯。隣の段（波数が WAVE_RATIO 倍）の窓と足すとちょうど 1 になるので、段を重ねると
+//   切れ目のないスペクトルになる。風速で決まる大きい波の頭打ちは、段ごとの重みでシェーダーが付ける
+// - 向きの広がり: Longuet-Higgins の cos^2s(θ/2)（s = WAVE_SPREAD。風下の +x に偏り、風上へはほとんど進まない）
+// - 時間: 深い水の分散関係 ω = √(gk)。ループさせるため、タイルの中の波数 n の波の回転数を、n = 3 で 4 回になる
+//   √n の比例で整数に丸める（n = 3 で WAVE_CYC 回。段の大きさ L ではループが WAVE_CYC x 2π / √(2π g 3 / L) 秒。帯の上の端の
+//   波数 25 でも 1 回りに 11 コマほどあり、コマの間を補間してもなめらか）
+// - 傾きの分散（2 軸の和）が 1 になるよう正規化する
+// Ray（kuwacom）の水面の調べで知った作り方を、論文の式から書いたもの（コードは使っていない）
+const WAVE_N = 128, WAVE_T = 64, WAVE_RATIO = 2.9, WAVE_BAND = 8.5, WAVE_SPREAD = 12, WAVE_ENC = 3, WAVE_CYC = 2;
+function fft1(re, im, inv) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const a = (inv ? 2 : -2) * Math.PI / len, wr = Math.cos(a), wi = Math.sin(a);
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let k = 0; k < len / 2; k++) {
+        const ur = re[i + k], ui = im[i + k];
+        const vr = re[i + k + len / 2] * cr - im[i + k + len / 2] * ci, vi = re[i + k + len / 2] * ci + im[i + k + len / 2] * cr;
+        re[i + k] = ur + vr; im[i + k] = ui + vi;
+        re[i + k + len / 2] = ur - vr; im[i + k + len / 2] = ui - vi;
+        [cr, ci] = [cr * wr - ci * wi, cr * wi + ci * wr];
+      }
+    }
+  }
+}
+function makeWaveData() {
+  const N = WAVE_N, T = WAVE_T;
+  let seed = 20261125;
+  const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const gauss = () => Math.sqrt(-2 * Math.log(rnd() + 1e-12)) * Math.cos(2 * Math.PI * rnd());
+  const fq = i => (i < N / 2 ? i : i - N);
+  // 初めの振幅 h0(k)（複素数）
+  const h0r = new Float64Array(N * N), h0i = new Float64Array(N * N), cyc = new Float64Array(N * N);
+  for (let z = 0; z < N; z++) for (let x = 0; x < N; x++) {
+    const nx = fq(x), nz = fq(z), nk = Math.hypot(nx, nz);
+    if (nk < 0.5) continue;
+    const t = Math.log(nk / WAVE_BAND) / Math.log(WAVE_RATIO);
+    const win = Math.abs(t) < 1 ? Math.cos(0.5 * Math.PI * t) ** 2 : 0;
+    const spread = Math.abs(Math.cos(0.5 * Math.atan2(nz, nx))) ** (2 * WAVE_SPREAD);
+    const amp = Math.sqrt(nk ** -4 * win * spread / 2);
+    h0r[z * N + x] = gauss() * amp; h0i[z * N + x] = gauss() * amp;
+    cyc[z * N + x] = Math.max(1, Math.round(WAVE_CYC / Math.sqrt(3) * Math.sqrt(nk)));   // ループの間に回る回数
+  }
+  const sx = new Float32Array(N * N * T), sy = new Float32Array(N * N * T);
+  const re = new Float64Array(N * N), im = new Float64Array(N * N), rr = new Float64Array(N), ri = new Float64Array(N);
+  for (let f = 0; f < T; f++) {
+    // h(k, t) = h0(k) e^{iωt} + conj(h0(-k)) e^{-iωt}。傾き i kx h と i kz h を、実部と虚部に入れて 1 回で逆変換する
+    for (let z = 0; z < N; z++) for (let x = 0; x < N; x++) {
+      const i = z * N + x, j = ((N - z) % N) * N + (N - x) % N;
+      const ph = 2 * Math.PI * cyc[i] * f / T, c = Math.cos(ph), s = Math.sin(ph);
+      const hr = h0r[i] * c - h0i[i] * s + h0r[j] * c - h0i[j] * s;
+      const hi = h0r[i] * s + h0i[i] * c - (h0r[j] * s + h0i[j] * c);
+      const kx = 2 * Math.PI * fq(x), kz = 2 * Math.PI * fq(z);
+      // i kx h + i (i kz h) = (-kx hi - kz hr) + i (kx hr - kz hi)
+      re[i] = -kx * hi - kz * hr; im[i] = kx * hr - kz * hi;
+    }
+    for (let z = 0; z < N; z++) {
+      rr.set(re.subarray(z * N, z * N + N)); ri.set(im.subarray(z * N, z * N + N));
+      fft1(rr, ri, true);
+      re.set(rr, z * N); im.set(ri, z * N);
+    }
+    for (let x = 0; x < N; x++) {
+      for (let z = 0; z < N; z++) { rr[z] = re[z * N + x]; ri[z] = im[z * N + x]; }
+      fft1(rr, ri, true);
+      for (let z = 0; z < N; z++) { re[z * N + x] = rr[z]; im[z * N + x] = ri[z]; }
+    }
+    sx.set(re, f * N * N); sy.set(im, f * N * N);
+  }
+  let v = 0;
+  for (let i = 0; i < sx.length; i++) v += sx[i] * sx[i] + sy[i] * sy[i];
+  const k = 1 / Math.sqrt(v / sx.length);
+  const out = new Int8Array(N * N * T * 2);
+  for (let i = 0; i < sx.length; i++) {
+    out[2 * i] = Math.max(-127, Math.min(127, Math.round(sx[i] * k / WAVE_ENC * 127)));
+    out[2 * i + 1] = Math.max(-127, Math.min(127, Math.round(sy[i] * k / WAVE_ENC * 127)));
+  }
+  return out;
+}
+// 波: 上の波の画像を 5 段（タイルの大きさ 192 m から 2.9 倍ずつ小さく。帯の中心の波長 22.6・7.8・2.7・0.93・0.32 m）重ねて、
+// 面を傾ける。どの段も同じ画像なので、段ごとに向き（風の向き 40° のまわり）と位置をずらし、2 つ隔てた段が同じ形で入れ子に
+// ならないよう間の 2 段を鏡に映す。段ごとの強さは、風速（?wind=、既定 3 m/s）の Pierson-Moskowitz の風浪のスペクトルで、
+// 波長がピーク（2π / (0.77 g / 風速²)、3 m/s で 7.5 m）より長い段を exp(-1.25 (波長 / ピーク)²) で弱め、全体の傾きの分散を
+// Cox と Munk の値（0.003 + 0.00512 x 風速。3 m/s で 0.018）からさざ波の粗さ（WATER_ROUGH²）を引いた分にする（?waves= で倍率、
+// 0 で平ら）。画面で帯の中心の波長が 3.8〜1.5 画素になる段は消し、消した分の傾きの分散を Beckmann の粗さに足す（遠くで
+// ちらつかず、遠くほど照り返しが広がって光の道になる）。波は地球の 20 km ごとの区切りの点（fr.ngrid）からの位置で決める。
+// 色合いが google のときは波が動く（fr.ngrid.w が時刻。描き続けるので重い）。?waveAnim=1 で apple でも動かし、?waveAnim=0 で
+// 止める。前の値のノイズを重ねたものは、波の形がなく、もやもやした凹凸に見えた
+const WAVE_WIND = num('wind', 3), WAVE_ANIM_PARAM = params.get('waveAnim');
+const waveAnim = () => WATER && (WAVE_ANIM_PARAM === '1' || (WAVE_ANIM_PARAM !== '0' && look === 'google'));
+const WAVE_LAYERS = (() => {
+  const amp = num('waves', 1), rough = num('waterRough', 0.06);
+  if (amp <= 0) return [];                // ?waves=0: 波なし
+  const lp = 2 * Math.PI / (0.77 * 9.81 / (WAVE_WIND * WAVE_WIND));
+  const turn = [0, 0.37, -0.29, 0.52, -0.44], off = [[0, 0], [0.31, 0.66], [0.18, 0.24], [0.77, 0.45], [0.57, 0.12]], mirror = [1, 1, -1, -1, 1];
+  const ls = turn.map((t, o) => {
+    const L = 192 / WAVE_RATIO ** o, lc = L / WAVE_BAND, a = 40 * RAD + t;
+    return { L, lc, dx: Math.cos(a), dy: Math.sin(a), m: mirror[o], ox: off[o][0], oy: off[o][1], v: Math.exp(-1.25 * (lc / lp) ** 2),
+             period: WAVE_CYC * 2 * Math.PI / Math.sqrt(2 * Math.PI * 9.81 * 3 / L) };
+  });
+  const total = Math.max(0.003 + 0.00512 * WAVE_WIND - rough * rough, 0.001) * amp * amp;
+  const sum = ls.reduce((a, l) => a + l.v, 0);
+  for (const l of ls) l.v *= total / sum;
+  return ls;
+})();
+const WATER_WGSL = /* wgsl */`
+const WATER_ROUGH = ${num('waterRough', 0.06).toFixed(4)};
+const WAVE_VAR = ${WAVE_LAYERS.reduce((a, l) => a + l.v, 0).toExponential(5)};   // 波の傾きの分散の合計
+// 波の傾き（東・北）と、画面で細かすぎて消した段の傾きの分散。q: 東・北の位置 [m]、fp: 1 画素の大きさ [m]、t: 時刻 [秒]
+fn waterWaves(q: vec2f, fp: f32, t: f32) -> vec3f {
+  var g = vec2f(0.0);
+  var lost = 0.0;
+  var f = 0.0;
+  var s = vec2f(0.0);
+${WAVE_LAYERS.map(l => {
+    const d = `vec2f(${f4(l.dx)}, ${f4(l.dy)})`, e = `vec2f(${f4(-l.dy)}, ${f4(l.dx)})`;
+    return `  f = smoothstep(1.5, 3.8, ${f4(l.lc)} / fp);
+  s = textureSampleLevel(waveTex, waveSamp, vec3f(vec2f(dot(q, ${d}), ${l.m.toFixed(1)} * dot(q, ${e})) / ${f4(l.L)} + vec2f(${f4(l.ox)}, ${f4(l.oy)}), fract(t / ${f4(l.period)})), 0.0).rg * ${WAVE_ENC.toFixed(1)};
+  g += (${d} * s.x + ${e} * (${l.m.toFixed(1)} * s.y)) * (${Math.sqrt(l.v).toExponential(5)} * f);
+  lost += ${l.v.toExponential(5)} * (1.0 - f * f);`;
+  }).join('\n')}
+  return vec3f(g, lost);
+}
+// Beckmann の Smith の G1（Walter ら 2007 の有理式の近似）
+fn beckmannG1(c: f32, m2: f32) -> f32 {
+  let a = c / (sqrt(m2) * sqrt(max(1.0 - c * c, 1e-6)));
+  if (a >= 1.6) { return 1.0; }
+  return (3.535 * a + 2.181 * a * a) / (1.0 + 2.276 * a + 2.577 * a * a);
+}
+fn waterLin(land: vec3f, photo: vec3f, area: vec4f, road: vec4f, n: vec3f, rel: vec3f, local: vec3f, fp: f32, shadow: f32) -> vec3f {
+  let east = u.east.xyz;
+  let north = u.north.xyz;
+  let up = normalize(cross(east, north));
+  let sea = dot(local - u.off.xyz, up) - u.rc.w;
+  let bridge = smoothstep(0.2, 0.5, road.y);
+  let high = smoothstep(6.0, 10.0, sea);
+  // 水面の段差: 詳しさの違うタイルは水面の高さが少し違い、タイルの縁から水面の下へ垂れた縁（垂直の面）があるので、低い
+  // 所から見ると、その面が暗い帯や青緑の帯の段差に見えた。水面の画像の内側（0.6〜0.9 以上。岸壁の境はぼけて半分ほど）で、
+  // 海抜 -1〜-2 m より低い所は、垂直の面も水面として（上向きの面の向きで）描く（Apple の水面は東京湾で海抜 -3〜-5 m ほど）
+  let flatW = smoothstep(0.9, 0.97, dot(n, up));
+  let stepW = smoothstep(0.6, 0.9, area.x) * (1.0 - smoothstep(-2.0, -1.0, sea));
+  let w = smoothstep(0.3, 0.7, area.x) * max(flatW, stepW) * (1.0 - bridge * high);
+  if (w <= 0.0 || fr.cam0.w < 0.5) { return land; }   // 空があれば（色合いが apple でも空は描く）
+  let under = bridge * (1.0 - high);                   // 橋の下
+  // 波で傾けた面の向き
+  let pl = fr.ngrid.xyz + rel;
+  let wv = waterWaves(vec2f(dot(pl, east), dot(pl, north)), fp, fr.ngrid.w);
+  // 段差の垂直の面には波を付けない（波は水平の位置で決めるので、垂直の面では縦の縞になった）。その分は粗さに
+  let nw = normalize(up - (east * wv.x + north * wv.y) * flatW);
+  let m2 = WATER_ROUGH * WATER_ROUGH + wv.z + (1.0 - flatW) * WAVE_VAR;   // Beckmann の m² は傾きの分散（2 軸の和）
+  let v = normalize(rel);
+  let cosV = max(dot(-v, nw), 1e-3);
+  let F = 0.02 + 0.98 * pow(1.0 - cosV, 5.0);
+  var p = fr.cam0.xyz + rel / 1000.0;
+  p = normalize(p) * max(length(p), BOTTOM + 0.001);
+  let bal = fr.balance.rgb * fr.balance.w;
+  // 映る向き（波で地平線より下を向いたら、地平線のすぐ上にする）
+  var r = reflect(v, nw);
+  r = normalize(r + up * max(0.01 - dot(r, up), 0.0));
+  let sky = skyRadiance(p, r, fr.sun.xyz).l * bal * (1.0 - 0.85 * under);
+  // 太陽の照り返し（Beckmann の微小面。D・G（Smith、Walter らの近似）・F / (4 cos 視線)。光は太陽の放射照度 x 大気の
+  // 透けぐあい）。傾きの分布をガウスにする（GGX は裾が長く、遠くの水面一面に薄い光が残る。Ray の調べで知った選び方）
+  let s = fr.sun.xyz;
+  let ns = dot(up, s);
+  let h = normalize(s - v);
+  let nh = max(dot(nw, h), 1e-4);
+  let t2 = (1.0 - nh * nh) / (nh * nh);
+  let D = exp(-t2 / m2) / (PI * m2 * nh * nh * nh * nh);
+  let g1 = beckmannG1(cosV, m2);
+  let g2 = beckmannG1(max(dot(nw, s), 1e-3), m2);
+  let Fh = 0.02 + 0.98 * pow(1.0 - clamp(dot(h, -v), 0.0, 1.0), 5.0);
+  let sunT = transToTop(length(p), dot(normalize(p), s));
+  // 太陽のない光（曇り）と橋の下では照り返しなし
+  let glint = SOLAR * sunT * D * g1 * g2 * Fh / (4.0 * cosV) * smoothstep(0.0, 0.03, ns) * shadow * bal * (1.0 - under)
+            * ${light && light.sun ? '1.0' : '0.0'};
+  // 水の中の色: 写真の水の色に、日かげを取り除かずに今の光を当てたもの（橋の下は空の光がさえぎられる分だけ暗く）
+  let body = untone(lightLin(photo, 1.0, up)) * (1.0 - 0.5 * under);
+  return mix(land, tone(body * (1.0 - F) + sky * F + glint), w);
+}`;
 // 光の描き直し（今のビューアの lightApply を WGSL に）。c は sRGB、lit は撮ったときの日なた（1）・日かげ（0）、
 // n は面の向き（地球の座標の軸。画面上の位置の変化から求める）
 const LIGHT_WGSL = !light ? 'fn lightRgb(c: vec3f, lit: f32, n: vec3f) -> vec3f { return c; }' : (() => {
@@ -323,6 +541,7 @@ fn lightLin(c: vec3f, lit0: f32, n: vec3f) -> vec3f {
   return albedo * L;
 }
 fn lightRgb(c: vec3f, lit: f32, n: vec3f) -> vec3f { return linearToSrgb(lightLin(c, lit, n)); }
+${WATER ? WATER_WGSL : 'fn waterLin(land: vec3f, photo: vec3f, area: vec4f, road: vec4f, n: vec3f, rel: vec3f, local: vec3f, fp: f32, shadow: f32) -> vec3f { return land; }'}
 // メッシュの日の当たり方。植物の色の所（青より赤や緑が強い。緑の木も紅葉も）は、日かげとみなさない。新しい Flyover の
 // 森の地面のメッシュは、上から撮った木の写真で、木の陰で多くが日かげになっている。そのまま日かげを取り除くと 6〜10 倍に
 // 明るくなり、その上に描く木（スプラット）より明るく浮いて見えた。日かげの壁や道は空の光で青っぽく写るので、0 のまま
@@ -479,6 +698,11 @@ fn nightAdd(c: vec3f, photo: vec3f, gloss: f32, n: vec3f, rel: vec3f, hg: f32, r
   // - なければ見当で: 地面の高さ（5 m まで）の平らな所で、草木（緑）と水面（なめらか＝ガラスの地図が黒く、写真が青か
   //   緑がかっている所。舗装もなめらかに出ることがあるが、灰色）を除く
   let flatK = smoothstep(0.85, 0.95, upness) * smoothstep(0.2, 0.6, fp);
+  // 橋の下の水面（OpenStreetMap の水面で、高架の範囲にあり、海抜（タイルの中心のジオイド高 u.rc.w から）が 6〜10 m より
+  // 低い所）。高架の道路の画像は上から見た範囲なので、そのままだと橋の下の水面に街灯と車の光が乗った
+  let tUp = normalize(cross(u.east.xyz, u.north.xyz));
+  let seaH = dot(local - u.off.xyz, tUp) - u.rc.w;
+  let underBridge = smoothstep(0.3, 0.7, area.x) * smoothstep(0.2, 0.5, road.y) * (1.0 - smoothstep(6.0, 10.0, seaH));
   var streetK: f32;
   var bright = 1.0;
   var major = 0.5;
@@ -487,7 +711,7 @@ fn nightAdd(c: vec3f, photo: vec3f, gloss: f32, n: vec3f, rel: vec3f, hg: f32, r
     bright = 0.5 + road.x;
     major = smoothstep(0.78, 0.86, road.x);
     // 街の明るさが低い所（郊外、山あい）の街灯は減らす。細い道はほとんど消し、幹線は半分ほど残す
-    streetK *= mix(mix(0.05, 0.45, major), 1.0, city);
+    streetK *= mix(mix(0.05, 0.45, major), 1.0, city) * (1.0 - underBridge);
   } else {
     let tint = max(photo.g, photo.b) - photo.r;
     let water = (1.0 - smoothstep(0.15, 0.35, gloss)) * smoothstep(0.0, 0.04, tint);
@@ -517,7 +741,7 @@ fn nightAdd(c: vec3f, photo: vec3f, gloss: f32, n: vec3f, rel: vec3f, hg: f32, r
   // 照らし、900 m² に 1 つほどの明るい点を置く。上空から見ると橙の塊になる
   let yard = select(0.0, road.z, hasRoad);
   let floodK = smoothstep(0.85, 0.95, upness) * smoothstep(0.2, 0.6, fp) * smoothstep(0.1, 0.4, yard)
-             * (1.0 - smoothstep(6.0 + 2.0 * fp, 10.0 + 3.0 * fp, hg));
+             * (1.0 - smoothstep(6.0 + 2.0 * fp, 10.0 + 3.0 * fp, hg)) * (1.0 - underBridge);
   if (floodK > 0.0) {
     add += (sparkles(vec2f(e, nn), vec2f(dot(dpx, east), dot(dpx, north)), vec2f(dot(dpy, east), dot(dpy, north)), 900.0, 0.15, true, 0.8) + vec3f(1.0, 0.52, 0.18) * 0.07) * floodK * yard;
   }
@@ -531,7 +755,7 @@ fn nightAdd(c: vec3f, photo: vec3f, gloss: f32, n: vec3f, rel: vec3f, hg: f32, r
   let ab = areaLod(local, 35.0);
   let spillCol = vec3f(1.0, 0.72, 0.42) * (rb.x * 0.02 + ab.y * 0.06 * ${f4(NIGHT_T.shop)}) + vec3f(1.0, 0.55, 0.2) * rb.z * 0.08
                + vec3f(0.85, 0.9, 1.0) * (smoothstep(0.6, 1.0, ab.z) * 0.06 + smoothstep(0.5, 0.9, ab.w) * 0.12 * ${f4(NIGHT_T.stadium)});
-  add += pow(photo, vec3f(2.2)) * spillCol * exp(-max(hg, 0.0) / 10.0) * select(0.0, 1.0, hasRoad) * (1.0 - water) * 1.5;
+  add += pow(photo, vec3f(2.2)) * spillCol * exp(-max(hg, 0.0) / 10.0) * select(0.0, 1.0, hasRoad) * (1.0 - water) * (1.0 - underBridge) * 1.5;
   // ---- 水面に映る明かり: 岸の明かり（60 m ほどにぼかした道路と商業地）の、さざ波でちぎれた映り込み。水面を、カメラに
   // 向かう向きに長い 0.8 m x 5 m の区画に分け、区画ごとの乱数の 4 乗（まれに明るい）で明るさを決める（遠くでは平均）
   if (water > 0.0) {
@@ -566,7 +790,7 @@ fn nightAdd(c: vec3f, photo: vec3f, gloss: f32, n: vec3f, rel: vec3f, hg: f32, r
   // ---- 駅と線路（OpenStreetMap の線路。青が 0.35 で線路、0.55 で操車場、1 で駅のまわり）。高架の線路もあるので 18 m まで。
   // 線路沿いはまばらな白い明かり、駅のホームは白く明るく照らす
   let railK = smoothstep(0.85, 0.95, upness) * smoothstep(0.2, 0.6, fp) * smoothstep(0.25, 0.4, area.z)
-            * (1.0 - smoothstep(18.0 + 2.0 * fp, 25.0 + 3.0 * fp, hg)) * (1.0 - water);
+            * (1.0 - smoothstep(18.0 + 2.0 * fp, 25.0 + 3.0 * fp, hg)) * (1.0 - water) * (1.0 - underBridge);
   if (railK > 0.0) {
     let station = smoothstep(0.7, 0.95, area.z);
     add += (sparkles(vec2f(e, nn) + 3.0, jE, jN, mix(150.0, 40.0, station), mix(0.06, 0.3, station), true, 0.0)
@@ -706,7 +930,7 @@ fn seasonLin(lin: vec3f, color: vec4f, pw: vec3f) -> vec3f {
 }`;
 const FLY_WGSL = /* wgsl */`${ATMO_WGSL}
 // p: (1 刻みの長さ, 4 分の 1 の切り出し, タイルの幅 [m], 道路の画像があれば 1)。east, north: タイルの中心の東と北。off: 中心から見たタイルの地面の
-// 中心（切り出し用）。rc: 中心（カメラを原点に）。sun0: 撮ったときの太陽（東・北・上、w が 1 なら分かっている）
+// 中心（切り出し用）。rc: 中心（カメラを原点に）と、w にタイルの中心のジオイド高 [m]（水面の海抜用。WATER のときだけ）。sun0: 撮ったときの太陽（東・北・上、w が 1 なら分かっている）
 struct U { mvp: mat4x4f, p: vec4f, east: vec4f, north: vec4f, off: vec4f, rc: vec4f, sun0: vec4f };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var samp: sampler;
@@ -714,7 +938,9 @@ struct U { mvp: mat4x4f, p: vec4f, east: vec4f, north: vec4f, off: vec4f, rc: ve
 @group(0) @binding(3) var uvTex: texture_2d<f32>;    // HEVC の写真の縦横半分の色（r が Cb、g が Cr）
 @group(0) @binding(4) var shadeTex: texture_2d<f32>; // 撮ったときの日の当たり方（?light= のときだけ。ほかは白）。夜は緑がガラスの地図
 @group(0) @binding(5) var roadTex: texture_2d<f32>;  // 夜景: タイルの範囲を上から見た道路（赤: 道路、緑: 高架、青: 投光器の範囲、アルファ: 夜の明るさ。osm.py）
-@group(0) @binding(6) var areaTex: texture_2d<f32>;  // 夜景: 範囲（赤: 水面、緑: 商業地、青: 線路と駅、アルファ: 競技場。osm.py の areas）
+@group(0) @binding(6) var areaTex: texture_2d<f32>;
+@group(0) @binding(7) var waveTex: texture_3d<f32>;   // 水面の波の傾き（WATER のとき。makeWaveData）
+@group(0) @binding(8) var waveSamp: sampler;          // くり返して引く（時間の向きも）  // 夜景: 範囲（赤: 水面、緑: 商業地、青: 線路と駅、アルファ: 競技場。osm.py の areas）
 struct V { @builtin(position) pos: vec4f, @location(0) uv: vec2f, @location(1) local: vec3f, @location(2) color: vec4f,
            @location(3) at: vec3f, @location(4) as_: vec3f, @location(5) rel: vec3f, @location(6) world: vec3f };
 fn srgbToLinear(c: vec3f) -> vec3f { return select(pow((c + 0.055) / 1.055, vec3f(2.4)), c / 12.92, c <= vec3f(0.04045)); }
@@ -775,25 +1001,27 @@ fn normalOf(rel: vec3f) -> vec3f {
 }
 @fragment fn fsMesh(i: V) -> @location(0) vec4f {
   let n = normalOf(i.rel);
+  let fp = max(length(dpdx(i.rel)), length(dpdy(i.rel)));   // 1 画素の大きさ [m]（水面の波用）
   let base = textureSample(tex, samp, i.uv).rgb;
   let sh = textureSample(shadeTex, samp, i.uv);
-  let road = ${NIGHT ? 'roadAt(i.local)' : 'vec4f(0.0)'};
-  let area = ${NIGHT ? 'areaAt(i.local)' : 'vec4f(0.0)'};
+  let road = ${NIGHT || WATER ? 'roadAt(i.local)' : 'vec4f(0.0)'};
+  let area = ${NIGHT || WATER ? 'areaAt(i.local)' : 'vec4f(0.0)'};
   if (clipped(i.local)) { discard; }
-  ${light ? 'return vec4f(atmoApplyLin(nightAdd(lightLin(base, meshLit(base, sh.r), n) * cloudShadeLin(sh.r, cloudShadow(i.rel)), base, sh.g, n, i.rel, groundHeight(i.local), road, area, i.local, u.p.w > 0.5), i.at, i.as_ + NIGHT_HAZE * (1.0 - i.at)), 1.0);'
+  ${light ? 'return vec4f(atmoApplyLin(nightAdd(waterLin(lightLin(base, meshLit(base, sh.r), n) * cloudShadeLin(sh.r, cloudShadow(i.rel)), base, area, road, n, i.rel, i.local, fp, cloudShadow(i.rel)), base, sh.g, n, i.rel, groundHeight(i.local), road, area, i.local, u.p.w > 0.5), i.at, i.as_ + NIGHT_HAZE * (1.0 - i.at)), 1.0);'
           : 'return vec4f(atmoApply(cloudShade(base, sh.r, cloudShadow(i.rel)), i.at, i.as_), 1.0);'}
 }
 // HEVC の写真。BT.601 のフルレンジ（hevc.js を見よ）
 @fragment fn fsMeshYuv(i: V) -> @location(0) vec4f {
   let n = normalOf(i.rel);
+  let fp = max(length(dpdx(i.rel)), length(dpdy(i.rel)));
   let y = textureSample(tex, samp, i.uv).r;
   let c = textureSample(uvTex, samp, i.uv).rg - 128.0 / 255.0;
   let sh = textureSample(shadeTex, samp, i.uv);
-  let road = ${NIGHT ? 'roadAt(i.local)' : 'vec4f(0.0)'};
-  let area = ${NIGHT ? 'areaAt(i.local)' : 'vec4f(0.0)'};
+  let road = ${NIGHT || WATER ? 'roadAt(i.local)' : 'vec4f(0.0)'};
+  let area = ${NIGHT || WATER ? 'areaAt(i.local)' : 'vec4f(0.0)'};
   if (clipped(i.local)) { discard; }
   let rgb = clamp(vec3f(y + 1.402 * c.y, y - 0.344136 * c.x - 0.714136 * c.y, y + 1.772 * c.x), vec3f(0.0), vec3f(1.0));
-  ${light ? 'return vec4f(atmoApplyLin(nightAdd(lightLin(rgb, meshLit(rgb, sh.r), n) * cloudShadeLin(sh.r, cloudShadow(i.rel)), rgb, sh.g, n, i.rel, groundHeight(i.local), road, area, i.local, u.p.w > 0.5), i.at, i.as_ + NIGHT_HAZE * (1.0 - i.at)), 1.0);'
+  ${light ? 'return vec4f(atmoApplyLin(nightAdd(waterLin(lightLin(rgb, meshLit(rgb, sh.r), n) * cloudShadeLin(sh.r, cloudShadow(i.rel)), rgb, area, road, n, i.rel, i.local, fp, cloudShadow(i.rel)), rgb, sh.g, n, i.rel, groundHeight(i.local), road, area, i.local, u.p.w > 0.5), i.at, i.as_ + NIGHT_HAZE * (1.0 - i.at)), 1.0);'
           : 'return vec4f(atmoApply(cloudShade(rgb, sh.r, cloudShadow(i.rel)), i.at, i.as_), 1.0);'}
 }
 // スプラット: 頂点の色は線形の値。不透明度の下位 6 ビットが撮ったときの日の当たり方。
@@ -886,7 +1114,18 @@ const groundLayout = device.createBindGroupLayout({ entries: [uniformEntry,
   { binding: 4, visibility: FR, texture: {} }] });
 const flyLayout = device.createBindGroupLayout({ entries: [uniformEntry,
   { binding: 1, visibility: FR, sampler: {} }, { binding: 2, visibility: FR, texture: {} }, { binding: 3, visibility: FR, texture: {} },
-  { binding: 4, visibility: FR, texture: {} }, { binding: 5, visibility: FR, texture: {} }, { binding: 6, visibility: FR, texture: {} }] });
+  { binding: 4, visibility: FR, texture: {} }, { binding: 5, visibility: FR, texture: {} }, { binding: 6, visibility: FR, texture: {} },
+  { binding: 7, visibility: FR, texture: { viewDimension: '3d' } }, { binding: 8, visibility: FR, sampler: {} }] });
+// 水面の波の画像（WATER でなければ 1 画素の空のもの）
+const waveTex = (() => {
+  const [w, h, d] = WATER ? [WAVE_N, WAVE_N, WAVE_T] : [1, 1, 1];
+  const tex = device.createTexture({ size: [w, h, d], dimension: '3d', format: 'rg8snorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+  const data = WATER ? makeWaveData() : new Int8Array(2);
+  device.queue.writeTexture({ texture: tex }, data, { bytesPerRow: w * 2, rowsPerImage: h }, [w, h, d]);
+  return tex;
+})();
+const waveView = waveTex.createView();
+const waveSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'repeat', addressModeV: 'repeat', addressModeW: 'repeat' });
 const frameLayout = device.createBindGroupLayout({ entries: [
   { binding: 0, visibility: VF, buffer: { type: 'uniform' } },
   { binding: 1, visibility: VF, sampler: {} },
@@ -1472,7 +1711,7 @@ if (ATMOSPHERE && floatFilter) {
     groupMain = frameBind(frameMain); groupPick = frameBind(framePick); groupLut = lutFrameBind(); groupAer = aerFrameBind();
     atmoReady = true; dirty = true;
   };
-  worker.postMessage({ haze: ATMO.haze });
+  worker.postMessage({ haze: ATMO.haze, strat: num('strat', 1), mixTop: MIX_TOP });
 }
 const IDENTITY = new Float64Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
 // 画面ごとの値: カメラは真下の楕円体からの高さで大気の球（半径 6360 km）の上に置く（今のビューアと同じ）
@@ -1493,9 +1732,9 @@ function frameData(vp, pickM) {
   f.set([...cam.pos, 0], 48);
   if (lightNow) f.set([...lightNow.sunColor, light.sun ? Math.max(Math.sin(light.sun[1] * RAD), 0) : 0, ...lightNow.sky, light.check ? 0 : 1], 52);
   const grid = cam.pos.map(v => Math.round(v / 20000) * 20000);
-  // ngrid.w: 車の光を動かす時刻 [秒]（10 分で 1 周）
+  // ngrid.w: 車の光を動かす時刻 [秒]（10 分で 1 周）か、?waveAnim=1 の水面の波の時刻 [秒]（1 時間で 1 周）
   // nup.w: 雲を出すか（1 か 0。0 なら地面の雲の影もなし）
-  f.set([...sub(cam.pos, grid), NIGHT && TRAFFIC ? (performance.now() / 1000) % 600 : 0, ...norm(grid), CN && cloudsOn && cloudReady ? 1 : 0], 60);
+  f.set([...sub(cam.pos, grid), NIGHT && TRAFFIC ? (performance.now() / 1000) % 600 : waveAnim() ?(performance.now() / 1000) % 3600 : 0, ...norm(grid), CN && cloudsOn && cloudReady ? 1 : 0], 60);
   // 雲の影の地図の真ん中（カメラの位置を 1 km ごとに丸めた点）
   f.set([...sub(cam.pos, shadowAnchor()), 0], 68);
   return f;
@@ -1965,10 +2204,10 @@ async function flyLoad(t) {
   const useHevc = hevc;
   let frames = [], queued = false;
   // 夜景の道路の画像（OpenStreetMap。取れなければ、道路は写真と高さから見当をつける）
-  const roadsP = NIGHT ? fetch(`${hostBase(t.x + t.y + 1)}/api/roads/${t.z}/${t.x}/${t.y}.png?v=4`, { signal: ac.signal })
+  const roadsP = NIGHT || WATER ? fetch(`${hostBase(t.x + t.y + 1)}/api/roads/${t.z}/${t.x}/${t.y}.png?v=4`, { signal: ac.signal })
     .then(r => r.ok ? r.arrayBuffer() : null).then(b => b && decodeImage(new Uint8Array(b), 'image/png', false, true)).catch(() => null) : null;
   // 夜景の範囲の画像（水面・商業地・線路・競技場）
-  const areasP = NIGHT ? fetch(`${hostBase(t.x + t.y + 2)}/api/areas/${t.z}/${t.x}/${t.y}.png?v=2`, { signal: ac.signal })
+  const areasP = NIGHT || WATER ? fetch(`${hostBase(t.x + t.y + 2)}/api/areas/${t.z}/${t.x}/${t.y}.png?v=2`, { signal: ac.signal })
     .then(r => r.ok ? r.arrayBuffer() : null).then(b => b && decodeImage(new Uint8Array(b), 'image/png', false, true)).catch(() => null) : null;
   try {
     let buf;
@@ -2093,7 +2332,8 @@ function upload({ t, g, bin, frames, images, roads, areas }) {
       { binding: 0, resource: { buffer: uniformBuffer, size: 160 } }, { binding: 1, resource: samp },
       { binding: 2, resource: tex.createView() }, { binding: 3, resource: (yuv ? yuv.uv : white).createView() },
       { binding: 4, resource: (shade || whiteR).createView() }, { binding: 5, resource: (roadTex || noRoad).createView() },
-      { binding: 6, resource: (areaTex || noArea).createView() }] });
+      { binding: 6, resource: (areaTex || noArea).createView() },
+      { binding: 7, resource: waveView }, { binding: 8, resource: waveSampler }] });
     if (m.alphaMode === 'BLEND') prims.push({ splat: true, pos, uv, col: at(p.attributes.COLOR_0), count: pos.count, bind });
     else {
       const ix = at(p.indices);
@@ -2103,6 +2343,7 @@ function upload({ t, g, bin, frames, images, roads, areas }) {
   const mid = add(center, mul([(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2], step));
   flySphere.set(t.key, { c: mid, r: len(sub(hi, lo)) * step / 2 });
   t.model = { buf: gbuf, texs, prims, center, step, off: sub(t.ground, center), low: NIGHT ? lowGround(t, g, bin, center, step) : 0,
+    sea: WATER || NIGHT ? geoid(mercLat(t.y + 0.5, 2 ** t.z), (t.lonW + t.lonE) / 2) : 0,   // 水面の海抜用のジオイド高 [m]
     roads: !!roadTex };
   t.state = 'ready'; flyModels++;
   t.usedAt = performance.now();     // 載せたばかりのものを、まだ描いていないからと同じコマで捨てない
@@ -2281,7 +2522,7 @@ function prepare(W, H, cssH, force = false) {
   for (let i = 0; i < n; i++) { const o = sub(list[i].t.meshCenter, cam.pos), b = putMvp(i, o); uniformData.set(o, b + 16); uniformData.set(list[i].rect, b + 20); }
   for (let j = 0; j < nf; j++) {
     const { t, mask } = fly[j], md = t.model, o = sub(md.center, cam.pos), b = putMvp(n + j, o);
-    uniformData.set([md.step, mask, t.width, md.roads ? 1 : 0, ...t.east, 0, ...t.north, 0, ...md.off, md.low, ...o, 0, ...t.sun0], b + 16);
+    uniformData.set([md.step, mask, t.width, md.roads ? 1 : 0, ...t.east, 0, ...t.north, 0, ...md.off, md.low, ...o, md.sea, ...t.sun0], b + 16);
   }
   if (n + nf) device.queue.writeBuffer(uniformBuffer, 0, uniformData, 0, (n + nf) * U_STRIDE / 4);
   // pass に描く。pipes: パイプラインの組、group: 画面ごとの値、sky: 空、opaque: 地面と建物、splats: 木（重みつきでためる）
@@ -2336,6 +2577,22 @@ let msaaTex = null, depthTex = null, sceneTex = null, W = 0, H = 0;
 const MOVE_SCALE = Math.min(Math.max(num('scale', 0.75), 0.25), 1);
 let fastTex = null;        // 動かしている間に描くテクスチャ（resize で作る）
 const bloom = BLOOM ? makeBloom(device, format, light === LIGHTS.night) : null;
+const godrays = GODRAYS > 0 ? makeGodrays(device, format) : null;
+// 光芒の太陽: 画面の位置 [u, v] と強さ。太陽が画面の外へ出るほど（画面の端から縦横の半分ほどで 0）、地平線の下 3° より低いほど弱め、
+// カメラの後ろなら 0
+function godraySun(vp) {
+  if (!godrays || !atmoReady) return null;
+  const { east, north, up } = enu(cam.pos);
+  const [az, el] = atmoSun.map(d => d * RAD);
+  const d = add(add(mul(east, Math.sin(az) * Math.cos(el)), mul(north, Math.cos(az) * Math.cos(el))), mul(up, Math.sin(el)));
+  const c = [0, 1, 3].map(r => vp[r] * d[0] + vp[4 + r] * d[1] + vp[8 + r] * d[2]);
+  if (c[2] <= 1e-6) return null;
+  const x = c[0] / c[2], y = c[1] / c[2];
+  const out = Math.max(Math.abs(x), Math.abs(y)) - 1;
+  const ss = (a, b, t) => { const k = clamp((t - a) / (b - a), 0, 1); return k * k * (3 - 2 * k); };
+  const k = GODRAYS * (1 - ss(0, 1, out)) * ss(-3, 1, el / RAD);
+  return k > 0 ? [x * 0.5 + 0.5, 0.5 - y * 0.5, k] : null;
+}
 if (SAMPLES > 1 && !bloom) pipeFor(format, 'fs');   // 引き伸ばすパイプラインは先に作っておく（動かし始めのコマが重くならないよう）
 let oitMain = null;        // 木をためるテクスチャ（resize で作る）
 let lastCam = '', movedAt = -Infinity, stillTimer = 0;
@@ -2349,7 +2606,7 @@ function resize() {
   if (fastTex) fastTex.destroy();
   if (sceneTex) sceneTex.destroy();
   // にじみを足すときは、いったんこの画像に描いてから画面に重ねる
-  sceneTex = bloom ? device.createTexture({ size: [W, H], format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING }) : null;
+  sceneTex = bloom || godrays ? device.createTexture({ size: [W, H], format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING }) : null;
   fastTex = SAMPLES > 1 ? fastTextures(W, H) : null;
   msaaTex = SAMPLES > 1 ? device.createTexture({ size: [W, H], format, sampleCount: SAMPLES, usage: GPUTextureUsage.RENDER_ATTACHMENT }) : null;
   depthTex = device.createTexture({ size: [W, H], format: DEPTH, sampleCount: SAMPLES, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
@@ -2561,13 +2818,26 @@ function render() {
     // 縮めて描き、にじみを足しながら（にじみがなければそのまま）画面に引き伸ばす
     const f = fastTex, view = f.color.createView();
     drawScene(enc, frame, { pipes: pipesOne, color: view, depth: f.depth.createView(), oit: f.oit, ms: false, out: view, size: [f.w, f.h], depthTex: f.depth }, query && query.set);
-    if (bloom) bloom.apply(enc, f.color, screen, f.w, f.h, BLOOM_THRESHOLD, BLOOM_STRENGTH);
-    else blit(enc, pipeFor(format, 'fs'), view, screen);
+    // 光芒を足し（足した画面は光芒の側のテクスチャ）、にじみを足しながら（なければそのまま）画面に引き伸ばす
+    const sunR = godraySun(frame.vp);
+    const src = (godrays && godrays.apply(enc, f.color, f.depth, false, f.w, f.h, sunR)) || f.color;
+    if (bloom) bloom.apply(enc, src, screen, f.w, f.h, BLOOM_THRESHOLD, BLOOM_STRENGTH);
+    else blit(enc, pipeFor(format, 'fs'), src.createView(), screen);
   } else {
     const target = sceneTex ? sceneTex.createView() : screen;
     drawScene(enc, frame, { pipes: pipesMain, color: ms ? ms.createView() : target, resolve: ms ? target : undefined,
       depth: depthTex.createView(), oit: oitMain, ms: SAMPLES > 1 && !!ms, out: target, size: [W, H], depthTex }, query && query.set);
-    if (sceneTex) bloom.apply(enc, sceneTex, screen, W, H, BLOOM_THRESHOLD, BLOOM_STRENGTH);
+    if (sceneTex) {
+      // 光芒を足す（にじみもあれば、光芒を足した画面ににじみを足す）
+      const sunR = godraySun(frame.vp);
+      let src = sceneTex;
+      if (godrays) {
+        if (bloom) src = godrays.apply(enc, sceneTex, depthTex, SAMPLES > 1, W, H, sunR) || sceneTex;
+        else if (godrays.apply(enc, sceneTex, depthTex, SAMPLES > 1, W, H, sunR, screen)) src = null;
+      }
+      if (bloom) bloom.apply(enc, src, screen, W, H, BLOOM_THRESHOLD, BLOOM_STRENGTH);
+      else if (src) blit(enc, pipeFor(format, 'fs'), src.createView(), screen);
+    }
   }
   const picking = pickReq && !pickBusy && canPick;
   if (picking) encodePick(enc, frame);
@@ -2603,7 +2873,7 @@ async function shot(SW, SH) {
   const color = device.createTexture({ size: [SW, SH], format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
   const depth = device.createTexture({ size: [SW, SH], format: DEPTH, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
   const dpr = devicePixelRatio || 1;
-  let oit = null, scene = null, chain = null;
+  let oit = null, scene = null, chain = null, gchain = null;
   const cssH = Math.min(SH / dpr, canvas.clientHeight * 2);
   shooting = { SW, SH, cssH };
   try {
@@ -2623,10 +2893,19 @@ async function shot(SW, SH) {
     device.queue.writeBuffer(frameMain, 0, frameData(frame.vp));
     const enc = device.createCommandEncoder();
     oit = oitTextures(SW, SH, 1);
-    if (bloom) scene = device.createTexture({ size: [SW, SH], format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+    if (bloom || godrays) scene = device.createTexture({ size: [SW, SH], format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
     const view = (scene || color).createView();
     drawScene(enc, frame, { pipes: pipesOne, color: view, depth: depth.createView(), oit, ms: false, out: view, size: [SW, SH], depthTex: depth });
-    if (scene) chain = bloom.applyOnce(enc, scene, color.createView(), SW, SH, BLOOM_THRESHOLD, BLOOM_STRENGTH);
+    if (scene) {
+      let src = scene;
+      const sunR = godraySun(frame.vp);
+      if (godrays) {
+        gchain = godrays.applyOnce(enc, scene, depth, false, SW, SH, sunR, bloom ? undefined : color.createView());
+        if (gchain && bloom) src = gchain.out;
+      }
+      if (bloom) chain = bloom.applyOnce(enc, src, color.createView(), SW, SH, BLOOM_THRESHOLD, BLOOM_STRENGTH);
+      else if (!gchain) blit(enc, pipeFor(format, 'fs'), scene.createView(), color.createView());
+    }
     const bpr = Math.ceil(SW * 4 / 256) * 256;
     const buf = device.createBuffer({ size: bpr * SH, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     enc.copyTextureToBuffer({ texture: color }, { buffer: buf, bytesPerRow: bpr }, [SW, SH]);
@@ -2645,7 +2924,7 @@ async function shot(SW, SH) {
     c.getContext('2d').putImageData(img, 0, 0);
     return c;
   } finally {
-    color.destroy(); depth.destroy(); if (oit) oit.destroy(); if (scene) scene.destroy(); if (chain) chain.destroy();
+    color.destroy(); depth.destroy(); if (oit) oit.destroy(); if (scene) scene.destroy(); if (chain) chain.destroy(); if (gchain) gchain.destroy();
     shooting = null; sel = null; dirty = true;
   }
 }
@@ -2682,6 +2961,7 @@ Object.assign(GE, {
 });
 // 夜景では車の光を動かすので、止まっていても 0.1 秒ごとに描き直す（?traffic=0 で止める）
 if (NIGHT && TRAFFIC) setInterval(() => { dirty = true; }, 100);
+if (WATER) setInterval(() => { if (waveAnim() && !document.hidden) dirty = true; }, 33);     // 水面の波を動かす（google のとき）
 requestAnimationFrame(tick);
 return GE;
 })();

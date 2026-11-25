@@ -14,7 +14,8 @@
 //   元のデモの既定（輝度の変換なし・半精度）と同じ
 //
 // 画面の Cesium とは別の WebGL の中で計算して、結果を Float32Array で返す（Cesium が覚えている GL の状態を
-// 乱さないため）。受け取り: { haze（ちりの量の倍率）}。返す: { ok, transmittance, scattering, irradiance, glsl（大気の値と関数。画面の
+// 乱さないため）。受け取り: { haze（ちりの量の倍率）, strat（成層圏のちりの量の倍率。既定 1、0 でなし）, mixTop（混合層の
+// 上端 [km]。なければ元の指数の形）}。返す: { ok, transmittance, scattering, irradiance, glsl（大気の値と関数。画面の
 // シェーダーの前に付ける）, ms } か { ok: false, error }
 
 const TRANSMITTANCE_W = 256, TRANSMITTANCE_H = 64;
@@ -30,8 +31,26 @@ const OZONE_CROSS_SECTION = [1.209e-25, 3.5e-25, 1.582e-26];  // kOzoneCrossSect
 const SUN_ANGULAR_RADIUS = 0.00935 / 2;
 const BOTTOM_RADIUS = 6360, TOP_RADIUS = 6420;               // km
 
-// haze: 空気中のちり（ミー散乱）の量の倍率。1 で元のデモの値
-function header(haze = 1) {
+// 成層圏のちり（ユンゲ層）の光学的厚さ（550 nm。火山の噴火のあとでない、ふだんの値 0.004〜0.01 ほどの下のほう）。
+// 日が沈んだあとも高い所のちりにだけ日が当たって赤い光を散らし、天頂の青と混ざって太陽の側の空が紫になる（薄明の
+// 紫の光。Lee と Hernández-Andrés 2003、Applied Optics 42(3)）。元のデモの大気にはないので足す。このビューアの対流圏の
+// ちり（haze 3 で 0.016）が少ないので、0.01 では昼の空まで白っぽくなった（太陽の高さ 20° の空の上の方の赤が 90 から
+// 106）。0.005 なら昼は 99 で、日が沈んで 4° の太陽の側の 20° ほどの高さは赤と青がそろい緑より多い紫（91, 75, 91）
+const STRAT_OD = 0.005;
+// 成層圏のちりの形 [km]: 下端 STRAT_BASE で 0 から立ち上がり（STRAT_RISE ほどで）、STRAT_TOP で 0 に戻る
+// （高さ 18 km ほどで一番濃い。1 - exp(-(h - 下端) / 立ち上がり) - (h - 下端) / (上端 - 下端) の形）
+const STRAT_BASE = 12, STRAT_RISE = 3, STRAT_TOP = 32;
+
+// 上端のある混合層のもや（mixTop を渡したとき）: 地面から上端 mixTop [km] まではちりの濃さが一様で、上端から MIX_SOFT [km]
+// ほどで急に薄れ、その上（自由対流圏）には MIX_FREE の割合の薄いちりが高さ 12 km までに直線で 0 に減る。現実の混合層は
+// 朝夜 0.1〜0.5 km、昼 1〜2 km（日中の対流で地面のちりが上へ混ざる）。ちりの総量（対流圏の光学的厚さ）は元の指数の形と
+// 同じにする（昼に上端が上がると、地面の近くは薄く、上まで広がる）。高い所から見下ろすと、街の上にもやの層の上端が見える
+// （Ray（kuwacom）の霞の調べで知った形。コードは使っていない）
+const MIX_SOFT = 0.2, MIX_FREE = 0.1;
+
+// haze: 空気中のちり（ミー散乱）の量の倍率。1 で元のデモの値。strat: 成層圏のちり（STRAT_OD）の倍率。
+// mixTop: 混合層の上端 [km]（なければ元の指数の形）
+function header(haze = 1, strat = 1, mixTop = null) {
   const f = x => {
     const s = Number(x).toPrecision(9);
     return /[.e]/.test(s) ? s : s + '.0';
@@ -39,12 +58,28 @@ function header(haze = 1) {
   const v3 = a => `vec3(${a.map(f).join(',')})`;
   const um = LAMBDAS.map(l => l * 1e-3);                     // マイクロメートル
   const rayleigh = um.map(l => 1.24062e-6 * Math.pow(l, -4) * 1000);
-  const mie = um.map(() => 5.328e-3 / 1200 * 1000 * haze);   // kMieAngstromAlpha = 0 なので波長によらない
+  // 対流圏のちりの密度の積分 [km]（元の指数の形は 1.2 x (1 - exp(-12 / 1.2))）。混合層の形では、総量を同じにするため係数を割る
+  const T = mixTop, base = STRAT_BASE;
+  const column = T ? T + (1 - MIX_FREE) * MIX_SOFT * (1 - Math.exp(-(base - T) / MIX_SOFT)) + MIX_FREE * (base - T) / 2 : 1.2 * (1 - Math.exp(-base / 1.2));
+  const mieK = 1.2 * (1 - Math.exp(-base / 1.2)) / column;
+  const mie = um.map(() => 5.328e-3 / 1200 * 1000 * haze * mieK);   // kMieAngstromAlpha = 0 なので波長によらない
   const maxOzone = 300 * 2.687e20 / 15000;                    // 1 m³ あたりの数
   const ozone = OZONE_CROSS_SECTION.map(c => maxOzone * c * 1000);
   const layer = (w, e, es, lt, c) => `DensityProfileLayer(${[w, e, es, lt, c].map(f).join(',')})`;
   const empty = layer(0, 0, 0, 0, 0);
-  const profile = (a, b) => `DensityProfile(DensityProfileLayer[2](${a},${b}))`;
+  const BIG = 1e9;                     // 2 つ目の層を上まで続ける幅（3 つ目を使わない形）
+  const profile = (a, b, c = empty) => `DensityProfile(DensityProfileLayer[3](${a},${b},${c}))`;
+  // ミー散乱の密度: 対流圏（STRAT_BASE より下）は元のデモの指数（高さ 1.2 km ごとに 1/e）、その上は成層圏のちり
+  // （密度 K の上の形。厚さは K x 面積 L / 2 - R x (1 - exp(-L / R))。ミー散乱の係数は 1 つなので、haze で割って
+  // 量を保つ）。元の層の式は 指数の係数 x exp(指数の割合 x 高さ) + 線形の係数 x 高さ + 定数 で、0〜1 に切り詰める
+  const L = STRAT_TOP - STRAT_BASE, R = STRAT_RISE;
+  const K = STRAT_OD * strat / (mie[1] * (L / 2 - R * (1 - Math.exp(-L / R))));
+  const strat3 = layer(0, -K * Math.exp(STRAT_BASE / R), -1 / R, -K / L, K * (1 + STRAT_BASE / L));
+  // 混合層: 上端まで 1、その上は (1 - 自由) exp(-(h - 上端) / 柔らかさ) + 自由 x (1 - (h - 上端) / (12 - 上端))、12 km から成層圏
+  const mieProfile = T
+    ? profile(layer(T, 0, 0, 0, 1),
+      layer(base - T, (1 - MIX_FREE) * Math.exp(T / MIX_SOFT), -1 / MIX_SOFT, -MIX_FREE / (base - T), MIX_FREE * (1 + T / (base - T))), strat3)
+    : profile(layer(base, 1, -1 / 1.2, 0, 0), layer(0, 0, 0, 0, 0), strat3);
   return `
 #define IN(x) const in x
 #define OUT(x) out x
@@ -66,13 +101,13 @@ const AtmosphereParameters ATMOSPHERE = AtmosphereParameters(
   ${f(SUN_ANGULAR_RADIUS)},
   ${f(BOTTOM_RADIUS)},
   ${f(TOP_RADIUS)},
-  ${profile(empty, layer(0, 1, -1 / 8, 0, 0))},
+  ${profile(empty, layer(BIG, 1, -1 / 8, 0, 0))},
   ${v3(rayleigh)},
-  ${profile(empty, layer(0, 1, -1 / 1.2, 0, 0))},
+  ${mieProfile},
   ${v3(mie.map(x => x * 0.9))},
   ${v3(mie)},
   ${f(0.8)},
-  ${profile(layer(25, 0, 0, 1 / 15, -2 / 3), layer(0, 0, 0, -1 / 15, 8 / 3))},
+  ${profile(layer(25, 0, 0, 1 / 15, -2 / 3), layer(BIG, 0, 0, -1 / 15, 8 / 3))},
   ${v3(ozone)},
   ${v3([0.1, 0.1, 0.1])},
   ${f(Math.cos(102 / 180 * Math.PI))});
@@ -163,13 +198,13 @@ void main() {
 }`,
 };
 
-function precompute(definitions, functions, haze) {
+function precompute(definitions, functions, haze, strat, mixTop) {
   const t0 = performance.now();
   const gl = new OffscreenCanvas(1, 1).getContext('webgl2', { antialias: false, depth: false, stencil: false });
   if (!gl) throw new Error('WebGL2 が使えない');
   if (!gl.getExtension('EXT_color_buffer_float')) throw new Error('浮動小数のテクスチャに描けない（EXT_color_buffer_float がない）');
   const floatLinear = !!gl.getExtension('OES_texture_float_linear');
-  const head = header(haze).replace('@DEFINITIONS@', definitions).replace('@FUNCTIONS@', functions);
+  const head = header(haze, strat, mixTop).replace('@DEFINITIONS@', definitions).replace('@FUNCTIONS@', functions);
 
   const compile = (type, src) => {
     const s = gl.createShader(type);
@@ -328,9 +363,11 @@ function precompute(definitions, functions, haze) {
 onmessage = async e => {
   try {
     const haze = e.data && e.data.haze || 1;
+    const strat = e.data && Number.isFinite(e.data.strat) ? e.data.strat : 1;
     const [definitions, functions] = await Promise.all(
       ['atmosphere/definitions.glsl', 'atmosphere/functions.glsl'].map(u => fetch(u).then(r => r.text())));
-    const r = precompute(definitions, functions, haze);
+    const mixTop = e.data && e.data.mixTop > 0 ? e.data.mixTop : null;
+    const r = precompute(definitions, functions, haze, strat, mixTop);
     postMessage({ ok: true, ...r }, [r.transmittance.buffer, r.irradiance.buffer, r.scattering.buffer]);
   } catch (e) {
     postMessage({ ok: false, error: String(e && e.message || e) });

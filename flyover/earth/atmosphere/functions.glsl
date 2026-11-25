@@ -266,10 +266,13 @@ Number GetLayerDensity(IN(DensityProfileLayer) layer, Length altitude) {
   return clamp(density, Number(0.0), Number(1.0));
 }
 
+// flyover-web での変更: 層を 3 つに（layers[1] は layers[0].width から layers[0].width + layers[1].width まで、その上は layers[2]）
 Number GetProfileDensity(IN(DensityProfile) profile, Length altitude) {
   return altitude < profile.layers[0].width ?
       GetLayerDensity(profile.layers[0], altitude) :
-      GetLayerDensity(profile.layers[1], altitude);
+      altitude < profile.layers[0].width + profile.layers[1].width ?
+      GetLayerDensity(profile.layers[1], altitude) :
+      GetLayerDensity(profile.layers[2], altitude);
 }
 
 Length ComputeOpticalLengthToTopAtmosphereBoundary(
