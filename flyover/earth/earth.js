@@ -944,7 +944,7 @@ async function startAtmosphere() {
   const data = await new Promise(resolve => {
     worker.onmessage = e => resolve(e.data);
     worker.onerror = e => resolve({ ok: false, error: e.message });
-    worker.postMessage({ haze: atmoHaze });
+    worker.postMessage({ haze: atmoHaze, strat: atmoParams.has('strat') ? Number(atmoParams.get('strat')) : 1 });
   });
   worker.terminate();
   if (!data.ok) {

@@ -194,8 +194,9 @@ struct DensityProfileLayer {
 // (from bottom to top). The width of the last layer is ignored, i.e. it always
 // extend to the top atmosphere boundary. The profile values vary between 0
 // (null density) to 1 (maximum density).
+// flyover-web での変更: 層を 2 つから 3 つに（ミー散乱の、上端のある混合層・その上・成層圏のちり。atmosphere.js）
 struct DensityProfile {
-  DensityProfileLayer layers[2];
+  DensityProfileLayer layers[3];
 };
 
 /*
