@@ -32,9 +32,10 @@ const SOLAR = ${v([1.474, 1.8504, 1.91198])};
 // lsun・lsky: ?light= の太陽の光と空の光（gpu-render.js の lightNow）。lsun.w は太陽の高さの正弦、lsky.w は
 // 地面にも光をかけるなら 1。ngrid: 20 km ごとの区切りの点からカメラまで（夜の窓の模様を細かく決めるため。地球の
 // 座標のままでは f32 で 0.5 m 刻みになる）、nup: その点の上の向き（w は雲を出すか）。shadowC: カメラから、雲の影の
-// 地図の真ん中（カメラの位置を 1 km ごとに丸めた点）までの逆向き [m]（gpu-clouds.js）
+// 地図の真ん中（カメラの位置を 1 km ごとに丸めた点）までの逆向き [m]（gpu-clouds.js）。sunVP: カメラを原点にした位置から
+// 建物の影の地図（太陽から見た正射影）へ、sunP: 影の地図の 1 画素の大きさ [m]（gpu-render.js の sunShadow）
 struct Frame { cam0: vec4f, sun: vec4f, balance: vec4f, aerial: vec4f, invVP: mat4x4f, pickM: mat4x4f, camPos: vec4f,
-  lsun: vec4f, lsky: vec4f, ngrid: vec4f, nup: vec4f, shadowC: vec4f };
+  lsun: vec4f, lsky: vec4f, ngrid: vec4f, nup: vec4f, shadowC: vec4f, sunVP: mat4x4f, sunP: vec4f };
 @group(1) @binding(0) var<uniform> fr: Frame;
 @group(1) @binding(1) var atmoSamp: sampler;
 @group(1) @binding(2) var transTex: texture_2d<f32>;

@@ -407,7 +407,11 @@ fn cloudMarch(v: vec3f, ndc: vec2f, pix: vec2f, tMax: f32, frame: f32, sky: bool
     c = vec4f(c.rgb * air.t + air.l * c.a, c.a);
   }
   // 霧
-  let hzc = clHaze(cam, v, hz, cosT, sl);
+  // 霧の光は、その向きの晴れた空より暗くしない。霧の光は地面での太陽と空の光から求めるのでベージュがかった灰色で、
+  // 地平線をかすめる視線では霧が 7 割ほどかかり、地平線の空がその色の帯になった（遠くの山の上に、雲の底のような
+  // 茶色い帯）。まわりの空の光を散らす霧は、後ろの空より暗くはならない
+  var hzc = clHaze(cam, v, hz, cosT, sl);
+  hzc = vec4f(max(hzc.rgb, skyRadiance(cam, v, sun).l), hzc.a);
   c = vec4f(mix(c.rgb, hzc.rgb, hzc.a), c.a * (1.0 - hzc.a) + hzc.a);
   // 雲の向こうの空にも光芒（空の光を、影に入った分だけ減らす。空に重ねるときの隠れる割合に入れる）
   if (sl > 0.0) {
