@@ -79,6 +79,7 @@ Alt キーを押しながら動かすと、ゆっくり動きます。
 | `?look=apple`、`?look=google` | 色合い（G キーと同じ） |
 | `?godrays=0` | 画面の上の光芒をなくす（WebGPU 版。既定 0.35、`?godrays=1` などで強く。夜は使わない） |
 | `?hazeTop=0.8` | もやの層の上端 [km]（WebGPU 版。既定は太陽の高さで 0.4〜1.5 km。`?hazeTop=0` で前の形） |
+| `?shadows=0` | 建物の影を落とさない（WebGPU 版。`?light=morning`・`evening`・`?sun=` のとき、今の太陽で建物の影を落とす） |
 | `?phase=0` | 太陽のまわりで強く光るもやをやめて、前の散乱の形にする（WebGPU 版） |
 | `?strat=0` | 成層圏のちりをなくす（既定 1。日が沈んだあとの太陽の側の空の紫が出なくなる。`?strat=2` などで倍に） |
 | `?raw=1` | Flyover のタイルを、サーバーで glb にせず、Apple から受け取ったままブラウザで読み解いて見る（WebGPU 版。HEVC を GPU で展開できるブラウザのみ）。`--r3d` なら新しい Flyover、そうでなければ古い Flyover。`?c3m=1` はいつも古い Flyover。`?light=` のときは使えない（ふだんの読み込みになる） |

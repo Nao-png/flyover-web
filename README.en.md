@@ -79,6 +79,7 @@ Hold Alt while moving to move slowly.
 | `?look=apple`, `?look=google` | The look (same as the G key) |
 | `?godrays=0` | Turns off the screen-space light shafts (WebGPU viewer; default 0.35, `?godrays=1` and so on for stronger; not used at night) |
 | `?hazeTop=0.8` | Top of the haze layer in km (WebGPU viewer; by default 0.4–1.5 km from the sun's height; `?hazeTop=0` for the old shape) |
+| `?shadows=0` | Turns off building shadows (WebGPU viewer; with `?light=morning`, `evening` or `?sun=`, buildings cast shadows from the current sun) |
 | `?phase=0` | Uses the old scattering shape instead of haze that glows strongly around the sun (WebGPU viewer) |
 | `?strat=0` | Removes the stratospheric aerosol (default 1; the purple sky on the sun's side after sunset goes away; `?strat=2` and so on to double it) |
 | `?raw=1` | Shows the Flyover tiles as received from Apple, decoded in the browser instead of converted to glb on the server (WebGPU viewer; needs a browser that decodes HEVC on the GPU). The new Flyover with `--r3d`, otherwise the old one. `?c3m=1` always shows the old Flyover. Not available with `?light=` (falls back to normal loading) |

@@ -21,9 +21,13 @@ const floatFilter = adapter.features.has('float32-filterable');     // 大気の
 const stencil32 = adapter.features.has('depth32float-stencil8');
 // 写真を GPU 用の圧縮形式（BC4 と BC5）にする（?bc=0 でしない）
 const BC = adapter.features.has('texture-compression-bc') && params.get('bc') !== '0';
+// 建物のタイルの 4 分の 1 の切り出しを、画素を捨てる（discard）代わりに三角形を切る面（clip distances）で行う（?clipd=0 で
+// しない）。discard があると、GPU が奥の見えない画素を色を計算する前に省けなくなり、お台場の夕方で地面と建物のパスが
+// 53 ms → 36 ms（MSAA 4 倍）になった
+const CLIPD = adapter.features.has('clip-distances') && params.get('clipd') !== '0';
 const device = await adapter.requestDevice({ requiredFeatures: [...(timing ? ['timestamp-query'] : []),
   ...(floatFilter ? ['float32-filterable'] : []), ...(stencil32 ? ['depth32float-stencil8'] : []),
-  ...(BC ? ['texture-compression-bc'] : [])] });
+  ...(BC ? ['texture-compression-bc'] : []), ...(CLIPD ? ['clip-distances'] : [])] });
 // 深度はステンシル付き（地面の代わりの親を、届いたタイルの描いていない画素にだけ描く）。depth32float-stencil8 なら
 // 深度をバッファに写せる（カーソルの下の建物を探すのに使う）
 const DEPTH = stencil32 ? 'depth32float-stencil8' : 'depth24plus-stencil8';
@@ -111,7 +115,11 @@ const NIGHT = light === LIGHTS.night && params.get('windows') !== '0';
 // ?light= の朝・夕方・曇り・?sun= の水面を、空を映す面として描き直す（waterLin）。水面は OpenStreetMap の水面の画像
 // （/api/areas/、夜景と同じもの）で見分ける。夜は夜景の水面の描き方があるので使わない。?water=0 で使わない
 const WATER = !!light && !light.check && light !== LIGHTS.night && params.get('water') !== '0';
-const WINDOWS_ON = Math.min(Math.max(num('windows', 0.22), 0), 1);
+// 太陽のある光（?light=morning・evening・?sun=）では、建物の影を今の太陽で落とす（影の地図。sunShadow）。写真の影は
+// 取り除いてあるので、影の地図がないと建物の影がなくなる。?shadows=0 で使わない
+const SHADOWS = !!(light && light.sun && !light.check) && params.get('shadows') !== '0';
+const SHADOW_N = SHADOWS ? 4096 : 1;
+const WINDOWS_ON =Math.min(Math.max(num('windows', 0.22), 0), 1);
 // 夜景の時刻（?time=21 など。0〜24 時、既定 21 時）。時刻ごとの明かりの量（0〜1）の表を、1 時間ごとの値から線形に補う。
 // office: オフィスの窓（白い LED）、home: 住まいとホテルの窓（暖かい白）、shop: 店先とネオン、traffic: 車、stadium: 競技場
 const HOUR = ((num('time', 21) % 24) + 24) % 24;
@@ -442,6 +450,7 @@ const WAVE_LAYERS = (() => {
 })();
 const WATER_WGSL = /* wgsl */`
 const WATER_ROUGH = ${num('waterRough', 0.06).toFixed(4)};
+const WATER_BODY = ${Math.min(Math.max(num('waterBody', 0.35), 0), 2).toFixed(3)};
 const WAVE_VAR = ${WAVE_LAYERS.reduce((a, l) => a + l.v, 0).toExponential(5)};   // 波の傾きの分散の合計
 // 波の傾き（東・北）と、画面で細かすぎて消した段の傾きの分散。q: 東・北の位置 [m]、fp: 1 画素の大きさ [m]、t: 時刻 [秒]
 fn waterWaves(q: vec2f, fp: f32, t: f32) -> vec3f {
@@ -510,8 +519,10 @@ fn waterLin(land: vec3f, photo: vec3f, area: vec4f, road: vec4f, n: vec3f, rel: 
   // 太陽のない光（曇り）と橋の下では照り返しなし
   let glint = SOLAR * sunT * D * g1 * g2 * Fh / (4.0 * cosV) * smoothstep(0.0, 0.03, ns) * shadow * bal * (1.0 - under)
             * ${light && light.sun ? '1.0' : '0.0'};
-  // 水の中の色: 写真の水の色に、日かげを取り除かずに今の光を当てたもの（橋の下は空の光がさえぎられる分だけ暗く）
-  let body = untone(lightLin(photo, 1.0, up)) * (1.0 - 0.5 * under);
+  // 水の中の色: 写真の水の色に、日かげを取り除かずに今の光を当てたもの（橋の下は空の光がさえぎられる分だけ暗く）。
+  // 写真の水の色には、撮った昼の空が映った分が多く入っているので、WATER_BODY 倍に暗くして（?waterBody=、既定 0.35）、
+  // 今の空の映り込み（F）を目立たせる。遠くの水面（斜めに見るほど F が大きい）ほど今の空の色になり、手前は写真の青緑が残る
+  let body = untone(lightLin(photo, 1.0, up)) * (WATER_BODY * (1.0 - 0.5 * under));
   return mix(land, tone(body * (1.0 - F) + sky * F + glint), w);
 }`;
 // 光の描き直し（今のビューアの lightApply を WGSL に）。c は sRGB、lit は撮ったときの日なた（1）・日かげ（0）、
@@ -521,6 +532,38 @@ const LIGHT_WGSL = !light ? 'fn lightRgb(c: vec3f, lit: f32, n: vec3f) -> vec3f 
   const sunENU = s ? [Math.sin(s[0]) * Math.cos(s[1]), Math.cos(s[0]) * Math.cos(s[1]), Math.sin(s[1])] : [0, 0, 1];
   return /* wgsl */`
 // 線形の値で返す（写真の色 c は sRGB。2.2 乗で線形に戻す。かすみ（atmoApplyLin）と同じ）
+const LUMA = vec3f(0.2126, 0.7152, 0.0722);
+// 写真の画素の位置の、日かげの明るさ / 日なたの明るさ（線形の明るさ。日の当たり方の画像の日なたと日かげで分けて平均する）。
+// まわり 3 つの輪（48・192・768 テクセル、それぞれ 4 点。輪ごとに 45° ずつ回す）と真ん中を、ミップマップの粗い段（輪の半径の 1/3 ほどの平均）で引き、
+// 外の輪ほど軽く（1・0.5・0.25）重ねる。輪をいつも全部使うので、比は画素ごとになめらかに変わる（日なたが見つかった輪だけを
+// 使うと、輪の切り替わりで境目が出る）。近くで見る細かいタイルは写真のテクセルが細かく、前の 24・96 テクセルの輪では
+// 大きな日かげの中で日なたに届かず、今までの倍率に戻って白く浮いた。y は確かさ（日なたと日かげの重みの小さいほうで 0〜1。
+// 0 なら今までの倍率。間はなめらかに混ぜる）
+fn localShade() -> vec2f {
+  let ts = vec2f(textureDimensions(tex));
+  var sl = 0.0; var wl = 0.0; var ss = 0.0; var ws = 0.0;
+  for (var ring = 0; ring < 3; ring++) {
+    let fr_ = f32(ring);
+    let r = 48.0 * exp2(2.0 * fr_);
+    let lev = 4.0 + 2.0 * fr_;
+    let w = exp2(-fr_);
+    for (var t = 0; t < 5; t++) {
+      if (ring > 0 && t == 4) { break; }
+      let a = f32(t) * 1.5707963 + fr_ * 0.7853982;
+      let o = select(vec2f(cos(a), sin(a)) * r, vec2f(0.0), t == 4) / ts;
+      let q = shUV + o;
+      var y: f32;
+      if (shMode == 2u) { y = pow(textureSampleLevel(tex, samp, q, lev).r, 2.2); }
+      else { y = dot(pow(textureSampleLevel(tex, samp, q, lev).rgb, vec3f(2.2)), LUMA); }
+      let m = clamp(textureSampleLevel(shadeTex, samp, q, lev).r, 0.0, 1.0) * w;
+      let m0 = w - m;
+      sl += y * m; wl += m; ss += y * m0; ws += m0;
+    }
+  }
+  let conf = smoothstep(0.1, 0.6, min(wl, ws));
+  if (conf <= 0.0) { return vec2f(0.0); }
+  return vec2f(clamp((ss / ws) / max(sl / wl, 1e-4), 0.0, 1.0), conf);
+}
 fn lightLin(c: vec3f, lit0: f32, n: vec3f) -> vec3f {
   let lit = clamp(lit0, 0.0, 1.0);
   ${light.check ? 'return vec3f(lit);' : ''}
@@ -533,11 +576,26 @@ fn lightLin(c: vec3f, lit0: f32, n: vec3f) -> vec3f {
     let s0 = normalize(east * u.sun0.x + north * u.sun0.y + up * u.sun0.z);
     k = clamp(dot(n, s0) / u.sun0.z, 0.25, 2.0);
   }
-  // 影を取り除いた色。日かげは日なたの R 0.10・G 0.15・B 0.17 倍ほどに写っている
-  let albedo = pow(c, vec3f(2.2)) / mix(vec3f(0.10, 0.15, 0.17), vec3f(1.0), lit * k);
+  // 影を取り除いた色。日かげは日なたの R 0.10・G 0.15・B 0.17 倍ほどに写っている（SHADE）。ただし写真の日かげがそれより
+  // 明るい所（ビルの谷間の壁など。まわりの壁の照り返し）では、その倍率で割ると白く飛ぶ（丸の内の壁で、日かげは日なたの
+  // 0.6〜0.7 倍だった）。日の当たり方の画像で日かげの画素は、まわりの写真で日かげと日なたの明るさを比べて（localShade）、
+  // 割る値をそこまで上げる
+  let shade = vec3f(0.10, 0.15, 0.17);
+  let litDiv = mix(shade, vec3f(1.0), k);
+  var shadeDiv = shade;
+  if (lit < 0.99 && shMode > 0u) {
+    let est = localShade();
+    if (est.y > 0.0) {
+      let yS = dot(shade, LUMA);
+      let yL = dot(litDiv, LUMA);
+      let t = clamp((est.x * yL - yS) / max(yL - yS, 1e-3), 0.0, 1.0) * est.y;
+      shadeDiv = mix(shade, litDiv, t);
+    }
+  }
+  let albedo = pow(c, vec3f(2.2)) / mix(shadeDiv, litDiv, lit);
   let sunE = normalize(east * ${f4(sunENU[0])} + north * ${f4(sunENU[1])} + up * ${f4(sunENU[2])});
   let sky = 0.65 + 0.35 * dot(n, up);
-  let L = fr.lsky.xyz * sky${light.sun ? ' + fr.lsun.xyz * max(dot(n, sunE), 0.0)' : ''};
+  let L = fr.lsky.xyz * sky${light.sun ? ' + fr.lsun.xyz * max(dot(n, sunE), 0.0) * sunVis' : ''};
   return albedo * L;
 }
 fn lightRgb(c: vec3f, lit: f32, n: vec3f) -> vec3f { return linearToSrgb(lightLin(c, lit, n)); }
@@ -941,8 +999,52 @@ struct U { mvp: mat4x4f, p: vec4f, east: vec4f, north: vec4f, off: vec4f, rc: ve
 @group(0) @binding(6) var areaTex: texture_2d<f32>;
 @group(0) @binding(7) var waveTex: texture_3d<f32>;   // 水面の波の傾き（WATER のとき。makeWaveData）
 @group(0) @binding(8) var waveSamp: sampler;          // くり返して引く（時間の向きも）  // 夜景: 範囲（赤: 水面、緑: 商業地、青: 線路と駅、アルファ: 競技場。osm.py の areas）
+@group(1) @binding(7) var sunShadowTex: texture_depth_2d;      // 建物の影の地図（SHADOWS のとき。ほかは 1 画素）
+@group(1) @binding(8) var sunShadowSamp: sampler_comparison;
+// 今の画素の日なたの割合（建物の影で 0）。lightLin の太陽の光に掛ける。描く関数の初めに sunShadow で決める
+var<private> sunVis: f32 = 1.0;
+// lightLin の localShade 用: 写真の uv と、写真の形（0: 使わない（木・水面）、1: RGB、2: HEVC の明るさ）。描く関数の初めに決める
+var<private> shUV: vec2f = vec2f(0.0);
+var<private> shMode: u32 = 0u;
+// 建物の影: 太陽から見た正射影の深さの地図（fr.sunVP）と比べる。自分の影の縞（特に低い夕日で斜めに当たる地面）を防ぐ補正は 3 つ:
+// 1. 面の向きにずらす: 1 画素 x (0.5 + 1.5 x 光と面のなす角の正弦)。光が斜めに当たる面ほど大きく
+// 2. 受ける面の傾き: 半画素ずつずらした 4 点（線形の比較で 2 x 2 ずつ）を比べるとき、受ける面をその点まで延ばした深さと比べる
+//    （面の傾きは 5 まで）。平らな面に一定の余裕を足すだけだと、傾いた面の周りの点が面の奥に入って縞になる
+// 3. 深さの刻みの余裕: 1 画素 x (0.5 + 0.5 x 傾き)
+// 地図の外へ近づくほど影を消す（Ray（kuwacom）の影の調べで知った補正の組み立て。式はここで導いた）
+fn sunShadow(rel: vec3f, n: vec3f) -> f32 {
+  let texel = fr.sunP.x;
+  let ns = max(dot(n, fr.sun.xyz), 0.02);
+  let sinT = sqrt(max(1.0 - ns * ns, 0.0));
+  let tanT = min(sinT / ns, 5.0);
+  let c = fr.sunVP * vec4f(rel + n * (texel * (0.5 + 1.5 * sinT)), 1.0);
+  // 行列の行: a = 地図の横の向き / 半分の幅、b = 縦の向き / 半分の幅、k = -太陽の向き / 深さの範囲
+  let m = fr.sunVP;
+  let a = vec3f(m[0][0], m[1][0], m[2][0]);
+  let b = vec3f(m[0][1], m[1][1], m[2][1]);
+  let k = length(vec3f(m[0][2], m[1][2], m[2][2]));
+  // 地図の座標（-1〜1）で 1 動いたときの、受ける面の深さの変化（面の上で動くと太陽の向きに -(n・横) 幅 / (n・s) だけずれる）
+  let lim = 5.0 * k / length(a);
+  let grad = clamp(vec2f(dot(n, a) / dot(a, a), dot(n, b) / dot(b, b)) * k / ns, vec2f(-lim), vec2f(lim));
+  let z0 = c.z - texel * (0.5 + 0.5 * tanT) * k;
+  let edge = max(abs(c.x), abs(c.y));
+  let uv = vec2f(c.x * 0.5 + 0.5, 0.5 - c.y * 0.5);
+  let d = 0.5 / ${SHADOW_N}.0;
+  var v = 0.0;
+  for (var t = 0; t < 4; t++) {
+    let o = vec2f(select(-d, d, (t & 1) != 0), select(-d, d, (t & 2) != 0));
+    // uv の v は地図の縦の座標と逆向き
+    let z = clamp(z0 + dot(grad, vec2f(2.0 * o.x, -2.0 * o.y)), 0.0, 1.0);
+    v += textureSampleCompareLevel(sunShadowTex, sunShadowSamp, uv + o, z);
+  }
+  return mix(v * 0.25, 1.0, smoothstep(0.85, 1.0, edge));
+}
 struct V { @builtin(position) pos: vec4f, @location(0) uv: vec2f, @location(1) local: vec3f, @location(2) color: vec4f,
            @location(3) at: vec3f, @location(4) as_: vec3f, @location(5) rel: vec3f, @location(6) world: vec3f };
+// clip distances のときの頂点の出力（clip_distances は頂点の出力にしか使えないので、画素の入力の V とは分ける）
+${CLIPD ? `struct VO { @builtin(position) pos: vec4f, @location(0) uv: vec2f, @location(1) local: vec3f, @location(2) color: vec4f,
+            @location(3) at: vec3f, @location(4) as_: vec3f, @location(5) rel: vec3f, @location(6) world: vec3f,
+            @builtin(clip_distances) clip: array<f32, 2> };` : ''}
 fn srgbToLinear(c: vec3f) -> vec3f { return select(pow((c + 0.055) / 1.055, vec3f(2.4)), c / 12.92, c <= vec3f(0.04045)); }
 fn linearToSrgb(c: vec3f) -> vec3f { return select(1.055 * pow(c, vec3f(1.0 / 2.4)) - 0.055, c * 12.92, c <= vec3f(0.0031308)); }
 ${LIGHT_WGSL}
@@ -979,6 +1081,13 @@ fn clipped(local: vec3f) -> bool {
   let q = select(0u, 1u, dot(d, u.east.xyz) >= 0.0) + select(0u, 2u, dot(d, u.north.xyz) < 0.0);
   return ((m >> q) & 1u) == 0u;
 }
+// 4 分の 1 の part（clipped と同じ番号。4 なら切らない）の内側で 0 以上になる 2 つの距離（東と北の向きの、タイルの地面の
+// 中心からの距離に符号を付けたもの）。三角形はこの面で切られるので、画素を捨てずに済む
+fn quadClip(l: vec3f, part: u32) -> array<f32, 2> {
+  if (part >= 4u) { return array<f32, 2>(1.0, 1.0); }
+  let d = l - u.off.xyz;
+  return array<f32, 2>(select(-1.0, 1.0, (part & 1u) != 0u) * dot(d, u.east.xyz), select(1.0, -1.0, (part & 2u) != 0u) * dot(d, u.north.xyz));
+}
 fn vsCommon(q: vec4i, uv: vec2f, color: vec4f) -> V {
   var o: V;
   let l = vec3f(q.xyz) * u.p.x;
@@ -991,7 +1100,11 @@ fn vsCommon(q: vec4i, uv: vec2f, color: vec4f) -> V {
   o.at = a.t; o.as_ = a.s;
   return o;
 }
-@vertex fn vsMesh(@location(0) q: vec4i, @location(1) uv: vec2f) -> V { return vsCommon(q, uv, vec4f(1.0)); }
+// part: 描く 4 分の 1（0〜3 = 北西・北東・南西・南東。4 は全部）。描く呼び出しの最初のインスタンスの番号で渡す（quadDraws）
+@vertex fn vsMesh(@location(0) q: vec4i, @location(1) uv: vec2f, @builtin(instance_index) part: u32) -> ${CLIPD ? 'VO' : 'V'} {
+  let v = vsCommon(q, uv, vec4f(1.0));
+  ${CLIPD ? 'return VO(v.pos, v.uv, v.local, v.color, v.at, v.as_, v.rel, v.world, quadClip(v.local, part));' : 'return v;'}
+}
 @vertex fn vsSplat(@location(0) q: vec4i, @location(1) color: vec4f, @location(2) uv: vec2f) -> V { return vsCommon(q, uv, color); }
 // 見ている側を向いた面の向き（カメラが原点）
 fn normalOf(rel: vec3f) -> vec3f {
@@ -1000,28 +1113,32 @@ fn normalOf(rel: vec3f) -> vec3f {
   return n;
 }
 @fragment fn fsMesh(i: V) -> @location(0) vec4f {
+  shUV = i.uv; shMode = 1u;
   let n = normalOf(i.rel);
+  ${SHADOWS ? 'sunVis = sunShadow(i.rel, n);' : ''}
   let fp = max(length(dpdx(i.rel)), length(dpdy(i.rel)));   // 1 画素の大きさ [m]（水面の波用）
   let base = textureSample(tex, samp, i.uv).rgb;
   let sh = textureSample(shadeTex, samp, i.uv);
   let road = ${NIGHT || WATER ? 'roadAt(i.local)' : 'vec4f(0.0)'};
   let area = ${NIGHT || WATER ? 'areaAt(i.local)' : 'vec4f(0.0)'};
-  if (clipped(i.local)) { discard; }
-  ${light ? 'return vec4f(atmoApplyLin(nightAdd(waterLin(lightLin(base, meshLit(base, sh.r), n) * cloudShadeLin(sh.r, cloudShadow(i.rel)), base, area, road, n, i.rel, i.local, fp, cloudShadow(i.rel)), base, sh.g, n, i.rel, groundHeight(i.local), road, area, i.local, u.p.w > 0.5), i.at, i.as_ + NIGHT_HAZE * (1.0 - i.at)), 1.0);'
+  ${CLIPD ? '' : 'if (clipped(i.local)) { discard; }'}
+  ${light ? 'return vec4f(atmoApplyLin(nightAdd(waterLin(lightLin(base, meshLit(base, sh.r), n) * cloudShadeLin(sh.r, cloudShadow(i.rel)), base, area, road, n, i.rel, i.local, fp, cloudShadow(i.rel) * sunVis),base, sh.g, n, i.rel, groundHeight(i.local), road, area, i.local, u.p.w > 0.5), i.at, i.as_ + NIGHT_HAZE * (1.0 - i.at)), 1.0);'
           : 'return vec4f(atmoApply(cloudShade(base, sh.r, cloudShadow(i.rel)), i.at, i.as_), 1.0);'}
 }
 // HEVC の写真。BT.601 のフルレンジ（hevc.js を見よ）
 @fragment fn fsMeshYuv(i: V) -> @location(0) vec4f {
+  shUV = i.uv; shMode = 2u;
   let n = normalOf(i.rel);
+  ${SHADOWS ? 'sunVis = sunShadow(i.rel, n);' : ''}
   let fp = max(length(dpdx(i.rel)), length(dpdy(i.rel)));
   let y = textureSample(tex, samp, i.uv).r;
   let c = textureSample(uvTex, samp, i.uv).rg - 128.0 / 255.0;
   let sh = textureSample(shadeTex, samp, i.uv);
   let road = ${NIGHT || WATER ? 'roadAt(i.local)' : 'vec4f(0.0)'};
   let area = ${NIGHT || WATER ? 'areaAt(i.local)' : 'vec4f(0.0)'};
-  if (clipped(i.local)) { discard; }
+  ${CLIPD ? '' : 'if (clipped(i.local)) { discard; }'}
   let rgb = clamp(vec3f(y + 1.402 * c.y, y - 0.344136 * c.x - 0.714136 * c.y, y + 1.772 * c.x), vec3f(0.0), vec3f(1.0));
-  ${light ? 'return vec4f(atmoApplyLin(nightAdd(waterLin(lightLin(rgb, meshLit(rgb, sh.r), n) * cloudShadeLin(sh.r, cloudShadow(i.rel)), rgb, area, road, n, i.rel, i.local, fp, cloudShadow(i.rel)), rgb, sh.g, n, i.rel, groundHeight(i.local), road, area, i.local, u.p.w > 0.5), i.at, i.as_ + NIGHT_HAZE * (1.0 - i.at)), 1.0);'
+  ${light ? 'return vec4f(atmoApplyLin(nightAdd(waterLin(lightLin(rgb, meshLit(rgb, sh.r), n) * cloudShadeLin(sh.r, cloudShadow(i.rel)), rgb, area, road, n, i.rel, i.local, fp, cloudShadow(i.rel) * sunVis),rgb, sh.g, n, i.rel, groundHeight(i.local), road, area, i.local, u.p.w > 0.5), i.at, i.as_ + NIGHT_HAZE * (1.0 - i.at)), 1.0);'
           : 'return vec4f(atmoApply(cloudShade(rgb, sh.r, cloudShadow(i.rel)), i.at, i.as_), 1.0);'}
 }
 // スプラット: 頂点の色は線形の値。不透明度の下位 6 ビットが撮ったときの日の当たり方。
@@ -1036,6 +1153,7 @@ fn oitWeight(a: f32, fz: f32) -> f32 {
 }
 @fragment fn fsSplat(i: V) -> OitOut {
   let n = normalOf(i.rel);
+  ${SHADOWS ? 'sunVis = sunShadow(i.rel, n);' : ''}
   let t = textureSample(tex, samp, i.uv);
   if (clipped(i.local)) { discard; }
   let lin = seasonLin(i.color.rgb, i.color, i.world);
@@ -1133,7 +1251,14 @@ const frameLayout = device.createBindGroupLayout({ entries: [
   { binding: 3, visibility: VF, texture: { viewDimension: '3d' } },
   { binding: 4, visibility: VF, texture: { viewDimension: '3d' } },
   { binding: 5, visibility: VF, texture: { viewDimension: '3d' } },
-  { binding: 6, visibility: VF, texture: {} }] });
+  { binding: 6, visibility: VF, texture: {} },
+  { binding: 7, visibility: FR, texture: { sampleType: 'depth' } }, { binding: 8, visibility: FR, sampler: { type: 'comparison' } }] });
+// 建物の影の地図（SHADOWS でなければ 1 画素）。描くときの組（groupMain）に入るので、影の地図を描くパスは別の組を使う
+const sunShadowTex = device.createTexture({ size: [SHADOW_N, SHADOW_N], format: 'depth32float',
+  usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+const sunShadowView = sunShadowTex.createView();
+const sunShadowSamp = device.createSampler({ compare: 'less-equal', magFilter: 'linear', minFilter: 'linear',
+  addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
 // かすみの表を作る計算シェーダー用（表は書き込み先なので、描くときの組とは分ける）
 const CS = GPUShaderStage.COMPUTE;
 const frameLayoutC = device.createBindGroupLayout({ entries: [
@@ -1305,7 +1430,7 @@ const noCloudTex = device.createTexture({ size: [1, 1], format: 'rgba16float', u
 const noCloudGroup = device.createBindGroup({ layout: cloudLayout, entries: [
   { binding: 10, resource: noCloudTex.createView() }, { binding: 11, resource: cloudSampler }] });
 let cloudOverNow = null;     // このコマで地面や建物の手前の雲も描くか（drawScene）
-const flyModule = device.createShaderModule({ code: FLY_WGSL });
+const flyModule = device.createShaderModule({ code: (CLIPD ? 'enable clip_distances;\n' : '') + FLY_WGSL });
 const mipModule = device.createShaderModule({ code: MIP_WGSL });
 const extModule = device.createShaderModule({ code: EXT_WGSL });
 
@@ -1356,6 +1481,110 @@ const [pipesMain, pipes1, oitPipe] = await Promise.all([makePipes(SAMPLES), SAMP
       color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' }, alpha: { srcFactor: 'zero', dstFactor: 'one' } } }] },
     primitive: { topology: 'triangle-list' } })]);
 const pipesOne = pipes1 || pipesMain;
+
+// ---------------------------------------------------------------- 建物の影の地図（SHADOWS のとき）
+// 太陽から見た正射影で、建物（Flyover のメッシュ。木のスプラットは影を落とさない）の深さを描く。範囲は、カメラの真下の
+// 地面から画面の真ん中の向きが地面に当たる点までの 4 分の 3 の所を真ん中にした正方形（半分の幅はその 2 点の距離 + カメラの
+// 高さ、150 m〜2.5 km。2^(1/4) 倍ずつに丸め、真ん中は
+// 1 画素ごとに丸めて、カメラが動いても影の縁がちらつかないように）。深さの範囲は、範囲に入る描くタイルの球から決める。
+// 影を落とすのは画面に選んだタイルだけなので、画面の外の建物の影はない
+// 4 分の 1 の切り出し（mask のビット 0〜3）ごとの描く呼び出し。clip distances なら使う部分ごとに 1 回描き、部分の番号を
+// 最初のインスタンスの番号で渡す（quadClip）。4 は全部
+const quadParts = mask => !CLIPD || !mask ? [4] : [0, 1, 2, 3].filter(q => (mask >> q) & 1);
+const SHADOW_NONE = new Float32Array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 0, 1]);   // どこも地図の外（x = 2）
+const sunShadow = { m: null, texel: 0, key: '' };
+const sunShadowVP = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+const sunShadowLayout = device.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } }] });
+const sunShadowGroup = device.createBindGroup({ layout: sunShadowLayout, entries: [{ binding: 0, resource: { buffer: sunShadowVP } }] });
+const sunShadowPipe = !SHADOWS ? null : await (() => {
+  const module = device.createShaderModule({ code: (CLIPD ? 'enable clip_distances;\n' : '') + /* wgsl */`
+struct U { mvp: mat4x4f, p: vec4f, east: vec4f, north: vec4f, off: vec4f, rc: vec4f, sun0: vec4f };
+@group(0) @binding(0) var<uniform> u: U;
+@group(1) @binding(0) var<uniform> lvp: mat4x4f;
+struct V { @builtin(position) pos: vec4f, @location(0) local: vec3f${CLIPD ? ', @builtin(clip_distances) clip: array<f32, 2>' : ''} };
+@vertex fn vs(@location(0) q: vec4i, @builtin(instance_index) part: u32) -> V {
+  var o: V;
+  let l = vec3f(q.xyz) * u.p.x;
+  o.pos = lvp * vec4f(u.rc.xyz + l, 1.0);
+  o.local = l;
+  ${CLIPD ? `// 4 分の 1 の切り出し（FLY_WGSL の quadClip と同じ）
+  if (part >= 4u) { o.clip = array<f32, 2>(1.0, 1.0); } else {
+    let d = l - u.off.xyz;
+    o.clip = array<f32, 2>(select(-1.0, 1.0, (part & 1u) != 0u) * dot(d, u.east.xyz), select(1.0, -1.0, (part & 2u) != 0u) * dot(d, u.north.xyz));
+  }` : ''}
+  return o;
+}
+${CLIPD ? '' : `// 4 分の 1 の切り出し（FLY_WGSL の clipped と同じ。clip distances のときは使わず、深さだけのパイプラインにする）
+@fragment fn fs(i: V) {
+  let m = u32(u.p.y);
+  if (m == 0u) { return; }
+  let d = i.local - u.off.xyz;
+  let q = select(0u, 1u, dot(d, u.east.xyz) >= 0.0) + select(0u, 2u, dot(d, u.north.xyz) < 0.0);
+  if (((m >> q) & 1u) == 0u) { discard; }
+}`}` });
+  return device.createRenderPipelineAsync({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [flyLayout, sunShadowLayout] }),
+    vertex: { module, entryPoint: 'vs', buffers: [{ arrayStride: 8, attributes: [{ shaderLocation: 0, offset: 0, format: 'sint16x4' }] }] },
+    fragment: CLIPD ? undefined : { module, entryPoint: 'fs', targets: [] },
+    primitive: { topology: 'triangle-list', cullMode: 'none' },
+    depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' } });
+})();
+// 影の地図の行列（カメラを原点にした位置から。x・y は -1〜1、深さは太陽に近いほど 0）を決める。fly: 描くタイル
+function sunShadowFit(fly, nf) {
+  sunShadow.m = null;
+  if (!SHADOWS || !nf) return;
+  const { east, north, up } = enu(cam.pos);
+  const [az, el] = atmoSun.map(d => d * RAD);
+  const s = norm(add(add(mul(east, Math.sin(az) * Math.cos(el)), mul(north, Math.cos(az) * Math.cos(el))), mul(up, Math.sin(el))));
+  const lx = norm(cross([0, 0, 1], s)), ly = cross(s, lx);
+  const h = groundDist(), sinA = -dot(cam.dir, up);
+  const reach = Math.min(h / Math.max(sinA, 0.1), 5000);
+  const nadir = sub(cam.pos, mul(up, h)), target = add(cam.pos, mul(cam.dir, reach));
+  const mid = add(nadir, mul(sub(target, nadir), 0.75));
+  const r0 = clamp(len(sub(target, nadir)) + h, 150, 2500);
+  const R = 2 ** (Math.ceil(Math.log2(r0) * 4) / 4);
+  const texel = 2 * R / SHADOW_N;
+  const cx = Math.round(dot(mid, lx) / texel) * texel, cy = Math.round(dot(mid, ly) / texel) * texel;
+  let zmin = Infinity, zmax = -Infinity;
+  for (let j = 0; j < nf; j++) {
+    const b = flySphere.get(fly[j].t.key);
+    if (!b) continue;
+    if (Math.abs(dot(b.c, lx) - cx) > R + b.r || Math.abs(dot(b.c, ly) - cy) > R + b.r) continue;
+    const z = dot(sub(b.c, cam.pos), s);
+    zmin = Math.min(zmin, z - b.r); zmax = Math.max(zmax, z + b.r);
+  }
+  if (!(zmax > zmin)) return;
+  const zr = zmax - zmin + 1, ox = dot(cam.pos, lx) - cx, oy = dot(cam.pos, ly) - cy;
+  const m = new Float32Array(16);
+  for (let c = 0; c < 3; c++) { m[c * 4] = lx[c] / R; m[c * 4 + 1] = ly[c] / R; m[c * 4 + 2] = -s[c] / zr; }
+  m[12] = ox / R; m[13] = oy / R; m[14] = (zmax + 0.5) / zr; m[15] = 1;
+  sunShadow.m = m; sunShadow.texel = texel;
+}
+// 影の地図を描く（行列と描くタイルが前と同じなら描かない）。n: 地面のタイルの数（一様な値の並びで建物はその後ろ）
+function sunShadowDraw(enc, fly, n, nf, ts) {
+  if (!sunShadowPipe || !sunShadow.m) return false;
+  let key = Array.from(sunShadow.m).join();
+  for (let j = 0; j < nf; j++) key += ',' + fly[j].t.key + ':' + fly[j].mask + ':' + fly[j].t.model.prims.length;
+  if (key === sunShadow.key) return false;  sunShadow.key = key;
+  device.queue.writeBuffer(sunShadowVP, 0, sunShadow.m);
+  const pass = enc.beginRenderPass({ colorAttachments: [],
+    depthStencilAttachment: { view: sunShadowView, depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 1 },
+    timestampWrites: ts ? { querySet: ts, beginningOfPassWriteIndex: 0 } : undefined });
+  pass.setPipeline(sunShadowPipe);
+  pass.setBindGroup(1, sunShadowGroup);
+  for (let j = 0; j < nf; j++) {
+    const md = fly[j].t.model;
+    for (const p of md.prims) {
+      if (p.splat) continue;
+      pass.setBindGroup(0, p.bind, [(n + j) * U_STRIDE]);
+      pass.setVertexBuffer(0, md.buf, p.pos.offset);
+      pass.setIndexBuffer(md.buf, p.ix32 ? 'uint32' : 'uint16', p.ix.offset);
+      for (const part of quadParts(fly[j].mask)) pass.drawIndexed(p.ix.count, 1, 0, 0, part);
+    }
+  }
+  pass.end();
+  return true;
+}
 
 const linear = device.createSampler({ magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
   addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', maxAnisotropy: 8 });
@@ -1670,8 +1899,8 @@ const white = tex1('rgba8unorm', [255, 255, 255, 255]), whiteR = tex1(NIGHT ? 'r
 
 // ---------------------------------------------------------------- 大気の表と画面ごとの値
 
-const frameMain = device.createBuffer({ size: 288, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-const framePick = device.createBuffer({ size: 288, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+const frameMain = device.createBuffer({ size: 368, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+const framePick = device.createBuffer({ size: 368, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 const atmoSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
 const atmoFormat = floatFilter ? 'rgba32float' : 'rgba16float';
 let atmoT2 = device.createTexture({ size: [1, 1], format: atmoFormat, usage: GPUTextureUsage.TEXTURE_BINDING });
@@ -1683,7 +1912,8 @@ const frameEntries = buf => [
 const bsmTex = device.createTexture({ size: CN ? [512, 512] : [1, 1], format: 'rgba16float',
   usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING });
 const frameBind = buf => device.createBindGroup({ layout: frameLayout, entries: [...frameEntries(buf),
-  ...lutTex.map((t, i) => ({ binding: 4 + i, resource: t.createView() })), { binding: 6, resource: bsmTex.createView() }] });
+  ...lutTex.map((t, i) => ({ binding: 4 + i, resource: t.createView() })), { binding: 6, resource: bsmTex.createView() },
+  { binding: 7, resource: sunShadowView }, { binding: 8, resource: sunShadowSamp }] });
 const shadowLayout = device.createBindGroupLayout({ entries: [
   { binding: 0, visibility: CS, storageTexture: { access: 'write-only', format: 'rgba16float' } }, ...noiseEntries(CS)] });
 const shadowGroup = device.createBindGroup({ layout: shadowLayout, entries: [{ binding: 0, resource: bsmTex.createView() }, ...noiseResources] });
@@ -1720,7 +1950,7 @@ function frameData(vp, pickM) {
   const [az, el] = atmoSun.map(d => d * RAD);
   const sun = norm(add(add(mul(east, Math.sin(az) * Math.cos(el)), mul(north, Math.cos(az) * Math.cos(el))), mul(up, Math.sin(el))));
   const mode = !atmoReady ? 0 : look === 'apple' ? 1 : 2;
-  const f = new Float32Array(72);
+  const f = new Float32Array(92);
   // 夜は空とかすみの明るさを落とす（沈んだ太陽の残りの光で空が灰色や橙にならないよう、ほぼ黒に）
   // sun.w: かすみの表の一番遠い距離 [m]（見える地平線まで + 200 km。山や雲の分）。カメラが 30 km より高いときは 0 で、
   // 表を使わず頂点ごとに計算する（大気の外からだと、大気に入る所でかすみが急に変わり、表では縞になる。高い所から
@@ -1737,6 +1967,9 @@ function frameData(vp, pickM) {
   f.set([...sub(cam.pos, grid), NIGHT && TRAFFIC ? (performance.now() / 1000) % 600 : waveAnim() ?(performance.now() / 1000) % 3600 : 0, ...norm(grid), CN && cloudsOn && cloudReady ? 1 : 0], 60);
   // 雲の影の地図の真ん中（カメラの位置を 1 km ごとに丸めた点）
   f.set([...sub(cam.pos, shadowAnchor()), 0], 68);
+  // 建物の影の地図（prepare の sunShadowFit で決める。まだなければ、どこも地図の外になる行列）
+  f.set(sunShadow.m || SHADOW_NONE, 72);
+  f.set([sunShadow.texel, 0, 0, 0], 88);
   return f;
 }
 
@@ -2525,6 +2758,7 @@ function prepare(W, H, cssH, force = false) {
     uniformData.set([md.step, mask, t.width, md.roads ? 1 : 0, ...t.east, 0, ...t.north, 0, ...md.off, md.low, ...o, md.sea, ...t.sun0], b + 16);
   }
   if (n + nf) device.queue.writeBuffer(uniformBuffer, 0, uniformData, 0, (n + nf) * U_STRIDE / 4);
+  sunShadowFit(fly, nf);
   // pass に描く。pipes: パイプラインの組、group: 画面ごとの値、sky: 空、opaque: 地面と建物、splats: 木（重みつきでためる）
   const encode = (pass, pipes, group, { sky = true, opaque = true, splats = false } = {}) => {
     pass.setBindGroup(0, emptyGroup);
@@ -2556,7 +2790,7 @@ function prepare(W, H, cssH, force = false) {
           } else {
             pass.setVertexBuffer(1, md.buf, p.uv.offset);
             pass.setIndexBuffer(md.buf, p.ix32 ? 'uint32' : 'uint16', p.ix.offset);
-            pass.drawIndexed(p.ix.count);
+            for (const part of quadParts(fly[j].mask)) pass.drawIndexed(p.ix.count, 1, 0, 0, part);
           }
         }
       }
@@ -2564,7 +2798,7 @@ function prepare(W, H, cssH, force = false) {
     // 空: 地面と建物のあと、何も描かれていない所だけ
     if (sky) { pass.setBindGroup(0, skyGroup); pass.setPipeline(pipes.sky); pass.draw(3); }
   };
-  return { vp, near, n, nf, encode };
+  return { vp, near, n, nf, encode, shadow: (enc, ts) => sunShadowDraw(enc, fly, n, nf, ts) };
 }
 
 // 画面の描画用のテクスチャ
@@ -2576,6 +2810,9 @@ let msaaTex = null, depthTex = null, sceneTex = null, W = 0, H = 0;
 // 効く。1600 x 1000 の夜景で 1 コマ 39 ms → 25 ms ほど）。止まったら元の大きさで描き直す。?scale=1 で縮めない
 const MOVE_SCALE = Math.min(Math.max(num('scale', 0.75), 0.25), 1);
 let fastTex = null;        // 動かしている間に描くテクスチャ（resize で作る）
+// 波だけが動いている間（カメラは止まっている）は、元の大きさのまま MSAA を使わず 1 倍で描く（止まった画面を MSAA 4 倍で
+// 描き続けると、東京タワーのまわりの夕方で 1 コマ 50 ms ほどかかり、GPU が休めなかった）。テクスチャは初めて使うときに作る
+let animTex = null;
 const bloom = BLOOM ? makeBloom(device, format, light === LIGHTS.night) : null;
 const godrays = GODRAYS > 0 ? makeGodrays(device, format) : null;
 // 光芒の太陽: 画面の位置 [u, v] と強さ。太陽が画面の外へ出るほど（画面の端から縦横の半分ほどで 0）、地平線の下 3° より低いほど弱め、
@@ -2604,6 +2841,7 @@ function resize() {
   if (msaaTex) msaaTex.destroy();
   if (depthTex) depthTex.destroy();
   if (fastTex) fastTex.destroy();
+  if (animTex) { animTex.destroy(); animTex = null; }
   if (sceneTex) sceneTex.destroy();
   // にじみを足すときは、いったんこの画像に描いてから画面に重ねる
   sceneTex = bloom || godrays ? device.createTexture({ size: [W, H], format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING }) : null;
@@ -2615,8 +2853,8 @@ function resize() {
   dirty = true;
 }
 // 動かしている間のテクスチャ: 縮めた大きさの色（あとで画面に引き伸ばす）・奥行き・木をためるもの
-function fastTextures(w0, h0) {
-  const w = Math.max(1, Math.round(w0 * MOVE_SCALE)), h = Math.max(1, Math.round(h0 * MOVE_SCALE));
+function fastTextures(w0, h0, scale = MOVE_SCALE) {
+  const w = Math.max(1, Math.round(w0 * scale)), h = Math.max(1, Math.round(h0 * scale));
   const color = device.createTexture({ size: [w, h], format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
   const depth = device.createTexture({ size: [w, h], format: DEPTH, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
   const oit = oitTextures(w, h, 1);
@@ -2636,6 +2874,8 @@ function oitTextures(w, h, samples) {
 // 1 回分を描く: 空・地面・建物 → 木を重みつきでためる → 木を重ねる。
 // t: { pipes, color, resolve（MSAA のとき画面）, depth, oit, ms（MSAA で描くか）, out（できあがりを書く所）, size（[幅, 高さ]） }
 function drawScene(enc, frame, t, timestamps) {
+  // 建物の影の地図（SHADOWS のとき）。描いたら、GPU の時間の測り始めはこのパスで
+  const tsBegin = frame.shadow(enc, timestamps) ? null : timestamps;
   // かすみの表（fr は frameMain。画面の向きは同じなので、カーソルの下の点を探すときもこれを使う）
   const cp = enc.beginComputePass();
   cp.setPipeline(aerialPipe); cp.setBindGroup(0, lutGroup); cp.setBindGroup(1, groupAer);
@@ -2658,7 +2898,7 @@ function drawScene(enc, frame, t, timestamps) {
     const camKey = Array.from(frame.vp).join() + cam.pos.join() + ready;
     const sk = cloudAccumStep(c.sky, camKey, frame.vp, cam.pos, ready);
     const pc = enc.beginRenderPass({ colorAttachments: [{ view: sk.write, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0] }],
-      timestampWrites: timestamps ? { querySet: timestamps, beginningOfPassWriteIndex: 0 } : undefined });
+      timestampWrites: tsBegin ? { querySet: tsBegin, beginningOfPassWriteIndex: 0 } : undefined });
     pc.setPipeline(cloudPipe);
     pc.setBindGroup(0, device.createBindGroup({ layout: cloudPassLayout, entries: [...noiseResources,
       { binding: 16, resource: sk.hist }, { binding: 17, resource: { buffer: c.sky.uni } }] }));
@@ -2675,7 +2915,7 @@ function drawScene(enc, frame, t, timestamps) {
     depthStencilAttachment: { view: t.depth, depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 0,
       stencilLoadOp: 'clear', stencilStoreOp: 'store', stencilClearValue: 0 },
     // 描き始めの時刻は、雲を描くときは雲の画像のパスで記録する
-    timestampWrites: timestamps && !cloudsNow ? { querySet: timestamps, beginningOfPassWriteIndex: 0 } : undefined,
+    timestampWrites: tsBegin && !cloudsNow ? { querySet: tsBegin, beginningOfPassWriteIndex: 0 } : undefined,
   });
   frame.encode(p1, t.pipes, groupMain);
   p1.end();
@@ -2799,7 +3039,7 @@ function pickAsync(x, y) {
 }
 
 // 画面に描く
-let stats = { draw: 0, fly: 0 }, cpuMs = 0;
+let stats = { draw: 0, fly: 0 }, cpuMs = 0, drawMode = '';   // drawMode: 最後のコマの描き方（move・waves・still）
 function render() {
   const t0 = performance.now();
   resize();
@@ -2810,13 +3050,16 @@ function render() {
   const now = performance.now(), key = cam.pos.join() + cam.dir.join() + cam.up.join();
   if (key !== lastCam) { lastCam = key; movedAt = now; }
   const fast = SAMPLES > 1 && now - movedAt < STILL_MS;
+  const waves = SAMPLES > 1 && !fast && waveAnim();     // 波だけが動いている（animTex に 1 倍で描く）
+  drawMode = fast ? 'move' : waves ? 'waves' : 'still';
   if (fast) { clearTimeout(stillTimer); stillTimer = setTimeout(() => { dirty = true; }, STILL_MS + 10); }
   const ms = fast ? null : msaaTex;
   const enc = device.createCommandEncoder();
   const screen = ctx.getCurrentTexture().createView();
-  if (fast) {
-    // 縮めて描き、にじみを足しながら（にじみがなければそのまま）画面に引き伸ばす
-    const f = fastTex, view = f.color.createView();
+  if (fast || waves) {
+    // 縮めて描き、にじみを足しながら（にじみがなければそのまま）画面に引き伸ばす（波だけのときは元の大きさで）
+    if (waves && !animTex) animTex = fastTextures(W, H, 1);
+    const f = waves ? animTex : fastTex, view = f.color.createView();
     drawScene(enc, frame, { pipes: pipesOne, color: view, depth: f.depth.createView(), oit: f.oit, ms: false, out: view, size: [f.w, f.h], depthTex: f.depth }, query && query.set);
     // 光芒を足し（足した画面は光芒の側のテクスチャ）、にじみを足しながら（なければそのまま）画面に引き伸ばす
     const sunR = godraySun(frame.vp);
@@ -2956,12 +3199,13 @@ Object.assign(GE, {
   look: () => look, setLook: name => { look = name; try { localStorage.setItem('look', name); } catch (e) { /* */ } dirty = true; },
   atmosphere: ATMOSPHERE, mode2D: false,
   pending: () => active + flyActive + uploads.length + groundUploads.length, shooting: () => !!shooting,
-  stats: () => ({ gpuMs, cpuMs, ...stats, groundTiles: loadedCount, flyModels, flyActive, uploads: uploads.length, groundUploads: groundUploads.length, upSubmits, active,
+  stats: () => ({ gpuMs, cpuMs, drawMode, ...stats, groundTiles: loadedCount, flyModels, flyActive, uploads: uploads.length, groundUploads: groundUploads.length, upSubmits, active,
     memMB: { ground: mem.ground / 1048576, fly: mem.fly / 1048576 }, hevc, bc: BC }),
 });
 // 夜景では車の光を動かすので、止まっていても 0.1 秒ごとに描き直す（?traffic=0 で止める）
 if (NIGHT && TRAFFIC) setInterval(() => { dirty = true; }, 100);
-if (WATER) setInterval(() => { if (waveAnim() && !document.hidden) dirty = true; }, 33);     // 水面の波を動かす（google のとき）
+// 水面の波を動かす（google のとき）。毎秒 20 コマ（波はゆっくりなので、30 コマと見分けにくく、GPU の時間が 3 分の 2 になる）
+if (WATER) setInterval(() => { if (waveAnim() && !document.hidden) dirty = true; }, 50);
 requestAnimationFrame(tick);
 return GE;
 })();
