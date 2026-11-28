@@ -26,11 +26,12 @@ function codecString(h) {
           (tier ? 'H' : 'L') + h[12], ...cons.map(b => b.toString(16).toUpperCase())].join('.');
 }
 
-function decode(config, data) {
-  // 展開器はこのスレッドで 1 つを使い回す（作るのに時間がかかる）。設定が前と同じなら設定し直さない。
-  // 失敗すると展開器は閉じるので、次は作り直す
+// 展開器はこのスレッドで 1 つを使い回す（作るのに時間がかかる）。設定が前と同じなら設定し直さない。
+// 失敗すると展開器は閉じるので、次は作り直す。出てきたコマは、sink があればそれに渡し、なければ frame に置く
+function ready(config) {
   if (!dec || dec.state === 'closed') {
-    dec = new VideoDecoder({ output: f => { if (frame) frame.close(); frame = f; }, error: e => { lastError = e; } });
+    dec = new VideoDecoder({ output: f => { if (sink) { sink(f); return; } if (frame) frame.close(); frame = f; },
+                             error: e => { lastError = e; } });
     lastConfig = null;
   }
   const key = codecString(config) + ':' + config.join(',');
@@ -39,6 +40,9 @@ function decode(config, data) {
                     hardwareAcceleration: 'prefer-hardware' });
     lastConfig = key;
   }
+}
+function decode(config, data) {
+  ready(config);
   frame = null; lastError = null;
   dec.decode(new EncodedVideoChunk({ type: 'key', timestamp: 0, data }));
   return dec.flush().then(() => {
@@ -48,7 +52,56 @@ function decode(config, data) {
     return f;
   }, e => { throw lastError || e; });
 }
-let dec = null, frame = null, lastConfig = null, lastError = null;
+let dec = null, frame = null, lastConfig = null, lastError = null, sink = null;
+
+// 続けて展開する（gpu が 'frame' で batch のとき）。画像ごとに flush すると、専用回路の流れが毎回空になるまで待つ。
+// 届いたタイルの画像をすぐ decode に入れ（前のタイルの展開を待たない。設定が変わる所も、configure は前の decode の
+// あとに順に行われる）、待っている画像がなくなったときだけ flush する（専用回路は最後のコマを、次が来るか flush
+// するまで出さないことがある）。出てきたコマは、抱えたまま次を展開すると詰まることがあるので、すぐ { id, part,
+// frame } で送り、タイルの全部のコマを送ったら { id, out, ms } で知らせる。どのタイルの何枚目かは、通し番号の
+// timestamp で見分ける
+const live = new Map();          // timestamp -> { job, part }
+let nextTs = 0, flushing = false;
+function streamOut(f) {
+  const e = live.get(f.timestamp);
+  live.delete(f.timestamp);
+  if (!e) { f.close(); return; }
+  const { job, part } = e, w = f.visibleRect.width, h = f.visibleRect.height;
+  job.out[part] = { w, h, part };
+  postMessage({ id: job.id, part, frame: f }, [f]);      // 送ると、このスレッドのコマは閉じる
+  if (--job.left === 0) postMessage({ id: job.id, out: job.out, ms: { decode: performance.now() - job.t, copy: 0, n: job.out.length } });
+}
+// 通し番号が upto より前で、まだコマが出ていないタイルを失敗にする（upto がなければ全部）
+function streamFail(e, upto = Infinity) {
+  const jobs = new Set();
+  for (const [ts, v] of live) if (ts < upto) { jobs.add(v.job); live.delete(ts); }
+  for (const [ts, v] of live) if (jobs.has(v.job)) live.delete(ts);
+  for (const job of jobs) postMessage({ id: job.id, error: String(lastError || e) });
+}
+// flush を始めた時までに入れた画像は、flush が終われば全部出ているはず。flush の間に届いたタイルはまだ出ていない
+// ことがあるので、それはもう 1 回 flush する
+function streamFlush() {
+  if (flushing || !live.size || !dec || dec.state === 'closed') return;
+  flushing = true;
+  const upto = nextTs;
+  dec.flush().then(() => { flushing = false; streamFail(new Error('コマが出てこない'), upto); streamFlush(); },
+                   e => { flushing = false; streamFail(e); });
+}
+function stream(id, images) {
+  const job = { id, out: images.map(() => null), left: images.length, t: performance.now() };
+  if (!images.length) { postMessage({ id, out: [], ms: { decode: 0, copy: 0, n: 0 } }); return; }
+  try {
+    sink = streamOut;
+    images.forEach((im, i) => {
+      ready(im.config);
+      const ts = nextTs++;
+      live.set(ts, { job, part: i });
+      dec.decode(new EncodedVideoChunk({ type: 'key', timestamp: ts, data: im.data }));
+    });
+  } catch (e) { streamFail(e); return; }
+  // 同じ時に続けて届いたタイルも入れ終えてから flush する
+  setTimeout(streamFlush, 0);
+}
 
 // 展開したコマ（NV12 か I420）を、すき間なく詰めた Y と UV（交互）の面にする
 async function planes(frame) {
@@ -75,8 +128,10 @@ async function planes(frame) {
 
 // このスレッドの中では 1 つずつ順に展開する（並べるときは earth.js がスレッドを増やす）
 let queue = Promise.resolve();
-onmessage = ({ data: { id, images, gpu } }) => {
+onmessage = ({ data: { id, images, gpu, batch } }) => {
+  if (gpu === 'frame' && batch) { stream(id, images); return; }
   queue = queue.then(async () => {
+    sink = null;
     try {
       const out = [], ms = { decode: 0, copy: 0, n: images.length };   // かかった時間（調べる用）
       for (const im of images) {

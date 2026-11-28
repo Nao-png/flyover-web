@@ -15,6 +15,7 @@
 取得したものは cache/ に保存し、次からはそれを使う。r3d=True なら、Flyover のタイルに iOS 27 の
 新しい Flyover（style 98、flyover/r3d.py）を使い、そのタイルがないか読めないときは C3M にする。
 """
+import asyncio
 import http.server
 import json
 import mimetypes
@@ -73,6 +74,11 @@ def fetch_heights(z, get_many, r3d=False):
             return raws
         else:
             n = 4
+
+
+async def _call(fn, **kw):
+    """fn(**kw) をイベントループのスレッドで呼ぶ（/api/netconfig）。"""
+    return fn(**kw)
 
 
 def fetch_r3d(client, region, x, y, z, get_many):
@@ -204,7 +210,7 @@ class Earth:
         t0 = time.perf_counter()
         with self._lock(("glb", z, x, y, hevc, night)):
             timing["wait"] = (time.perf_counter() - t0) * 1000
-            if os.path.exists(path):
+            if os.path.exists(path) and not self.client.nocache:
                 return open(path, "rb").read() or None
             t0 = time.perf_counter()
             out = None
@@ -350,6 +356,19 @@ def handler(earth):
         def route(self, path, query):
             if path == "/api/config":
                 return self.send(200, json.dumps(earth.config()).encode(), "application/json", cache=False)
+            if path == "/api/netconfig":          # 取り方の設定（比べる用）: ?hedge=秒&hedge_below=本&limit=本&nocache=1
+                q = {k: v[0] for k, v in query.items()}
+                if "nocache" in q:
+                    earth.client.nocache = q.pop("nocache") == "1"
+                net = earth.client._net
+                cfg = asyncio.run_coroutine_threadsafe(_call(net.configure, **q), net.loop).result()
+                return self.send(200, json.dumps({**cfg, "nocache": earth.client.nocache}).encode(),
+                                 "application/json", cache=False)
+            if path == "/api/netstats":           # Apple からの取得の数と時間（調べる用。?reset=1 で数え直す）
+                net = earth.client._net
+                if query.get("reset") == ["1"]:
+                    net.reset_stats()
+                return self.send(200, json.dumps(net.stats_summary()).encode(), "application/json", cache=False)
             if path == "/api/search":
                 res = earth.search(query.get("q", [""])[0])
                 return self.send(200, json.dumps(res, ensure_ascii=False).encode(),

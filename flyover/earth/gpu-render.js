@@ -153,6 +153,20 @@ const MIX_TOP = (() => {
 })();
 const SEASONS = { sakura: 0, momiji: 1, check: 2 };
 const season = cfg.r3d ? SEASONS[params.get('season')] : undefined;
+// 季節の色の印が付くまでの時間（調べる用。GE.stats の season）: タイルの数、合計と最長 [ms]
+const seasonStat = { tiles: 0, ms: 0, max: 0 };
+// 印は別のスレッド（gpu-season-worker.js）で付ける（1 タイルで 75 ms ほどかかり、メインスレッドでは画面が止まった）。
+// glb のバイト列と HEVC の面は、写さずに渡して返してもらう。?seasonw=0 でメインスレッドで付ける
+const seasonWorker = season !== undefined && params.get('seasonw') !== '0' ? new Worker('gpu-season-worker.js') : null;
+const seasonJobs = new Map();
+let seasonId = 0;
+if (seasonWorker) seasonWorker.onmessage = ({ data }) => { const done = seasonJobs.get(data.id); seasonJobs.delete(data.id); done(data); };
+const seasonMark = (buf, planes, fine) => new Promise(resolve => {
+  const id = ++seasonId;
+  seasonJobs.set(id, resolve);
+  seasonWorker.postMessage({ id, buf, planes, fine },
+    [buf.buffer, ...(planes || []).flatMap(p => p && p.y ? [p.y.buffer, p.uv.buffer] : [])]);
+});
 const SAMPLES = Number(params.get('msaa')) === 1 ? 1 : 4;
 
 // ---------------------------------------------------------------- シェーダー
@@ -1313,7 +1327,7 @@ const noiseResources = [
   { binding: 21, resource: clWeatherTex.createView() }];
 // ノイズを作る計算シェーダー。形のノイズは重いので、16 段ずつ毎コマに分けて作る（一度に作ると GPU が時間切れになる
 // おそれがある）。clGenStep が 0〜7 で形、8 で残り、9 で天気のミップマップ。できたら cloudReady
-let clGenStep = 0, cloudReady = false;
+let clGenStep = 0, cloudReady = false, cloudInfo = null, clGenT0 = 0;   // cloudInfo: 雲のノイズを作り始めてからできるまでの時間 [ms]（GE.stats の clouds）
 const clGen = CN ? (() => {
   const layout = device.createBindGroupLayout({ entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm', viewDimension: '3d' } },
@@ -1336,6 +1350,7 @@ const clGen = CN ? (() => {
   return { shape: pipe('genShape'), detail: pipe('genDetail'), weather: pipe('genWeather'), turb: pipe('genTurb'), groups };
 })() : null;
 function cloudGenTick() {
+  if (!clGenStep) clGenT0 = performance.now();
   const enc = device.createCommandEncoder();
   if (clGenStep < 8) {
     const cp = enc.beginComputePass();
@@ -1351,6 +1366,7 @@ function cloudGenTick() {
   } else {
     makeMips(enc, clWeatherTex, CL_WEATHER_LEVELS);
     cloudReady = true;
+    cloudInfo = { from: 'generate', ms: Math.round(performance.now() - clGenT0) };
   }
   device.queue.submit([enc.finish()]);
   clGenStep++;
@@ -1924,12 +1940,62 @@ const lutFrameBind = () => device.createBindGroup({ layout: frameLayoutC, entrie
 const aerFrameBind = () => device.createBindGroup({ layout: frameLayoutA, entries: [...frameEntries(frameMain),
   { binding: 6, resource: bsmTex.createView() }] });
 let groupMain = frameBind(frameMain), groupPick = frameBind(framePick), groupLut = lutFrameBind(), groupAer = aerFrameBind(), atmoReady = false;
-// 前もって計算する表は、今のビューアのワーカーで（WebGL2 で数秒）。float32 の補間ができないときは使わない
+// 大気の表ができるまでの時間 [ms] と、どこから来たか（cache・compute。GE.stats の atmo）
+const atmoT0 = performance.now();
+let atmoInfo = null;
+// 大気の表をこのブラウザーに覚えておく（IndexedDB。表は 17 MB ほど）。鍵は計算の設定と、計算に使うファイル
+// （atmosphere.js と 2 つの GLSL）の中身の SHA-256 なので、どれかを直せば計算し直す。設定ごと（?light= の光で
+// もやの層の上端が変わる）に、新しく使った 4 つまで残す
+const atmoCache = (() => {
+  const KEEP = 4;
+  let dbp = null;
+  const db = () => dbp || (dbp = new Promise((ok, ng) => {
+    const r = indexedDB.open('flyover-atmosphere', 1);
+    // tables: 鍵 -> 表、used: 鍵 -> 最後に使った時刻（古いものを消すのに、大きな表を読まずに済むよう分ける）
+    r.onupgradeneeded = () => { r.result.createObjectStore('tables'); r.result.createObjectStore('used'); };
+    r.onsuccess = () => ok(r.result); r.onerror = () => ng(r.error);
+  }));
+  const done = tx => new Promise((ok, ng) => { tx.oncomplete = ok; tx.onerror = tx.onabort = () => ng(tx.error); });
+  return {
+    async key(params) {
+      const files = await Promise.all(['atmosphere.js', 'atmosphere/definitions.glsl', 'atmosphere/functions.glsl']
+        .map(u => fetch(u).then(r => { if (!r.ok) throw new Error(u + ' ' + r.status); return r.text(); })));
+      const bytes = new TextEncoder().encode(JSON.stringify(params) + '\0' + files.join('\0'));
+      return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)), b => b.toString(16).padStart(2, '0')).join('');
+    },
+    async get(key) {
+      const tx = (await db()).transaction(['tables', 'used'], 'readwrite');
+      let v = null;
+      tx.objectStore('tables').get(key).onsuccess = e => {
+        v = e.target.result || null;
+        if (v) tx.objectStore('used').put(Date.now(), key);
+      };
+      await done(tx);
+      return v;
+    },
+    async put(key, v) {
+      try {
+        const tx = (await db()).transaction(['tables', 'used'], 'readwrite');
+        const tables = tx.objectStore('tables'), used = tx.objectStore('used');
+        tables.put(v, key);
+        used.put(Date.now(), key);
+        const seen = [];
+        used.openCursor().onsuccess = e => {
+          const c = e.target.result;
+          if (c) { seen.push([c.key, c.key === key ? Infinity : c.value]); c.continue(); return; }
+          for (const [k] of seen.sort((a, b) => b[1] - a[1]).slice(KEEP)) { tables.delete(k); used.delete(k); }
+        };
+        await done(tx);
+      } catch (e) { console.warn('大気の表を保存できない:', e); }
+    },
+  };
+})();
+// 前もって計算する表は、今のビューアのワーカーで（WebGL2 で数秒）。float32 の補間ができないときは使わない。
+// 計算した表はこのブラウザーの IndexedDB に覚えておき、次からはそれを使う（atmoCache）
 if (ATMOSPHERE && floatFilter) {
-  const worker = new Worker('atmosphere.js');
-  worker.onmessage = ({ data }) => {
-    worker.terminate();
-    if (!data.ok) { console.warn('大気を計算できない:', data.error); return; }
+  const params = { haze: ATMO.haze, strat: num('strat', 1), mixTop: MIX_TOP };
+  const use = (data, from) => {
+    atmoInfo = { from, ms: Math.round(performance.now() - atmoT0) };
     const tex = (w, h, d, pixels) => {
       const t = device.createTexture({ size: [w, h, d], dimension: d > 1 ? '3d' : '2d', format: 'rgba32float',
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
@@ -1941,7 +2007,18 @@ if (ATMOSPHERE && floatFilter) {
     groupMain = frameBind(frameMain); groupPick = frameBind(framePick); groupLut = lutFrameBind(); groupAer = aerFrameBind();
     atmoReady = true; dirty = true;
   };
-  worker.postMessage({ haze: ATMO.haze, strat: num('strat', 1), mixTop: MIX_TOP });
+  const compute = key => {
+    const worker = new Worker('atmosphere.js');
+    worker.onmessage = ({ data }) => {
+      worker.terminate();
+      if (!data.ok) { console.warn('大気を計算できない:', data.error); return; }
+      use(data, 'compute');
+      if (key) atmoCache.put(key, { transmittance: data.transmittance, scattering: data.scattering, irradiance: data.irradiance });
+    };
+    worker.postMessage(params);
+  };
+  atmoCache.key(params).then(key => atmoCache.get(key).then(hit => hit ? use(hit, 'cache') : compute(key)))
+    .catch(e => { console.warn('大気の表の保存を使えない:', e); compute(null); });
 }
 const IDENTITY = new Float64Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
 // 画面ごとの値: カメラは真下の楕円体からの高さで大気の球（半径 6360 km）の上に置く（今のビューアと同じ）
@@ -2317,17 +2394,30 @@ async function rawTile(t, signal) {
 // 展開は 1 つずつ（同時にいくつも展開すると GPU の側が詰まり、画面が 100 ms 単位で止まる。読み込みも遅くなる）。
 // ?hevcw= で数を変えられる
 const HEVC_WORKERS = Number(params.get('hevcw')) || 1;
-const hevcWorkers = hevc ? Array.from({ length: HEVC_WORKERS }, () => ({ worker: new Worker('hevc.js'), job: null })) : [];
+const hevcWorkers = hevc ? Array.from({ length: HEVC_WORKERS }, () => ({ worker: new Worker('hevc.js'), jobs: new Map() })) : [];
 const hevcPending = [];
 // コマをそのまま受け取るか（?hevcframe=0 で前と同じく RGB の画像で受け取る）
 const HEVC_FRAME = params.get('hevcframe') !== '0';
+// 前のタイルの展開を待たずに次のタイルを展開器に入れ、flush は待つものがなくなったときだけ（hevc.js の stream）。
+// 1 つの展開器に同時に頼むタイルの数は HEVC_DEPTH まで（?hevcdepth=）。?hevcbatch=0 で前と同じく 1 枚ずつ flush
+const HEVC_BATCH = params.get('hevcbatch') !== '0' && HEVC_FRAME && season === undefined;
+const HEVC_DEPTH = HEVC_BATCH ? Math.max(1, Number(params.get('hevcdepth')) || 2) : 1;
+let hevcId = 0;
+// 展開にかかった時間（調べる用。GE.stats の hevcDecode）: タイルの数、画像の数、頼んでから全部届くまでの時間の合計、
+// 最初に頼んでから最後に届くまで [ms]
+const hevcStat = { tiles: 0, images: 0, ms: 0, first: 0, last: 0 };
 for (const w of hevcWorkers) w.worker.onmessage = ({ data }) => {
-  const job = w.job;
+  const job = w.jobs.get(data.id);
+  if (!job) { if (data.frame) data.frame.close(); return; }
   if (data.frame) {             // 1 枚ずつ届くコマは、すぐ GPU で Y と UV にする
     try { job.parts[data.part] = frameTextures(data.frame, 'fly'); } catch (e) { job.partError = e; }
     return;
   }
-  w.job = null;
+  w.jobs.delete(data.id);
+  if (!data.error) {
+    const now = performance.now();
+    hevcStat.tiles++; hevcStat.images += data.out.length; hevcStat.ms += now - job.sent; hevcStat.last = now;
+  }
   const err = data.error ? new Error(data.error) : job.partError;
   if (err) { dropFrames(job.parts); job.reject(err); }
   else job.resolve(data.out.map(o => o.part !== undefined ? job.parts[o.part] : o));
@@ -2340,13 +2430,16 @@ function hevcNext() {
   }
   const rank = ({ t }) => (t.vis && t.wanted === fframe ? 0 : 1e9) + t.pri;
   for (const w of hevcWorkers) {
-    if (w.job || !hevcPending.length) continue;
-    let best = 0;
-    for (let i = 1; i < hevcPending.length; i++) if (rank(hevcPending[i]) < rank(hevcPending[best])) best = i;
-    w.job = hevcPending.splice(best, 1)[0];
-    w.job.parts = [];
-    // 季節の色では、写真の色を CPU で見る（gpu-season.js）ので、Y と UV を読み戻す
-    w.worker.postMessage({ id: 0, images: w.job.images, gpu: season !== undefined ? false : HEVC_FRAME ? 'frame' : true });
+    while (w.jobs.size < HEVC_DEPTH && hevcPending.length) {
+      let best = 0;
+      for (let i = 1; i < hevcPending.length; i++) if (rank(hevcPending[i]) < rank(hevcPending[best])) best = i;
+      const job = hevcPending.splice(best, 1)[0], id = ++hevcId;
+      job.parts = []; job.sent = now;
+      if (!hevcStat.first) hevcStat.first = now;
+      w.jobs.set(id, job);
+      // 季節の色では、写真の色を CPU で見る（gpu-season.js）ので、Y と UV を読み戻す
+      w.worker.postMessage({ id, images: job.images, gpu: season !== undefined ? false : HEVC_FRAME ? 'frame' : true, batch: HEVC_BATCH });
+    }
   }
 }
 const hevcDecode = (t, images) => new Promise((resolve, reject) => { hevcPending.push({ t, images, resolve, reject }); hevcNext(); });
@@ -2470,7 +2563,16 @@ async function flyLoad(t) {
       }
     }
     if (season !== undefined) {            // 季節の色: スプラットに木の葉かどうかの印を付ける（buf を書き換える）
-      try { await markTreeSplats(buf, frames, t.z >= 19); } catch (e) { console.warn('季節の色の印', t.key, e); }
+      const ts = performance.now();
+      if (seasonWorker) {
+        const r = await seasonMark(buf, frames, t.z >= 19);
+        buf = r.buf; frames = r.planes || frames;
+        if (r.error) console.warn('季節の色の印', t.key, r.error);
+      } else {
+        try { await markTreeSplats(buf, frames, t.z >= 19); } catch (e) { console.warn('季節の色の印', t.key, e); }
+      }
+      const dt = performance.now() - ts;
+      seasonStat.tiles++; seasonStat.ms += dt; seasonStat.max = Math.max(seasonStat.max, dt);
       ({ json: g, bin } = glbParts(buf));
     }
     // 使う画像だけを読む: HEVC でない材質の写真と、?light= のときは日の当たり方の画像
@@ -2873,14 +2975,22 @@ function oitTextures(w, h, samples) {
 }
 // 1 回分を描く: 空・地面・建物 → 木を重みつきでためる → 木を重ねる。
 // t: { pipes, color, resolve（MSAA のとき画面）, depth, oit, ms（MSAA で描くか）, out（できあがりを書く所）, size（[幅, 高さ]） }
+let aerialKey = '';       // 前にかすみの表を計算したときの条件（drawScene）
 function drawScene(enc, frame, t, timestamps) {
   // 建物の影の地図（SHADOWS のとき）。描いたら、GPU の時間の測り始めはこのパスで
-  const tsBegin = frame.shadow(enc, timestamps) ? null : timestamps;
-  // かすみの表（fr は frameMain。画面の向きは同じなので、カーソルの下の点を探すときもこれを使う）
-  const cp = enc.beginComputePass();
-  cp.setPipeline(aerialPipe); cp.setBindGroup(0, lutGroup); cp.setBindGroup(1, groupAer);
-  cp.dispatchWorkgroups(LUT / 4, LUT / 4, LUT / 4);
-  cp.end();
+  let tsBegin = frame.shadow(enc, timestamps) ? null : timestamps;
+  // かすみの表（fr は frameMain。画面の向きは同じなので、カーソルの下の点を探すときもこれを使う）。表はカメラ・
+  // 太陽・色合い・雲（と雲の影の地図）だけで決まるので、それが前と同じなら計算しない（カメラを止めて波や夜景の車だけが
+  // 動いている間は、毎コマ同じ表を計算し直していた）。計算したら、GPU の時間の測り始めはこのパスで
+  const ak = frame.vp.join() + cam.pos.join() + atmoReady + look + (cloudPipe && cloudsOn && cloudReady) + shadowKey;
+  if (ak !== aerialKey) {
+    aerialKey = ak;
+    const cp = enc.beginComputePass(tsBegin ? { timestampWrites: { querySet: tsBegin, beginningOfPassWriteIndex: 0 } } : undefined);
+    cp.setPipeline(aerialPipe); cp.setBindGroup(0, lutGroup); cp.setBindGroup(1, groupAer);
+    cp.dispatchWorkgroups(LUT / 4, LUT / 4, LUT / 4);
+    cp.end();
+    tsBegin = null;
+  }
   const cloudsNow = cloudPipe && cloudsOn && cloudReady;
   if (cloudPipe && !cloudsNow) { skyGroup = noCloudGroup; cloudOverNow = null; }
   if (cloudsNow) {
@@ -3031,9 +3141,14 @@ let lastPick = null;
 // 建物も含めたカーソルの下の点を、次に描くときに探す（Promise）
 function pickAsync(x, y) {
   if (!canPick) { const p = pickTerrain(x, y); return Promise.resolve(p ? { p, onGlobe: true } : null); }
+  // 同じ位置の要求がまだ待っていれば、それに相乗りする（打ち切らない）。gpu-ui.js はカーソルの下の点を、表示用と
+  // ドラッグ用（requestHover）に同じ位置で続けて頼むので、前の要求を null で打ち切ると、ドラッグ用の点がいつも
+  // null になり、建物の上でも地形だけで探していた
   return new Promise(resolve => {
+    if (pickReq && pickReq.req.x === x && pickReq.req.y === y) { pickReq.all.push(resolve); return; }
     if (pickReq) pickReq.resolve(null);
-    pickReq = { req: { x, y }, resolve };
+    const all = [resolve];
+    pickReq = { req: { x, y }, all, resolve: v => { for (const f of all) f(v); } };
     dirty = true;
   });
 }
@@ -3199,7 +3314,7 @@ Object.assign(GE, {
   look: () => look, setLook: name => { look = name; try { localStorage.setItem('look', name); } catch (e) { /* */ } dirty = true; },
   atmosphere: ATMOSPHERE, mode2D: false,
   pending: () => active + flyActive + uploads.length + groundUploads.length, shooting: () => !!shooting,
-  stats: () => ({ gpuMs, cpuMs, drawMode, ...stats, groundTiles: loadedCount, flyModels, flyActive, uploads: uploads.length, groundUploads: groundUploads.length, upSubmits, active,
+  stats: () => ({ gpuMs, cpuMs, drawMode, atmo: atmoInfo, clouds: cloudInfo, season: { ...seasonStat }, hevcDecode: { ...hevcStat }, ...stats, groundTiles: loadedCount, flyModels, flyActive, uploads: uploads.length, groundUploads: groundUploads.length, upSubmits, active,
     memMB: { ground: mem.ground / 1048576, fly: mem.fly / 1048576 }, hevc, bc: BC }),
 });
 // 夜景では車の光を動かすので、止まっていても 0.1 秒ごとに描き直す（?traffic=0 で止める）
