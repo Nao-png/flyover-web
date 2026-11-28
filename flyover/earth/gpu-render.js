@@ -2369,16 +2369,15 @@ const FLY_ACTIVE = 48, KEEP_MS = 5000, MAX_MODELS = 150, UPLOADS_PER_FRAME = 4;
 // ?raw=1: Flyover のタイルを、サーバーで glb にせず、Apple から受け取ったまま（/api/r3d/、/api/c3m/）受け取って、
 // ブラウザの作業用のスレッド（c3m.js と r3d.js）で読み解く。--r3d のサーバーなら新しい Flyover（R3D。ないタイルと
 // 読めないタイルは古い Flyover）、そうでなければ古い Flyover（C3M）。?c3m=1 はいつも古い Flyover。画像は HEVC のまま
-// GPU で展開する。HEVC を GPU で展開できないときと、?light= のときはふだんの glb（R3D の日の当たり方とガラスの地図は
-// 白黒の HEVC で、ブラウザでは展開できない）
+// GPU で展開する。HEVC を GPU で展開できないときはふだんの glb。?light= のときは、R3D の日の当たり方とガラスの地図
+// （白黒の HEVC で、ブラウザでは展開できない）だけを、サーバーで JPEG にして付けてもらう（/api/r3d/?shade=1）
 const RAW_WANT = params.get('c3m') === '1' ? 'c3m' : params.get('raw') === '1' ? (cfg.r3d ? 'r3d' : 'c3m') : null;
 // HEVC のまま受け取って GPU の専用回路で展開する（できないときと ?hevc=0 のときは JPEG）
 let hevc = (cfg.r3d || RAW_WANT) && typeof VideoDecoder !== 'undefined' && params.get('hevc') !== '0'
   && (await VideoDecoder.isConfigSupported({ codec: 'hvc1.3.E.L120.B0', hardwareAcceleration: 'prefer-hardware' })
     .catch(() => ({}))).supported === true;
-const RAW = RAW_WANT && hevc && !light ? RAW_WANT : null;
-if (RAW_WANT && !RAW) console.warn(light ? '?light= では R3D の日の当たり方の画像が要るので、ふだんの glb で読み込む'
-  : 'HEVC を GPU で展開できないので、ふだんの glb で読み込む');
+const RAW = RAW_WANT && hevc ? RAW_WANT : null;
+if (RAW_WANT && !RAW) console.warn('HEVC を GPU で展開できないので、ふだんの glb で読み込む');
 const C3M_WORKERS = RAW ? Array.from({ length: 2 }, () => ({ worker: new Worker('c3m.js'), jobs: new Map() })) : [];
 let c3mId = 0;
 for (const w of C3M_WORKERS) {
@@ -2407,7 +2406,8 @@ const rawDecode = (key, kind, raw) => new Promise((resolve, reject) => {
 // そのまま受け取って読み解いたタイルの glb（Uint8Array）。データがなければ null。R3D がないか読めなければ C3M にする
 async function rawTile(t, signal) {
   for (const kind of RAW === 'r3d' ? ['r3d', 'c3m'] : ['c3m']) {
-    const r = await fetch(`${hostBase(t.x + t.y + 1)}/api/${kind}/${t.z}/${t.x}/${t.y}.bin`, { signal });
+    const q = kind === 'r3d' && light ? '?shade=1' + (NIGHT ? '&night=1' : '') : '';
+    const r = await fetch(`${hostBase(t.x + t.y + 1)}/api/${kind}/${t.z}/${t.x}/${t.y}.bin${q}`, { signal });
     if (r.status === 204) continue;
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await rawDecode(t.key, kind, await r.arrayBuffer());

@@ -250,9 +250,11 @@ class Net:
                         if len(self.stats["one_ms"]) < 100000:
                             self.stats["one_ms"].append(ms)
                             self.stats["by_flight"].setdefault(flight, []).append(ms)
-                        self.stats["bytes"] += len(r.content)
+                        # 数えるだけ（応答でないもの、たとえば試験の偽物の接続が返すものでも止まらないように）
+                        self.stats["bytes"] += len(getattr(r, "content", b"") or b"")
                         self.stats["t1"] = self.loop.time()
-                        self.stats["status"][r.status_code] = self.stats["status"].get(r.status_code, 0) + 1
+                        code = getattr(r, "status_code", None)
+                        self.stats["status"][code] = self.stats["status"].get(code, 0) + 1
                 finally:
                     if limit:
                         limit.release()

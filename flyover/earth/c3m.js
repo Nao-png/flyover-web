@@ -773,13 +773,20 @@ function tileModel(c3ms, warnings = []) {
     if (!matIndex.has(key)) {
       const m = c3ms[ci].materials[mat];
       const hv = m && m.format === 'heic' ? heifHevc(m.image) : null;
+      // 日の当たり方の画像（サーバーで JPEG にしたもの。flyover/glb.py と同じく occlusionTexture に）
+      let shade = {};
+      if ((hv || (m && m.format === 'jpeg')) && m.shadeJpeg && !m.repeat) {
+        images.push({ bufferView: view(m.shadeJpeg), mimeType: 'image/jpeg' });
+        textures.push({ source: images.length - 1, sampler: 0 });
+        shade = { occlusionTexture: { index: textures.length - 1 } };
+      }
       if (hv) {
-        materials.push({ pbrMetallicRoughness: unlit, doubleSided: true,
+        materials.push({ pbrMetallicRoughness: unlit, doubleSided: true, ...shade,
           extras: { hevc: { config: view(hv.config), data: view(hv.data), width: hv.w, height: hv.h, slab: slabs++ } } });
       } else if (m && m.format === 'jpeg') {
         images.push({ bufferView: view(m.image), mimeType: 'image/jpeg' });
         textures.push({ source: images.length - 1, sampler: m.repeat ? 1 : 0 });
-        materials.push({ pbrMetallicRoughness: { ...unlit, baseColorTexture: { index: textures.length - 1 } }, doubleSided: true });
+        materials.push({ pbrMetallicRoughness: { ...unlit, baseColorTexture: { index: textures.length - 1 } }, doubleSided: true, ...shade });
       } else {
         materials.push(null);       // 読めない画像（分割された HEIC など）。描かない
         warnings.push(`区分 ${ci} の材質 ${mat} の画像（${m ? m.format : 'なし'}）を読めないので、その三角形は描かない`);
@@ -891,6 +898,21 @@ function splitRaw(raw) {
     out.push(len ? raw.slice(off, off + len) : null);
     off += len;
   }
+  out.end = off;
+  return out;
+}
+// 区分の並びのあとに付いた、材質ごとの日の当たり方の画像（flyover/earth.py の shade_block。/api/r3d/?shade=1）。
+// Map: '区分:材質の番号' -> JPEG（Uint8Array）。付いていなければ空
+function shadeBlock(raw, off) {
+  const out = new Map();
+  if (off + 4 > raw.byteLength) return out;
+  const dv = new DataView(raw), m = dv.getUint32(off, true);
+  off += 4;
+  for (let i = 0; i < m; i++) {
+    const h = dv.getUint32(off, true), k = dv.getUint32(off + 4, true), len = dv.getUint32(off + 8, true);
+    out.set(h + ':' + k, new Uint8Array(raw, off + 12, len));
+    off += 12 + len;
+  }
   return out;
 }
 
@@ -898,11 +920,16 @@ function splitRaw(raw) {
 // build_glb と同じ）。R3D（parseFn に r3d.js の parse）では strict: 1 区分でも読めなければ 'fallback'（ビューアが C3M に
 // する。区分が欠けて建物の上が消えないよう）
 function build(raw, warnings = [], parseFn = parse, strict = false) {
-  const tiles = [];
+  const tiles = [], parts = splitRaw(raw), shades = shadeBlock(raw, parts.end);
   let failed = false;
-  splitRaw(raw).forEach((b, h) => {
+  parts.forEach((b, h) => {
     if (!b || failed) return;
-    try { tiles.push(parseFn(b)); } catch (e) { warnings.push(`h=${h} を読めない: ${e.message}`); if (strict) failed = true; }
+    try {
+      const t = parseFn(b);
+      // 日の当たり方の画像（JPEG）を材質に付ける（tileModel が occlusionTexture にする）
+      if (shades.size) (t.materials || []).forEach((m, k) => { const j = shades.get(h + ':' + k); if (j) m.shadeJpeg = j; });
+      tiles.push(t);
+    } catch (e) { warnings.push(`h=${h} を読めない: ${e.message}`); if (strict) failed = true; }
   });
   if (failed) return 'fallback';
   return tiles.length ? tileModel(tiles, warnings) : null;
