@@ -54,6 +54,7 @@ MANIFEST_URL_IOS27 = MANIFEST_URL.replace(
     "hardware=iPhone18,1&os=ios&os_build=24A335&os_version=27.0")
 STYLE_DTM = 17                    # 地形（16 bit の PNG、値は海抜 [m] の 4 倍）
 HEDGE = 1.5                       # 応答がこれ [秒] より遅ければ、同じ要求をもう 1 本出す
+HEDGE_BELOW = 32                  # ただし、出ている要求がこれより少ないときだけ（Net の説明を見よ）
 
 
 def _varint(b, i):
@@ -136,6 +137,9 @@ class Net:
 
     Apple の応答はたまに数秒以上かかり、それが読み込みの最後まで残るので、HEDGE 秒たっても
     返らなければ同じ要求を別の接続でもう 1 本出し、先に返ったほうを使う（遅いほうは取りやめる）。
+    ただし出ている要求が HEDGE_BELOW 本以上の間は出さない: 混んでいるときの遅れは Apple の取りこぼしではなく回線の
+    混み合いで、出し直すと回線をさらに取り合う（神戸・三宮のキャッシュのない読み込みで、要求の 8 割を出し直して
+    いた。数を見ると 8.2〜9.6 秒 → 5.6 秒。待つ時間を 4 秒にするのは 6.2〜6.6 秒、同時に 48 本までに絞るのは 8.2 秒）。
     それでも返らなければ、待つ時間を倍にしながら TRIES 本まで出す。1 本は TIMEOUT 秒であきらめる。
     接続ごと止まることもある（その接続の要求がどれも返らなくなる）ので、しばらく何も返っていない
     接続で時間切れになったら、その接続を捨てて張り直す。
@@ -167,6 +171,40 @@ class Net:
         self.slots = [asyncio.Semaphore(self.STREAMS) for _ in self.http]
         self.errors = (httpx.TransportError,)
         self.active = {"bulk": 0, "ground": 0}     # lane ごとの要求の数（出し直しは数えない）
+        # 取り方の設定（earth.py の /api/netconfig で変えられる。比べる用）: hedge: もう 1 本出すまで [秒]、hedge_below:
+        # 出ている要求がこれより少ないときだけ、遅れたものをもう 1 本出す（0 なら数を見ない）、limit: 全部の接続で同時に
+        # 出す要求の上限（0 なら STREAMS x 接続の数まで）
+        self.config = {"hedge": HEDGE, "hedge_below": HEDGE_BELOW, "limit": 0}
+        self._limit = None
+        self.reset_stats()
+
+    def configure(self, **kw):
+        """取り方の設定を変える（hedge、hedge_below、limit。イベントループのスレッドで呼ぶ）。"""
+        for k, v in kw.items():
+            if k in self.config and v is not None:
+                self.config[k] = type(self.config[k])(v)
+        n = self.config["limit"]
+        self._limit = asyncio.Semaphore(n) if n > 0 else None
+        return dict(self.config)
+
+    def reset_stats(self):
+        """取得の数と時間（調べる用。stats_summary、earth.py の /api/netstats）。"""
+        self.stats = {"get": 0, "ok": 0, "fail": 0, "sent": 0, "hedge": 0, "timeout": 0, "error": 0,
+                      "reset": 0, "status": {}, "ms": [], "one_ms": [], "bytes": 0, "t0": None, "t1": None,
+                      "by_flight": {}}     # by_flight: 送ったときに出ていた要求の数（16 本ごと）-> 1 本の時間 [ms]
+
+    def stats_summary(self):
+        st = dict(self.stats)
+        pct = lambda a, q: round(sorted(a)[min(len(a) - 1, int(q * len(a)))]) if a else None
+        for k in ("ms", "one_ms"):
+            a = st.pop(k)
+            st[k] = {"n": len(a), "p50": pct(a, 0.5), "p90": pct(a, 0.9), "p99": pct(a, 0.99), "max": round(max(a)) if a else None}
+        t0, t1 = st.pop("t0"), st.pop("t1")
+        st["span_s"] = round(t1 - t0, 2) if t0 is not None and t1 else None
+        st["mbps"] = round(st["bytes"] * 8 / 1e6 / (t1 - t0), 1) if st["span_s"] else None
+        st["by_flight"] = {f"{k}-{k + 15}": {"n": len(a), "p50": pct(a, 0.5), "p90": pct(a, 0.9)}
+                           for k, a in sorted(st["by_flight"].items())}
+        return st
 
     def get(self, make_url, method="GET", lane="bulk"):
         """make_url() の URL を GET した応答。URL は要求を出すたびに作る（認証を付け直す）。
@@ -187,6 +225,7 @@ class Net:
         """止まった接続を捨てて張り直す（その上の要求は失敗し、それぞれやり直す）。"""
         if self._make is None or self.http[i] is not client:
             return
+        self.stats["reset"] += 1
         self.http[i] = self._make()
         self.last_ok[i] = self.loop.time()
         asyncio.ensure_future(client.aclose())
@@ -195,18 +234,41 @@ class Net:
         for attempt in range(2):             # 接続が切れたなどの一時的な失敗は 1 回だけやり直す
             client = self.http[i]
             self.busy[i] += 1
+            limit = self._limit
             try:
-                async with self.slots[i]:
-                    r = await asyncio.wait_for(client.request(method, make_url()), self.TIMEOUT)
+                if limit:                         # 全部の接続で同時に出す要求の上限（config の limit）
+                    await limit.acquire()
+                try:
+                    async with self.slots[i]:
+                        t0 = self.loop.time()
+                        self.stats["sent"] += 1
+                        flight = sum(self.busy) // 16 * 16
+                        if self.stats["t0"] is None:
+                            self.stats["t0"] = t0
+                        r = await asyncio.wait_for(client.request(method, make_url()), self.TIMEOUT)
+                        ms = (self.loop.time() - t0) * 1000
+                        if len(self.stats["one_ms"]) < 100000:
+                            self.stats["one_ms"].append(ms)
+                            self.stats["by_flight"].setdefault(flight, []).append(ms)
+                        # 数えるだけ（応答でないもの、たとえば試験の偽物の接続が返すものでも止まらないように）
+                        self.stats["bytes"] += len(getattr(r, "content", b"") or b"")
+                        self.stats["t1"] = self.loop.time()
+                        code = getattr(r, "status_code", None)
+                        self.stats["status"][code] = self.stats["status"].get(code, 0) + 1
+                finally:
+                    if limit:
+                        limit.release()
                 self.last_ok[i] = self.loop.time()
                 return r
             except asyncio.TimeoutError:
+                self.stats["timeout"] += 1
                 # しばらく何も返っていない接続なら、接続ごと止まっているので張り直してやり直す
                 if attempt or self.loop.time() - self.last_ok[i] <= self.TIMEOUT / 2:
                     raise
                 self._reset(i, client)
                 continue
             except self.errors:
+                self.stats["error"] += 1
                 if attempt:
                     raise
             finally:
@@ -218,8 +280,17 @@ class Net:
             while self.active["bulk"] >= self.BUSY and self.active["ground"] >= self.GROUND_BUSY:
                 await asyncio.sleep(0.05)
         self.active[lane] += 1
+        self.stats["get"] += 1
+        t0 = self.loop.time()
         try:
-            return await self._hedged(make_url, method, lane)
+            r = await self._hedged(make_url, method, lane)
+            self.stats["ok"] += 1
+            if len(self.stats["ms"]) < 100000:
+                self.stats["ms"].append((self.loop.time() - t0) * 1000)
+            return r
+        except BaseException:
+            self.stats["fail"] += 1
+            raise
         finally:
             self.active[lane] -= 1
 
@@ -232,7 +303,7 @@ class Net:
             tasks[asyncio.ensure_future(self._one(make_url, method, lane, i))] = i
 
         launch()
-        tries, wait, error = 1, HEDGE, None
+        tries, wait, error = 1, self.config["hedge"], None
         while tasks:
             done, _ = await asyncio.wait(tasks, timeout=wait if tries < self.TRIES else None,
                                          return_when=asyncio.FIRST_COMPLETED)
@@ -244,9 +315,13 @@ class Net:
                     return t.result()
                 error = t.exception()
             # 遅いか、出したものが全部失敗したら、もう 1 本
+            below = self.config["hedge_below"]
+            if not done and tasks and below and sum(self.busy) >= below:
+                continue                     # 混んでいる間は、遅くても出し直さない（失敗したときは出し直す）
             if tries < self.TRIES and (not done or not tasks):
                 launch()
                 tries += 1
+                self.stats["hedge"] += 1
                 wait *= 2
         raise error
 
@@ -261,6 +336,7 @@ class Client:
         self._net = Net()                       # タイルの取得用（HTTP/2）
         self.sid = "".join(random.choices(string.digits, k=40))
         self.cache_dir = cache_dir
+        self.nocache = False                    # 比べる用: 保存した R3D のタイルを読まずに取り直す（/api/netconfig）
         os.makedirs(cache_dir, exist_ok=True)
         self.manifest = Manifest(self._cached("ResourceManifest.pbd", MANIFEST_URL, max_age=3600))
         name = self.manifest.file("altitude")
@@ -420,10 +496,11 @@ class Client:
         url, v = self.r3d_source()
         d = os.path.join(self.cache_dir, "r3d", f"{region['region']}_{v}")
         path = os.path.join(d, f"{z}_{x}_{y}_{h}.r3d")
-        if os.path.exists(path):
-            return open(path, "rb").read()
-        if os.path.exists(path + ".empty"):
-            return None
+        if not self.nocache:
+            if os.path.exists(path):
+                return open(path, "rb").read()
+            if os.path.exists(path + ".empty"):
+                return None
         b = self.r3d_tile(region, x, y, z, h)
         os.makedirs(d, exist_ok=True)
         _write(path + ".empty" if b is None else path, b or b"")

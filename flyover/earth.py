@@ -6,7 +6,8 @@
     /api/c3m/<z>/<x>/<y>.bin           古い Flyover のタイルの C3M を、Apple から受け取ったまま（高さ区分を
                                        まとめたもの。形は Earth.c3m_raw を見よ）。ないときは 204
     /api/r3d/<z>/<x>/<y>.bin           新しい Flyover のタイルの R3D を、同じく受け取ったまま（--r3d のとき）。
-                                       ないときは 204（ビューアは /api/c3m/ を使う）
+                                       ないときは 204（ビューアは /api/c3m/ を使う）。?shade=1 なら、そのあとに材質
+                                       ごとの日の当たり方の画像を付ける（&night=1 ならガラスの地図も。shade_block を見よ）
     /api/sat/<z>/<x>/<y>.jpg           衛星画像
     /api/terrain/<level>/<x>/<y>.bin   地形（地理座標のタイル、65 x 65 の float32 の楕円体高と、
                                        これより細かいタイルがないとき 1 になる float32 が 1 つ）
@@ -15,6 +16,7 @@
 取得したものは cache/ に保存し、次からはそれを使う。r3d=True なら、Flyover のタイルに iOS 27 の
 新しい Flyover（style 98、flyover/r3d.py）を使い、そのタイルがないか読めないときは C3M にする。
 """
+import asyncio
 import http.server
 import json
 import mimetypes
@@ -73,6 +75,11 @@ def fetch_heights(z, get_many, r3d=False):
             return raws
         else:
             n = 4
+
+
+async def _call(fn, **kw):
+    """fn(**kw) をイベントループのスレッドで呼ぶ（/api/netconfig）。"""
+    return fn(**kw)
 
 
 def fetch_r3d(client, region, x, y, z, get_many):
@@ -153,6 +160,33 @@ def _pack_raw(raws):
     return struct.pack(f"<{1 + len(raws)}I", len(raws), *map(len, raws)) + b"".join(raws)
 
 
+def shade_block(raws, night=False):
+    """R3D の高さ区分ごとのバイト列から、材質ごとの日の当たり方の画像（night ならガラスの地図も）を、glb と同じ JPEG
+    にして並べる（別のプロセスで動かす。glb.tile_glb の occlusionTexture と同じ中身）。ビューアが R3D をそのまま読み解く
+    ときに、白黒の HEVC（4:0:0）はブラウザで展開できないので、この 2 枚だけをここで変換する。くり返して貼る材質には
+    付けない（glb と同じ）。形: uint32 の数 m、そのあと m 個の（uint32 区分、uint32 材質の番号、uint32 長さ、JPEG）。
+    どれも little endian。"""
+    out = []
+    for h, b in enumerate(raws):
+        if not b:
+            continue
+        try:
+            sec = r3d.sections(b)
+        except ValueError:
+            continue
+        for k in range(len(sec.get("atlases", []))):
+            try:
+                s = r3d.shade_image(b, sec, k)
+                if not s or r3d.repeat_texture(b, sec, k):
+                    continue
+                j = glb._shade_jpeg(s, gloss=r3d.gloss_image(b, sec, k) if night else None)
+            except Exception as e:
+                print(f"  shade h={h} k={k}: {e}", flush=True)
+                continue
+            out.append(struct.pack("<3I", h, k, len(j)) + j)
+    return struct.pack("<I", len(out)) + b"".join(out)
+
+
 class Earth:
     def __init__(self, cache_dir="cache", jobs=192, r3d=False):
         self.client = Client(cache_dir=cache_dir)
@@ -204,7 +238,7 @@ class Earth:
         t0 = time.perf_counter()
         with self._lock(("glb", z, x, y, hevc, night)):
             timing["wait"] = (time.perf_counter() - t0) * 1000
-            if os.path.exists(path):
+            if os.path.exists(path) and not self.client.nocache:
                 return open(path, "rb").read() or None
             t0 = time.perf_counter()
             out = None
@@ -240,15 +274,36 @@ class Earth:
         raws = fetch_heights(z, lambda hs: self.map(lambda k: self.client.tile_cached(region, x, y, z, k), hs))
         return _pack_raw(raws)
 
-    def r3d_raw(self, z, x, y):
+    def r3d_raw(self, z, x, y, shade=False, night=False, timing=None):
         """新しい Flyover（R3D）のタイルの、高さ区分ごとの R3D を、そのまま並べたもの（形は c3m_raw と同じ。ビューアが
-        earth/r3d.js で読み解く）。データがないか、--r3d でなければ None。"""
+        earth/r3d.js で読み解く）。データがないか、--r3d でなければ None。shade なら、そのあとに材質ごとの日の当たり方の
+        画像（night ならガラスの地図も）を shade_block の形で付ける（?light= 用。cache/r3dshade1/ に残す）。"""
+        timing = {} if timing is None else timing
         if not self.r3d or not R3D_MIN_ZOOM <= z <= MAX_ZOOM:
             return None
         region = self.client.region_of_tile(x, y, z, strict=True)
         if region is None:
             return None
-        return _pack_raw(fetch_r3d(self.client, region, x, y, z, lambda hs, get: self.map(get, hs)))
+        t0 = time.perf_counter()
+        raws = fetch_r3d(self.client, region, x, y, z, lambda hs, get: self.map(get, hs))
+        timing["fetch"] = (time.perf_counter() - t0) * 1000
+        out = _pack_raw(raws)
+        if not out or not shade:
+            return out
+        d = os.path.join(self.cache_dir, "r3dshade1" + ("n" if night else ""), f"{region['region']}_{region['version']}", str(z))
+        path = os.path.join(d, f"{x}_{y}.bin")
+        t0 = time.perf_counter()
+        with self._lock(("shade", z, x, y, night)):
+            if os.path.exists(path) and not self.client.nocache:
+                block = open(path, "rb").read()
+            else:
+                block = self.cpu.submit(shade_block, raws, night).result()
+                os.makedirs(d, exist_ok=True)
+                tmp = f"{path}.{threading.get_ident()}.tmp"
+                open(tmp, "wb").write(block)
+                os.replace(tmp, path)
+        timing["shade"] = (time.perf_counter() - t0) * 1000
+        return out + block
 
     def night_image(self, kind, z, x, y):
         """夜景の画像（flyover/osm.py。OpenStreetMap のデータを OpenFreeMap から、夜の明るさを NASA の Black Marble から取る）。
@@ -350,6 +405,19 @@ def handler(earth):
         def route(self, path, query):
             if path == "/api/config":
                 return self.send(200, json.dumps(earth.config()).encode(), "application/json", cache=False)
+            if path == "/api/netconfig":          # 取り方の設定（比べる用）: ?hedge=秒&hedge_below=本&limit=本&nocache=1
+                q = {k: v[0] for k, v in query.items()}
+                if "nocache" in q:
+                    earth.client.nocache = q.pop("nocache") == "1"
+                net = earth.client._net
+                cfg = asyncio.run_coroutine_threadsafe(_call(net.configure, **q), net.loop).result()
+                return self.send(200, json.dumps({**cfg, "nocache": earth.client.nocache}).encode(),
+                                 "application/json", cache=False)
+            if path == "/api/netstats":           # Apple からの取得の数と時間（調べる用。?reset=1 で数え直す）
+                net = earth.client._net
+                if query.get("reset") == ["1"]:
+                    net.reset_stats()
+                return self.send(200, json.dumps(net.stats_summary()).encode(), "application/json", cache=False)
             if path == "/api/search":
                 res = earth.search(query.get("q", [""])[0])
                 return self.send(200, json.dumps(res, ensure_ascii=False).encode(),
@@ -367,9 +435,13 @@ def handler(earth):
                     out = earth.flyover(a, b, c, timing, query.get("hevc") == ["1"], query.get("night") == ["1"])
                     # ブラウザには覚えさせない（作り方を変えたときに古いものが残らないよう）。cache/ にはある
                     return self.send(200 if out else 204, out or b"", "model/gltf-binary", cache=False, timing=timing)
-                if kind in ("c3m", "r3d"):
-                    out = (earth.c3m_raw if kind == "c3m" else earth.r3d_raw)(a, b, c)
+                if kind == "c3m":
+                    out = earth.c3m_raw(a, b, c)
                     return self.send(200 if out else 204, out or b"", cache=False)
+                if kind == "r3d":
+                    timing = {}
+                    out = earth.r3d_raw(a, b, c, query.get("shade") == ["1"], query.get("night") == ["1"], timing)
+                    return self.send(200 if out else 204, out or b"", cache=False, timing=timing)
                 if kind == "captured":
                     return self.send(200, json.dumps(earth.captured(a, b, c)).encode(), "application/json", cache=False)
                 if kind == "sat":

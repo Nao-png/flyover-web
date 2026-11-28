@@ -82,7 +82,7 @@ Hold Alt while moving to move slowly.
 | `?shadows=0` | Turns off building shadows (WebGPU viewer; with `?light=morning`, `evening` or `?sun=`, buildings cast shadows from the current sun) |
 | `?phase=0` | Uses the old scattering shape instead of haze that glows strongly around the sun (WebGPU viewer) |
 | `?strat=0` | Removes the stratospheric aerosol (default 1; the purple sky on the sun's side after sunset goes away; `?strat=2` and so on to double it) |
-| `?raw=1` | Shows the Flyover tiles as received from Apple, decoded in the browser instead of converted to glb on the server (WebGPU viewer; needs a browser that decodes HEVC on the GPU). The new Flyover with `--r3d`, otherwise the old one. `?c3m=1` always shows the old Flyover. Not available with `?light=` (falls back to normal loading) |
+| `?raw=1` | Shows the Flyover tiles as received from Apple, decoded in the browser instead of converted to glb on the server (WebGPU viewer; needs a browser that decodes HEVC on the GPU). The new Flyover with `--r3d`, otherwise the old one. `?c3m=1` always shows the old Flyover. With `?light=`, only the sun-exposure and glass maps are converted on the server and sent along |
 
 ## Export
 
