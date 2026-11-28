@@ -25,6 +25,10 @@ const BC = adapter.features.has('texture-compression-bc') && params.get('bc') !=
 // しない）。discard があると、GPU が奥の見えない画素を色を計算する前に省けなくなり、お台場の夕方で地面と建物のパスが
 // 53 ms → 36 ms（MSAA 4 倍）になった
 const CLIPD = adapter.features.has('clip-distances') && params.get('clipd') !== '0';
+// 建物の深さだけを先に描いてから、深さが等しい所だけ色を描く（手前の建物に隠れる画素の重い計算を省く）。新宿を斜めに
+// 見下ろして GPU の時間が 夜景 36.8 → 25.4 ms、夕方 21.9 → 17.5 ms、昼 18.5 → 16.7 ms。真上からは重なりが少なく、
+// 13.6 → 14.6 ms と少し遅い。?zpre=0 で使わない（比べる用）
+const ZPRE = params.get('zpre') !== '0';
 const device = await adapter.requestDevice({ requiredFeatures: [...(timing ? ['timestamp-query'] : []),
   ...(floatFilter ? ['float32-filterable'] : []), ...(stencil32 ? ['depth32float-stencil8'] : []),
   ...(BC ? ['texture-compression-bc'] : []), ...(CLIPD ? ['clip-distances'] : [])] });
@@ -1053,10 +1057,10 @@ fn sunShadow(rel: vec3f, n: vec3f) -> f32 {
   }
   return mix(v * 0.25, 1.0, smoothstep(0.85, 1.0, edge));
 }
-struct V { @builtin(position) pos: vec4f, @location(0) uv: vec2f, @location(1) local: vec3f, @location(2) color: vec4f,
+struct V { @invariant @builtin(position) pos: vec4f, @location(0) uv: vec2f, @location(1) local: vec3f, @location(2) color: vec4f,
            @location(3) at: vec3f, @location(4) as_: vec3f, @location(5) rel: vec3f, @location(6) world: vec3f };
 // clip distances のときの頂点の出力（clip_distances は頂点の出力にしか使えないので、画素の入力の V とは分ける）
-${CLIPD ? `struct VO { @builtin(position) pos: vec4f, @location(0) uv: vec2f, @location(1) local: vec3f, @location(2) color: vec4f,
+${CLIPD ? `struct VO { @invariant @builtin(position) pos: vec4f, @location(0) uv: vec2f, @location(1) local: vec3f, @location(2) color: vec4f,
             @location(3) at: vec3f, @location(4) as_: vec3f, @location(5) rel: vec3f, @location(6) world: vec3f,
             @builtin(clip_distances) clip: array<f32, 2> };` : ''}
 fn srgbToLinear(c: vec3f) -> vec3f { return select(pow((c + 0.055) / 1.055, vec3f(2.4)), c / 12.92, c <= vec3f(0.04045)); }
@@ -1119,6 +1123,20 @@ fn vsCommon(q: vec4i, uv: vec2f, color: vec4f) -> V {
   let v = vsCommon(q, uv, vec4f(1.0));
   ${CLIPD ? 'return VO(v.pos, v.uv, v.local, v.color, v.at, v.as_, v.rel, v.world, quadClip(v.local, part));' : 'return v;'}
 }
+// 深さだけを先に描く（ZPRE）。位置は vsCommon と同じ式で、@invariant で同じ値になるようにする（本番の描画は
+// 深さが等しい所だけ描く）
+struct VD { @invariant @builtin(position) pos: vec4f, @location(0) local: vec3f${CLIPD ? ', @builtin(clip_distances) clip: array<f32, 2>' : ''} };
+@vertex fn vsDepth(@location(0) q: vec4i, @builtin(instance_index) part: u32) -> VD {
+  var o: VD;
+  let l = vec3f(q.xyz) * u.p.x;
+  let clip = u.mvp * vec4f(l, 1.0);
+  o.pos = fr.pickM * clip;
+  o.local = l;
+  ${CLIPD ? 'o.clip = quadClip(l, part);' : ''}
+  return o;
+}
+// 色は書かない（パスの色の出力と合わせるために出すだけ）
+@fragment fn fsDepth(${CLIPD ? '' : '@location(0) local: vec3f'}) -> @location(0) vec4f { ${CLIPD ? '' : 'if (clipped(local)) { discard; }'} return vec4f(0.0); }
 @vertex fn vsSplat(@location(0) q: vec4i, @location(1) color: vec4f, @location(2) uv: vec2f) -> V { return vsCommon(q, uv, color); }
 // 見ている側を向いた面の向き（カメラが原点）
 fn normalOf(rel: vec3f) -> vec3f {
@@ -1469,8 +1487,15 @@ async function makePipes(samples) {
       { arrayStride: 8, attributes: [{ shaderLocation: 0, offset: 0, format: 'sint16x4' }] },
       { arrayStride: uvFormat === 'float32x2' ? 8 : 4, attributes: [{ shaderLocation: 1, offset: 0, format: uvFormat }] }] },
     fragment: { module: flyModule, entryPoint: entry, targets: [{ format }] },
+    primitive: { topology: 'triangle-list', cullMode: 'none' }, depthStencil: ZPRE ? depth(false, 'greater-equal') : depth(true, 'greater'),
+    multisample: ms });
+  // 建物の深さだけを先に描く（ZPRE）。重い画素の計算を、手前の建物に隠れる所でしないため
+  const depthOnly = !ZPRE ? null : device.createRenderPipelineAsync({
+    layout: flyPL,
+    vertex: { module: flyModule, entryPoint: 'vsDepth', buffers: [{ arrayStride: 8, attributes: [{ shaderLocation: 0, offset: 0, format: 'sint16x4' }] }] },
+    fragment: { module: flyModule, entryPoint: 'fsDepth', targets: [{ format, writeMask: 0 }] },
     primitive: { topology: 'triangle-list', cullMode: 'none' }, depthStencil: depth(true, 'greater'), multisample: ms });
-  const [sky, ground, groundFb, meshU16, meshF32, yuvU16, yuvF32, splat] = await Promise.all([
+  const [sky, ground, groundFb, meshU16, meshF32, yuvU16, yuvF32, splat, depthOnlyPipe] = await Promise.all([
     device.createRenderPipelineAsync({
       layout: device.createPipelineLayout({ bindGroupLayouts: [CN ? cloudLayout : emptyLayout, frameLayout] }),
       vertex: { module: globeModule, entryPoint: 'vsSky' }, fragment: { module: globeModule, entryPoint: 'fsSky', targets: [{ format }] },
@@ -1487,8 +1512,9 @@ async function makePipes(samples) {
         { format: 'rgba16float', blend: { color: { srcFactor: 'one', dstFactor: 'one' }, alpha: { srcFactor: 'zero', dstFactor: 'one-minus-src-alpha' } } },
         { format: 'r16float', blend: { color: { srcFactor: 'one', dstFactor: 'one' }, alpha: { srcFactor: 'one', dstFactor: 'one' } } }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' }, depthStencil: depth(false, 'greater'), multisample: ms }),
+    depthOnly,
   ]);
-  return { sky, ground, groundFb, meshU16, meshF32, yuvU16, yuvF32, splat };
+  return { sky, ground, groundFb, meshU16, meshF32, yuvU16, yuvF32, splat, depthOnly: depthOnlyPipe };
 }
 const oitModule = device.createShaderModule({ code: OIT_WGSL });
 const [pipesMain, pipes1, oitPipe] = await Promise.all([makePipes(SAMPLES), SAMPLES === 1 ? null : makePipes(1),
@@ -2866,6 +2892,20 @@ function prepare(W, H, cssH, force = false) {
     pass.setBindGroup(0, emptyGroup);
     pass.setBindGroup(1, group);
     pass.setStencilReference(1);
+    // 建物の深さだけを先に（ZPRE）。地面もこの深さで隠れる所は描かない
+    if (opaque && pipes.depthOnly) {
+      pass.setPipeline(pipes.depthOnly);
+      for (let j = 0; j < nf; j++) {
+        const md = fly[j].t.model;
+        for (const p of md.prims) {
+          if (p.splat) continue;
+          pass.setBindGroup(0, p.bind, [(n + j) * U_STRIDE]);
+          pass.setVertexBuffer(0, md.buf, p.pos.offset);
+          pass.setIndexBuffer(md.buf, p.ix32 ? 'uint32' : 'uint16', p.ix.offset);
+          for (const part of quadParts(fly[j].mask)) pass.drawIndexed(p.ix.count, 1, 0, 0, part);
+        }
+      }
+    }
     for (const fb of opaque ? [false, true] : []) {
       pass.setPipeline(fb ? pipes.groundFb : pipes.ground);
       for (let i = 0; i < n; i++) {
